@@ -5,3 +5,4 @@
 /web/pkg
 *.gif
 *.mp4
+.claude/
