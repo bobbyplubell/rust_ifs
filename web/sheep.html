@@ -27,6 +27,11 @@
   <div id="hud">
     <span id="info">loading…</span>
     <span id="sheep-id" class="id"></span>
+    <span id="quality">
+      <button data-q="low">low</button>
+      <button data-q="med">med</button>
+      <button data-q="high">high</button>
+    </span>
     <button id="spin">spin</button>
     <button id="dl">genome ↓</button>
     <a id="back" href="index.html">← flock</a>
@@ -48,8 +53,13 @@
     const cv = $('#cv');
     const ctx = cv.getContext('2d');
 
-    // High-quality full-screen render; ss 2 + plenty of samples.
-    const BIG = { width: 512, height: 512, ss: 2, nChunks: 64, samplesPerChunk: 250_000 };
+    // Display-quality presets (display-only — proofs always use PROOF_SPEC).
+    const QUALITY = {
+      low:  { width: 384, height: 384, ss: 1, nChunks: 32, samplesPerChunk: 120_000 },
+      med:  { width: 512, height: 512, ss: 2, nChunks: 64, samplesPerChunk: 250_000 },
+      high: { width: 768, height: 768, ss: 2, nChunks: 64, samplesPerChunk: 650_000 },
+    };
+    let quality = localStorage.getItem('sheep-quality') || 'med';
     const FRAME = { width: 320, height: 320, samples: 450_000, seed: 7 };
     const LOOP_MS = 14_000;
 
@@ -74,15 +84,24 @@
     }
 
     let record = null;
-    let still = null; // remembered crisp frame
+    let still = null;   // remembered crisp frame
+    let stillJob = null;
+
+    function markQuality() {
+      for (const b of document.querySelectorAll('#quality button')) {
+        b.disabled = b.dataset.q === quality;
+      }
+    }
 
     async function renderStill() {
+      stillJob?.cancel();
+      const spec = QUALITY[quality];
       const challengeHex = await sha256Hex(utf8(`view|${id}`));
-      const job = pool.submit(
-        { type: 'render', genomeJson: record.genome, challengeHex, ...BIG, tonemapEvery: 8 },
+      stillJob = pool.submit(
+        { type: 'render', genomeJson: record.genome, challengeHex, ...spec, tonemapEvery: 8 },
         { onProgress: (p) => { if (p.rgba) paint(p); } },
       );
-      const done = await job.done;
+      const done = await stillJob.done;
       if (done.type === 'done') { paint(done); still = done; }
     }
 
@@ -127,6 +146,16 @@
       $('#sheep-id').textContent = id;
       $('#info').textContent = record.name ||
         (record.parents ? `born g${record.gen - GENESIS_GEN} of ${record.parents.map(p => p.slice(0, 8)).join(' × ')}` : `sheep ${id.slice(0, 8)}`);
+      markQuality();
+      for (const b of document.querySelectorAll('#quality button')) {
+        b.onclick = () => {
+          quality = b.dataset.q;
+          localStorage.setItem('sheep-quality', quality);
+          markQuality();
+          still = null;
+          if (!spinning) renderStill().catch(console.error);
+        };
+      }
       $('#spin').onclick = () => toggleSpin().catch(console.error);
       $('#dl').onclick = () => {
         const a = document.createElement('a');

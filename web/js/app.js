@@ -7,10 +7,11 @@ import { sha256Hex, utf8 } from './hash.js';
 import { loadIdentity, sign, PEER_NS } from './identity.js';
 import { openStore } from './store.js';
 import {
-  Net, BroadcastTransport, gen, GEN_MS, GENESIS_GEN, PROOF_SPEC,
+  Net, BroadcastTransport, CompositeTransport, gen, GEN_MS, GENESIS_GEN, PROOF_SPEC,
   sheepSignBytes, voteSignBytes, voteChallenge,
 } from './net.js';
 import { computeFlock, breedChallenge } from './gens.js';
+import { RELAYS } from '../config.js';
 
 const $ = (s) => document.querySelector(s);
 const pool = new WorkerPool();
@@ -29,8 +30,21 @@ let shownGen = -1;
 async function main() {
   me = await loadIdentity();
   store = await openStore();
+
+  // Tabs always talk via BroadcastChannel; the internet swarm joins in when
+  // relays are configured (libp2p bundle loaded lazily, failure non-fatal).
+  const transports = [new BroadcastTransport()];
+  if (RELAYS.length) {
+    try {
+      const { createLibp2pTransport } = await import('./vendor/libp2p.js');
+      transports.push(await createLibp2pTransport({ relays: RELAYS }));
+    } catch (err) {
+      console.error('libp2p transport unavailable:', err);
+    }
+  }
+
   net = new Net({
-    transport: new BroadcastTransport(),
+    transport: new CompositeTransport(transports),
     store,
     pubHex: me.pubHex,
     checkSheepId: (genomeJson) =>

@@ -75,3 +75,37 @@ pub fn sinh(x: f64) -> f64 {
 pub fn cosh(x: f64) -> f64 {
     libm::cosh(x)
 }
+
+#[cfg(test)]
+mod tests {
+    /// Enforce the module rules mechanically: no std float transcendentals and
+    /// no f32 anywhere in flame-core outside this file. A failure here means
+    /// someone reintroduced a nondeterminism hazard.
+    #[test]
+    fn no_std_transcendentals_outside_fmath() {
+        let forbidden = [
+            ".sin()", ".cos()", ".sin_cos()", ".tan()", ".ln(", ".log(",
+            ".log2(", ".log10(", ".exp()", ".exp2(", ".exp_m1(", ".ln_1p(",
+            ".powf(", ".powi(", ".atan2(", ".atan(", ".asin(", ".acos(",
+            ".hypot(", ".sinh()", ".cosh()", ".tanh()", "f32",
+        ];
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let path = entry.unwrap().path();
+            if path.file_name().unwrap() == "fmath.rs" || path.extension() != Some("rs".as_ref()) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            for (lineno, line) in text.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or(""); // ignore comments
+                for pat in forbidden {
+                    assert!(
+                        !code.contains(pat),
+                        "{}:{}: `{}` — use crate::fmath (determinism; see fmath.rs)",
+                        path.display(), lineno + 1, pat,
+                    );
+                }
+            }
+        }
+    }
+}

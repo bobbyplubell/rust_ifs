@@ -1,0 +1,25 @@
+{
+  "name": "sheep-relay",
+  "private": true,
+  "type": "module",
+  "description": "Always-on libp2p relay/bootstrap peer for the sheep swarm, plus the browser transport bundle. Built and run via Docker only \u2014 no host Node required.",
+  "scripts": {
+    "relay": "node src/relay.js",
+    "test": "node test/roundtrip.js",
+    "bundle": "esbuild src/browser-entry.js --bundle --format=esm --minify --outfile=dist/libp2p.js"
+  },
+  "dependencies": {
+    "@chainsafe/libp2p-gossipsub": "^14",
+    "@chainsafe/libp2p-noise": "^16",
+    "@chainsafe/libp2p-yamux": "^7",
+    "@libp2p/bootstrap": "^11",
+    "@libp2p/circuit-relay-v2": "^3",
+    "@libp2p/identify": "^3",
+    "@libp2p/webrtc": "^5",
+    "@libp2p/websockets": "^9",
+    "libp2p": "^2"
+  },
+  "devDependencies": {
+    "esbuild": "latest"
+  }
+}

@@ -61,6 +61,21 @@ export class BroadcastTransport {
   }
 }
 
+/** Fan messages out over several transports at once (tabs via BroadcastChannel
+ *  AND the internet via libp2p). Duplicate deliveries are harmless: ingest is
+ *  idempotent (grow-only store). */
+export class CompositeTransport {
+  constructor(transports) {
+    this.transports = transports;
+  }
+  send(msg) {
+    for (const t of this.transports) t.send(msg);
+  }
+  onMessage(fn) {
+    for (const t of this.transports) t.onMessage(fn);
+  }
+}
+
 export class Net {
   /**
    * @param transport   {send, onMessage}
