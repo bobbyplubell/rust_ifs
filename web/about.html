@@ -37,13 +37,17 @@
 
     <h2>proof of sheep</h2>
     <p>
-      Voting costs a render. To vote for a sheep you render it with a challenge
-      derived from your key and the current generation, and sign the hashes of
-      the 64 chunks of work. Anyone can later re-render any one chunk
-      (1/64th of the work) and catch a forged vote — and a confirmed forgery is
-      itself provable to everyone else. There is no vote server to trust:
-      <em>the work is the ballot, and the art is the work</em>. You can watch
-      this machinery agree with itself on the
+      Voting costs a render — specifically, <em>one full loop of the sheep's
+      animation</em>. Your browser renders all 64 frames of the loop under a
+      challenge derived from your key and the current generation, and signs
+      the hash of each frame's work. The frames you just proved replay as an
+      animation on the card: the work is the ballot, the art is the work, and
+      the receipt is a dancing sheep. Anyone can later re-render any one frame
+      (1/64th of the work) and catch a forged vote — your browser quietly does
+      this to other peers' votes in the background, and a confirmed forgery
+      becomes a fraud proof everyone can check, discrediting that key's votes
+      everywhere. There is no vote server to trust. You can watch the
+      machinery agree with itself on the
       <a href="determinism.html">determinism page</a>.
     </p>
 

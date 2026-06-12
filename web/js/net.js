@@ -29,8 +29,14 @@ export const SURVIVORS_K = 4;
 /** Deterministic per-author submissions counted per generation (lowest sheep ids win). */
 export const AUTHOR_GEN_CAP = 3;
 
-/** Protocol render spec for vote AND release proofs (PLAN.md tuning constants). */
-export const PROOF_SPEC = { width: 256, height: 256, ss: 1, nChunks: 64, samplesPerChunk: 20_000 };
+/** Protocol v3 "loop proof" spec for vote AND release proofs: the proof's 64
+ *  units are FRAMES of the sheep's animation loop (frame i = phase i/64, with
+ *  2 temporal sub-steps of motion blur), so proving = watching one full loop,
+ *  and the frames replay as a cached animation afterward. ~15M samples total:
+ *  heavy enough to be a real cost, light enough for several votes per gen. */
+export const PROOF_SPEC = {
+  width: 256, height: 256, ss: 1, nFrames: 64, samplesPerFrame: 240_000, temporal: 2,
+};
 
 export const HEX64 = /^[0-9a-f]{64}$/;
 
@@ -45,12 +51,19 @@ export const voteSignBytes = (v) =>
 
 export const voteKey = (v) => `${v.voter}:${v.sheepId}:${v.gen}`;
 
-/** Self-certifying vote challenge: H(sheep_id ‖ voter ‖ gen). */
+/** Self-certifying vote challenge (v3 = loop proofs). */
 export const voteChallenge = (sheepId, voterHex, g) =>
-  sha256Hex(utf8(`${sheepId}|${voterHex}|${g}`));
+  sha256Hex(utf8(`v3|${sheepId}|${voterHex}|${g}`));
+
+// Fraud proof: a self-contained, objectively checkable accusation — "frame
+// `frame` of this signed vote should hash to `expected`, not what was signed".
+// Anyone verifies it by re-rendering that one frame (1/64 of a proof).
+export const fraudKey = (f) => `${f.voteKey}:${f.frame}`;
+export const fraudSignBytes = (f) =>
+  utf8(`fraud|${f.voteKey}|${f.frame}|${f.expected}|${f.reporter}`);
 
 export class BroadcastTransport {
-  constructor(channel = 'sheep-net-v2') {
+  constructor(channel = 'sheep-net-v3') {
     this.ch = new BroadcastChannel(channel);
   }
   send(msg) {
@@ -81,11 +94,18 @@ export class Net {
    * @param transport   {send, onMessage}
    * @param store       store.js instance
    * @param pubHex      our peer id (used to address anti-entropy fills)
-   * @param checkSheepId async (genomeJson) => sheep_id hex, via the wasm worker
-   * @param onSheep/onVote  callbacks fired when a NEW record is accepted
+   * @param checkSheepId  async (genomeJson) => sheep_id hex, via the wasm worker
+   * @param checkFrameHash async (genomeJson, challengeHex, frameIdx) => hash —
+   *                       re-renders one proof frame; used to verify incoming
+   *                       fraud claims before believing them
+   * @param onSheep/onVote/onFraud callbacks fired when a NEW record is accepted
    */
-  constructor({ transport, store, pubHex, checkSheepId, onSheep, onVote }) {
-    Object.assign(this, { transport, store, pubHex, checkSheepId, onSheep, onVote });
+  constructor({ transport, store, pubHex, checkSheepId, checkFrameHash,
+                lookupSheep, onSheep, onVote, onFraud }) {
+    Object.assign(this, {
+      transport, store, pubHex, checkSheepId, checkFrameHash, lookupSheep,
+      onSheep, onVote, onFraud,
+    });
     this.peers = new Map(); // pubHex -> last inv timestamp
   }
 
@@ -120,17 +140,27 @@ export class Net {
     }
   }
 
+  async publishFraud(record) {
+    record.key = fraudKey(record);
+    if (await this.store.addFraud(record)) {
+      this.transport.send({ kind: 'fraud', record });
+      this.onFraud?.(record);
+    }
+  }
+
   // -- receiving --------------------------------------------------------------
 
   async _recv(msg) {
     switch (msg.kind) {
       case 'sheep': return this._ingestSheep(msg.record);
       case 'vote': return this._ingestVote(msg.record);
+      case 'fraud': return this._ingestFraud(msg.record);
       case 'inv': return this._onInv(msg);
       case 'data': {
         if (msg.to !== this.pubHex) return;
         for (const r of msg.sheep || []) await this._ingestSheep(r);
         for (const r of msg.votes || []) await this._ingestVote(r);
+        for (const r of msg.fraud || []) await this._ingestFraud(r);
         return;
       }
     }
@@ -140,7 +170,7 @@ export class Net {
     if (!r || !HEX64.test(r.id) || typeof r.genome !== 'string') return;
     if (!Number.isInteger(r.gen) || !HEX64.test(r.author ?? '')) return;
     if (r.parents && !(Array.isArray(r.parents) && r.parents.every((p) => HEX64.test(p)))) return;
-    if (!Array.isArray(r.chunkHashes) || r.chunkHashes.length !== PROOF_SPEC.nChunks) return;
+    if (!Array.isArray(r.chunkHashes) || r.chunkHashes.length !== PROOF_SPEC.nFrames) return;
     if (!r.chunkHashes.every((h) => HEX64.test(h))) return;
     // Storage sanity bound per (author, gen) — the *selection* cap
     // (AUTHOR_GEN_CAP, deterministic lowest-ids) is applied in gens.js.
@@ -154,11 +184,35 @@ export class Net {
 
   async _ingestVote(v) {
     if (!v || !HEX64.test(v.sheepId) || !HEX64.test(v.voter) || !Number.isInteger(v.gen)) return;
-    if (!Array.isArray(v.chunkHashes) || v.chunkHashes.length !== PROOF_SPEC.nChunks) return;
+    if (!Array.isArray(v.chunkHashes) || v.chunkHashes.length !== PROOF_SPEC.nFrames) return;
     if (!v.chunkHashes.every((h) => HEX64.test(h))) return;
     if (!(await verify(v.voter, v.sig, voteSignBytes(v)))) return;
     v.key = voteKey(v);
     if (await this.store.addVote(v)) this.onVote?.(v);
+  }
+
+  /** A fraud claim is believed only after we verify it OURSELVES: check both
+   *  signatures, then re-render the disputed frame and confirm the claimed
+   *  hash. Cost: 1/64 of a proof. Requires the sheep's genome — if we don't
+   *  hold it yet, drop; anti-entropy re-offers the claim later. */
+  async _ingestFraud(f) {
+    if (!f || !f.vote || !Number.isInteger(f.frame) || !HEX64.test(f.expected ?? '')) return;
+    if (!HEX64.test(f.reporter ?? '')) return;
+    const v = f.vote;
+    if (f.frame < 0 || f.frame >= PROOF_SPEC.nFrames) return;
+    if (f.voteKey !== voteKey(v)) return;
+    if (!(await verify(f.reporter, f.sig, fraudSignBytes(f)))) return;
+    // The embedded vote must be genuinely signed by the accused...
+    if (!(await verify(v.voter, v.sig, voteSignBytes(v)))) return;
+    // ...and the claim must actually dispute it.
+    if (v.chunkHashes[f.frame] === f.expected) return;
+    const sheep = await this.lookupSheep(v.sheepId);
+    if (!sheep) return; // can't verify yet
+    const challenge = await voteChallenge(v.sheepId, v.voter, v.gen);
+    const actual = await this.checkFrameHash(sheep.genome, challenge, f.frame);
+    if (actual !== f.expected || actual === v.chunkHashes[f.frame]) return; // false accusation
+    f.key = fraudKey(f);
+    if (await this.store.addFraud(f)) this.onFraud?.(f);
   }
 
   // -- anti-entropy ------------------------------------------------------------
@@ -166,7 +220,8 @@ export class Net {
   async _sendInv() {
     const sheep = (await this.store.allSheep()).filter((r) => !r.baked).map((r) => r.id);
     const votes = (await this.store.allVotes()).map((v) => v.key);
-    this.transport.send({ kind: 'inv', from: this.pubHex, sheep, votes });
+    const fraud = (await this.store.allFraud()).map((f) => f.key);
+    this.transport.send({ kind: 'inv', from: this.pubHex, sheep, votes, fraud });
   }
 
   async _onInv(msg) {
@@ -174,10 +229,12 @@ export class Net {
     this.peers.set(msg.from, Date.now());
     const theirSheep = new Set(msg.sheep || []);
     const theirVotes = new Set(msg.votes || []);
+    const theirFraud = new Set(msg.fraud || []);
     const sheep = (await this.store.allSheep()).filter((r) => !r.baked && !theirSheep.has(r.id));
     const votes = (await this.store.allVotes()).filter((v) => !theirVotes.has(v.key));
-    if (sheep.length || votes.length) {
-      this.transport.send({ kind: 'data', to: msg.from, sheep, votes });
+    const fraud = (await this.store.allFraud()).filter((f) => !theirFraud.has(f.key));
+    if (sheep.length || votes.length || fraud.length) {
+      this.transport.send({ kind: 'data', to: msg.from, sheep, votes, fraud });
     }
   }
 }

@@ -25,6 +25,12 @@ em { color: #c8b06a; font-style: normal; }
 .card canvas.rendering { opacity: 0.85; }
 .card.selected canvas { border-color: #c8b06a; }
 
+.bar { height: 3px; background: #16161f; }
+.bar-fill {
+  height: 100%; width: 0; background: #c8b06a;
+  transition: width 0.15s ease;
+}
+
 .meta {
   display: flex; gap: 8px; align-items: baseline;
   padding: 4px 1px; font-size: 12px; color: #8d8da4;

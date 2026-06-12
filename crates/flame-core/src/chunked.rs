@@ -61,6 +61,61 @@ pub fn render_chunk(
     accum
 }
 
+/// Protocol v3 "loop proof" frame: the proof's unit of work is one frame of
+/// the sheep's animation loop instead of one chunk of a still. Frame `idx` of
+/// `n_frames` is the genome animated to phase `idx / n_frames`, rendered as
+/// `temporal` sub-steps spanning one frame interval (flam3 temporal samples,
+/// so the proven loop plays back with motion blur):
+///
+///   accum(idx) = Σ_{k=0..T-1} accumulate(
+///       animated(genome, idx/N + k/(N*T)),
+///       samples_per_frame / T, CHUNK_BURN_IN,
+///       seed = chunk_seed(challenge, idx) ^ k)
+///
+/// Deterministic: `animated` uses fmath only, the phase arithmetic is plain
+/// IEEE division of small integers. Hash with `chunk_hash` as usual. Auditing
+/// one frame costs 1/N of the full proof, same asymmetry as chunk audits.
+pub fn render_proof_frame(
+    genome: &Genome,
+    width: usize,
+    height: usize,
+    ss: usize,
+    samples_per_frame: u64,
+    challenge: &Challenge,
+    idx: u32,
+    n_frames: u32,
+    temporal: u32,
+) -> Accum {
+    let mut accum = Accum::new(width * ss, height * ss);
+    let t = temporal.max(1) as u64;
+    let per_step = (samples_per_frame / t).max(1);
+    let seed = chunk_seed(challenge, idx);
+    for k in 0..t {
+        let phase = idx as f64 / n_frames as f64 + k as f64 / (n_frames as f64 * t as f64);
+        let g = crate::animate::animated(genome, phase);
+        accumulate(&g, per_step, CHUNK_BURN_IN, seed ^ k, &mut accum);
+    }
+    accum
+}
+
+#[cfg(test)]
+mod proof_frame_tests {
+    use super::*;
+    use crate::rng::Rng;
+
+    #[test]
+    fn proof_frames_are_deterministic_and_distinct() {
+        let mut rng = Rng::new(7);
+        let genome = Genome::random(&mut rng, 3);
+        let challenge = challenge_from_seed(7);
+        let a = chunk_hash_hex(&render_proof_frame(&genome, 64, 64, 1, 30_000, &challenge, 3, 64, 2));
+        let b = chunk_hash_hex(&render_proof_frame(&genome, 64, 64, 1, 30_000, &challenge, 3, 64, 2));
+        let c = chunk_hash_hex(&render_proof_frame(&genome, 64, 64, 1, 30_000, &challenge, 4, 64, 2));
+        assert_eq!(a, b, "same frame must hash identically");
+        assert_ne!(a, c, "different frames must differ");
+    }
+}
+
 /// Chunk hash: SHA-256 over the chunk's own accumulation buffer (NOT the
 /// running sum) — cells row-major, each cell serialized as 4 x f64
 /// little-endian in order `[r_sum, g_sum, b_sum, count]` (32 bytes/cell).

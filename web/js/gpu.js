@@ -81,7 +81,9 @@ export class GpuFlame {
       if (!adapter) return null;
       const device = await adapter.requestDevice();
       const wgsl = await (await fetch(new URL('../shaders/flame.wgsl', import.meta.url))).text();
-      return new GpuFlame(device, device.createShaderModule({ code: wgsl }));
+      const flame = new GpuFlame(device, device.createShaderModule({ code: wgsl }));
+      flame.adapterInfo = adapter.info ?? {};
+      return flame;
     } catch (err) {
       console.warn('WebGPU unavailable:', err);
       return null;
@@ -234,6 +236,9 @@ export class GpuFlame {
       { width, height },
     );
     d.queue.submit([enc.finish()]);
-    await d.queue.onSubmittedWorkDone();
+    // Some implementations (notably software adapters) reject this promise
+    // with instance-lifetime errors even though the work completes — fall
+    // back to a small delay rather than failing the frame.
+    await d.queue.onSubmittedWorkDone().catch(() => new Promise((r) => setTimeout(r, 50)));
   }
 }

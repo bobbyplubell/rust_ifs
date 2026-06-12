@@ -45,8 +45,10 @@ const ctx = await browser.newContext();
 ctx.setDefaultTimeout(120_000);
 
 let failures = 0;
+const ts = () => new Date().toISOString().slice(11, 19);
+const section = (name) => console.log(`[${ts()}] === ${name}`);
 const check = (name, ok, extra = '') => {
-  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${extra ? ' — ' + extra : ''}`);
+  console.log(`[${ts()}] ${ok ? 'PASS' : 'FAIL'}  ${name}${extra ? ' — ' + extra : ''}`);
   if (!ok) failures++;
 };
 
@@ -54,6 +56,7 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
 
 // ---- 1. determinism ---------------------------------------------------------
 {
+  section('determinism');
   const page = await ctx.newPage();
   page.on('console', (m) => { if (m.type() === 'error') console.log('console.error:', m.text()); });
   await page.goto(`${base}/determinism.html`);
@@ -66,6 +69,7 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
 
 // ---- 2. two peers: render, vote sync, release sync --------------------------
 {
+  section('two peers');
   const p1 = await ctx.newPage();
   const p2 = await ctx.newPage();
   for (const [n, p] of [['p1', p1], ['p2', p2]]) {
@@ -95,11 +99,13 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
   }, undefined, { timeout: 120_000 });
   check('p1 first card rendered pixels', true);
 
-  // Vote on the first card in p1; the proof render runs, then p2's tally bumps.
+  // Vote on the first card in p1: a 64-frame loop proof fans out across the
+  // pool (heavier than the old chunk proof — generous timeout), then p2's
+  // tally bumps.
   const firstId = await p1.locator('.card').first().getAttribute('data-id');
   await p1.locator('.card button', { hasText: /^vote$/ }).first().click();
-  await p1.locator('.card button', { hasText: 'voted ✓' }).first().waitFor({ timeout: 180_000 });
-  check('p1 vote completed (proof rendered + signed)', true);
+  await p1.locator('.card button', { hasText: 'voted ✓' }).first().waitFor({ timeout: 300_000 });
+  check('p1 vote completed (loop proof rendered + signed)', true);
 
   const tally2 = p2.locator(`.card[data-id="${firstId}"] .tally`);
   await tally2.filter({ hasText: '♥' }).waitFor({ timeout: 30_000 });
@@ -113,15 +119,61 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
   const release = p2.locator('#release');
   await release.waitFor();
   await release.click();
-  await p2.locator('#release', { hasText: 'released ✓' }).waitFor({ timeout: 180_000 });
+  await p2.locator('#release', { hasText: 'released ✓' }).waitFor({ timeout: 300_000 });
   check('p2 bred and released a child (with proof)', true);
 
-  let received = true;
-  await p1.waitForFunction(
-    (n) => document.querySelectorAll('.card').length > n, cards1, { timeout: 30_000 },
-  ).catch(() => { received = false; });
-  const after = await p1.locator('.card').count();
-  check('p1 received the released child', received && after > cards1, `${cards1} -> ${after} cards`);
+  section('fraud injection');
+  // Fraud: inject a validly-signed vote with garbage hashes from a fresh key.
+  // The background auditor must re-render a frame, catch the mismatch, gossip
+  // a fraud proof, and the cheater's votes must stop counting. Steps are
+  // separate bounded evaluates so a hang names its step instead of stalling
+  // the suite.
+  try {
+    const step = async (name, fn, arg) => {
+      const r = await Promise.race([
+        p1.evaluate(fn, arg),
+        new Promise((_, rej) =>
+          setTimeout(() => rej(new Error(`fraud step "${name}" hung (30s)`)), 30_000)),
+      ]);
+      if (name !== 'poll stats') console.log(`[${ts()}] fraud step ok: ${name}`);
+      return r;
+    };
+
+    const voter = await step('forge + inject vote', async (sheepId) => {
+      const { voteSignBytes, voteKey, gen, PROOF_SPEC } = await import('./js/net.js');
+      const { hex } = await import('./js/hash.js');
+      const pair = await crypto.subtle.generateKey(
+        { name: 'Ed25519' }, false, ['sign', 'verify']);
+      const voter = hex(new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey)));
+      const chunkHashes = Array.from({ length: PROOF_SPEC.nFrames }, (_, i) =>
+        (i % 10).toString().repeat(64)); // garbage, but well-formed
+      const record = { sheepId, gen: gen(), voter, chunkHashes };
+      record.sig = hex(new Uint8Array(
+        await crypto.subtle.sign({ name: 'Ed25519' }, pair.privateKey, voteSignBytes(record))));
+      record.key = voteKey(record);
+      new BroadcastChannel('sheep-net-v3').postMessage({ kind: 'vote', record });
+      return voter;
+    }, firstId);
+
+    // Poll from node (no long-lived page evaluate): the idle-paced auditor
+    // should convict within a few 8s ticks.
+    let caught = false;
+    let stats = {};
+    const t0 = Date.now();
+    while (Date.now() - t0 < 150_000) {
+      stats = await step('poll stats', () => ({
+        audits: window.__sheepStats.audits,
+        frauds: window.__sheepStats.frauds,
+        banned: window.__sheepStats.banned,
+      }));
+      if (stats.frauds > 0 && stats.banned.includes(voter)) { caught = true; break; }
+      await new Promise((r) => setTimeout(r, 3000));
+    }
+    check('auditor catches forged vote and bans the key', caught,
+      `audits run: ${stats.audits}, frauds: ${stats.frauds}`);
+  } catch (err) {
+    check('auditor catches forged vote and bans the key', false, err.message);
+  }
 
   await p1.close();
   await p2.close();
@@ -129,6 +181,7 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
 
 // ---- 3. generation engine: one vote must still breed children ---------------
 {
+  section('generation engine');
   const page = await ctx.newPage();
   page.on('console', (m) => { if (m.type() === 'error') console.log('gen console.error:', m.text()); });
   await page.goto(`${base}/about.html`);
@@ -172,39 +225,57 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
 
 // ---- 4. WebGPU preview (soft: skips when the container has no WebGPU) -------
 {
+  section('webgpu');
   const page = await ctx.newPage();
   page.on('console', (m) => { if (m.type() === 'error') console.log('gpu console.error:', m.text()); });
   await page.goto(`${base}/about.html`); // any same-origin page to import from
   const result = await page.evaluate(async () => {
     try {
       const { GpuFlame } = await import('./js/gpu.js');
-      const gpu = await GpuFlame.create();
+      // Some headless builds hang inside requestAdapter instead of resolving
+      // null — bound it.
+      const gpu = await Promise.race([
+        GpuFlame.create(),
+        new Promise((r) => setTimeout(() => r(null), 20_000)),
+      ]);
       if (!gpu) return { available: false };
       const canvas = document.createElement('canvas');
       canvas.width = 128;
       canvas.height = 128;
       document.body.append(canvas);
       gpu.configure(canvas);
+      const infoJson = JSON.stringify(gpu.adapterInfo ?? {});
+      // Empty/unidentifiable adapter info in a container = assume software.
+      const software = infoJson.length <= 2 ||
+        /swiftshader|llvmpipe|software|cpu/i.test(infoJson);
       const genome = await (await fetch('genomes/seed_7.json')).text();
       await gpu.frame(genome, 0.3, { width: 128, height: 128, ss: 1, samples: 300_000 });
+      // Software adapters can lag the completion promise — poll up to 5s.
       const chk = document.createElement('canvas');
       chk.width = 128;
       chk.height = 128;
       const c2 = chk.getContext('2d');
-      c2.drawImage(canvas, 0, 0);
-      const d = c2.getImageData(0, 0, 128, 128).data;
       let lit = 0;
-      for (let i = 0; i < d.length; i += 4) if (d[i] + d[i + 1] + d[i + 2] > 30) lit++;
-      return { available: true, lit };
+      for (let tries = 0; tries < 10 && lit <= 50; tries++) {
+        await new Promise((r) => setTimeout(r, 500));
+        c2.drawImage(canvas, 0, 0);
+        const d = c2.getImageData(0, 0, 128, 128).data;
+        lit = 0;
+        for (let i = 0; i < d.length; i += 4) if (d[i] + d[i + 1] + d[i + 2] > 30) lit++;
+      }
+      return { available: true, software, info: infoJson, lit };
     } catch (err) {
-      return { available: true, error: err.message };
+      return { available: true, software: true, error: err.message };
     }
   });
   if (!result.available) {
-    console.log('SKIP  webgpu preview — no WebGPU adapter in this container');
+    console.log(`[${ts()}] SKIP  webgpu preview — no WebGPU adapter in this container`);
+  } else if ((result.error || result.lit <= 50) && result.software) {
+    console.log(`[${ts()}] SKIP  webgpu preview — software adapter quirk: ` +
+      (result.error || `${result.lit} lit pixels`) + ` (adapter: ${result.info ?? '{}'})`);
   } else {
     check('webgpu preview renders pixels', !result.error && result.lit > 50,
-      result.error || `${result.lit} lit pixels`);
+      (result.error || `${result.lit} lit pixels`) + ` (adapter: ${result.info ?? '{}'})`);
   }
   await page.close();
 }

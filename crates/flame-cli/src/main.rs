@@ -42,6 +42,7 @@ fn main() {
         "sheep-id" => cmd_sheep_id(&opts),
         "breed" => cmd_breed(&opts),
         "chunk-hashes" => cmd_chunk_hashes(&opts),
+        "frame-hashes" => cmd_frame_hashes(&opts),
         "-h" | "--help" | "help" => usage(),
         other => {
             eprintln!("unknown command: {other}\n");
@@ -63,7 +64,8 @@ fn usage() {
          \x20 frames-json  --in g.json --frames N [--out-dir dir] [size/quality opts]   (rotation loop)\n\
          \x20 sheep-id     --in g.json   (prints the sha-256 of the canonical genome json)\n\
          \x20 breed        --in-a a.json --in-b b.json --challenge <64-hex> [--out child.json]\n\
-         \x20 chunk-hashes --in g.json --challenge <hex> --chunks N --samples-per-chunk N --width W --height H --ss S\n"
+         \x20 chunk-hashes --in g.json --challenge <hex> --chunks N --samples-per-chunk N --width W --height H --ss S\n\
+         \x20 frame-hashes --in g.json --challenge <hex> --frames N --samples-per-frame N --temporal T --width W --height H --ss S   (loop proof)\n"
     );
 }
 
@@ -294,4 +296,26 @@ fn cmd_chunk_hashes(opts: &HashMap<String, String>) {
     }
     let rgba = flame_core::render::tonemap(&running, &genome, width, height, ss);
     println!("rgba: {}", flame_core::chunked::sha256_hex(&rgba));
+}
+
+// Native side of a protocol-v3 loop-proof audit: per-frame hashes.
+fn cmd_frame_hashes(opts: &HashMap<String, String>) {
+    let input = opts.get("in").expect("--in genome.json required");
+    let challenge_hex = opts.get("challenge").expect("--challenge <hex> required");
+    let challenge = flame_core::chunked::challenge_from_hex(challenge_hex)
+        .unwrap_or_else(|e| panic!("bad --challenge: {e}"));
+    let frames: u32 = get(opts, "frames", 64);
+    let samples_per_frame: u64 = get(opts, "samples-per-frame", 240_000);
+    let temporal: u32 = get(opts, "temporal", 2);
+    let width: usize = get(opts, "width", 256);
+    let height: usize = get(opts, "height", 256);
+    let ss: usize = get(opts, "ss", 1);
+
+    let genome = load_genome(input, "--in");
+    for idx in 0..frames {
+        let accum = flame_core::chunked::render_proof_frame(
+            &genome, width, height, ss, samples_per_frame, &challenge, idx, frames, temporal,
+        );
+        println!("{idx}: {}", flame_core::chunked::chunk_hash_hex(&accum));
+    }
 }

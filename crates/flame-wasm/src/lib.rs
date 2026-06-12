@@ -265,6 +265,72 @@ impl ChunkedRender {
     }
 }
 
+/// One frame of a protocol-v3 loop proof: hash (the proof unit) plus the
+/// tone-mapped RGBA of that frame, so rendering your proof doubles as
+/// watching the loop (and the frames can be cached for replay).
+#[wasm_bindgen]
+pub struct ProofFrame {
+    hash: String,
+    rgba: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl ProofFrame {
+    #[wasm_bindgen(getter)]
+    pub fn hash(&self) -> String {
+        self.hash.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn rgba(&self) -> Vec<u8> {
+        self.rgba.clone()
+    }
+}
+
+#[wasm_bindgen]
+pub fn proof_frame(
+    genome_json: &str,
+    width: u32,
+    height: u32,
+    ss: u32,
+    samples_per_frame: u32,
+    challenge_hex: &str,
+    idx: u32,
+    n_frames: u32,
+    temporal: u32,
+) -> Result<ProofFrame, JsValue> {
+    let genome = parse_genome_unvalidated(genome_json)?;
+    let challenge = parse_challenge(challenge_hex)?;
+    let accum = chunked::render_proof_frame(
+        &genome, width as usize, height as usize, ss as usize,
+        samples_per_frame as u64, &challenge, idx, n_frames, temporal,
+    );
+    let hash = chunked::chunk_hash_hex(&accum);
+    let rgba = tonemap(&accum, &genome, width as usize, height as usize, ss as usize);
+    Ok(ProofFrame { hash, rgba })
+}
+
+/// Audit one loop-proof frame: recompute its hash only (no pixels kept).
+#[wasm_bindgen]
+pub fn audit_frame(
+    genome_json: &str,
+    width: u32,
+    height: u32,
+    ss: u32,
+    samples_per_frame: u32,
+    challenge_hex: &str,
+    idx: u32,
+    n_frames: u32,
+    temporal: u32,
+) -> Result<String, JsValue> {
+    let genome = parse_genome_unvalidated(genome_json)?;
+    let challenge = parse_challenge(challenge_hex)?;
+    let accum = chunked::render_proof_frame(
+        &genome, width as usize, height as usize, ss as usize,
+        samples_per_frame as u64, &challenge, idx, n_frames, temporal,
+    );
+    Ok(chunked::chunk_hash_hex(&accum))
+}
+
 /// Re-render one chunk and return its hex hash without keeping any pixels —
 /// the audit primitive (1/n_chunks of a render's cost).
 #[wasm_bindgen]

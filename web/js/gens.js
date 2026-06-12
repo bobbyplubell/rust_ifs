@@ -21,6 +21,66 @@ export const breedChallenge = (g, idA, idB) => {
 
 const childCache = new Map(); // challengeHex -> {id, genome} (derivation is pure)
 
+// ---- niched selection (fitness sharing) -------------------------------------
+//
+// Survivor slots go to high-tally sheep, but each pick after the first has its
+// tally discounted by similarity to the already-chosen — so one aesthetic
+// cannot monopolize a generation no matter how many peers vote for near-
+// clones. Deterministic: plain IEEE arithmetic over public genome data, so
+// every peer computes the same survivors.
+
+const profileCache = new Map(); // sheepId -> {vars, pal, n}
+
+function profile(record) {
+  let p = profileCache.get(record.id);
+  if (p) return p;
+  const g = JSON.parse(record.genome);
+  const vars = new Array(22).fill(0);
+  for (const t of g.transforms) {
+    t.variations.forEach((w, i) => { vars[i] += Math.abs(w); });
+  }
+  const sum = vars.reduce((a, b) => a + b, 0) || 1;
+  for (let i = 0; i < vars.length; i++) vars[i] /= sum;
+  const pal = [0, 1, 2].map((k) =>
+    g.palette.stops.reduce((a, s) => a + s.rgb[k], 0) / g.palette.stops.length);
+  p = { vars, pal, n: g.transforms.length };
+  profileCache.set(record.id, p);
+  return p;
+}
+
+/** Genome distance in [0, 1]: variation-mix shape, mean palette color,
+ *  structural size. */
+function distance(a, b) {
+  let dv = 0;
+  for (let i = 0; i < 22; i++) dv += Math.abs(a.vars[i] - b.vars[i]);
+  const dp = (Math.abs(a.pal[0] - b.pal[0]) + Math.abs(a.pal[1] - b.pal[1]) +
+    Math.abs(a.pal[2] - b.pal[2])) / 3;
+  return Math.min(1, 0.6 * (dv / 2) + 0.3 * dp + 0.1 * (Math.abs(a.n - b.n) / 7));
+}
+
+/** Greedy niched pick of up to `k` from `voted` ([record, tally], sorted).
+ *  score = tally * (0.25 + 0.75 * min distance to already-chosen). */
+function nichedSurvivors(voted, k) {
+  const cand = voted.map(([r, c]) => ({ r, c, p: profile(r) }));
+  const chosen = [];
+  while (chosen.length < k && cand.length) {
+    let best = 0;
+    let bestScore = -1;
+    for (let i = 0; i < cand.length; i++) {
+      const minD = chosen.length
+        ? Math.min(...chosen.map((s) => distance(cand[i].p, s.p)))
+        : 1;
+      const score = cand[i].c * (0.25 + 0.75 * minD);
+      if (score > bestScore || (score === bestScore && cand[i].r.id < cand[best].r.id)) {
+        best = i;
+        bestScore = score;
+      }
+    }
+    chosen.push(cand.splice(best, 1)[0]);
+  }
+  return chosen.map((s) => s.r);
+}
+
 /**
  * Replay all generations and return the current living flock.
  *
@@ -30,7 +90,7 @@ const childCache = new Map(); // challengeHex -> {id, genome} (derivation is pur
  * @returns {living: Map(id -> record), genActive: number} — records carry
  *          .derived = true when they were born here rather than gossiped.
  */
-export async function computeFlock({ store, baked, breedFn, currentGen }) {
+export async function computeFlock({ store, baked, breedFn, currentGen, banned = new Set() }) {
   const current = currentGen ?? gen();
 
   // Submissions per generation, after the deterministic per-author cap
@@ -54,8 +114,10 @@ export async function computeFlock({ store, baked, breedFn, currentGen }) {
   }
 
   // Vote tallies per generation (dedup is inherent: one key per voter:sheep:gen).
+  // Votes from discredited keys (verified fraud proofs) count for nothing.
   const tallyByGen = new Map();
   for (const v of await store.allVotes()) {
+    if (banned.has(v.voter)) continue;
     if (!tallyByGen.has(v.gen)) tallyByGen.set(v.gen, new Map());
     const t = tallyByGen.get(v.gen);
     t.set(v.sheepId, (t.get(v.sheepId) || 0) + 1);
@@ -78,10 +140,11 @@ export async function computeFlock({ store, baked, breedFn, currentGen }) {
       .sort((a, b) => b[1] - a[1] || (a[0].id < b[0].id ? -1 : 1));
     if (!voted.length) continue; // quiet generation: carry over unchanged
 
-    // Voted sheep take survivor slots first; remaining slots (of K) fill from
-    // the unvoted living, newest first (deterministic). Without the fill, a
-    // lone vote would collapse the population to one un-breedable sheep.
-    const survivors = voted.slice(0, SURVIVORS_K).map(([r]) => r);
+    // Voted sheep take survivor slots first — niched, so near-clones share
+    // their votes' worth. Remaining slots (of K) fill from the unvoted living,
+    // newest first (deterministic). Without the fill, a lone vote would
+    // collapse the population to one un-breedable sheep.
+    const survivors = nichedSurvivors(voted, SURVIVORS_K);
     if (survivors.length < SURVIVORS_K) {
       const taken = new Set(survivors.map((r) => r.id));
       const fill = [...living.values()]

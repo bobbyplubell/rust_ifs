@@ -29,7 +29,7 @@ pub use breed::{breed, crossover, mutate, BREED_MUTATION_RATE};
 pub use canonical::{canonical_json, canonicalize, sheep_id, sheep_id_hex};
 pub use chunked::{
     challenge_from_hex, challenge_from_seed, chunk_hash, chunk_hash_hex, chunk_seed, render_chunk,
-    sha256_hex, to_hex, Challenge, CHUNK_BURN_IN,
+    render_proof_frame, sha256_hex, to_hex, Challenge, CHUNK_BURN_IN,
 };
 pub use genome::{Camera, Genome, Transform};
 pub use palette::{Palette, Stop};

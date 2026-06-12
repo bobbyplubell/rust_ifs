@@ -93,22 +93,24 @@ independently by two partitioned clients — merges into one.
 ### Vote (with embedded render proof — "Proof of Sheep")
 
 ```
-challenge_seed = H(sheep_id ‖ voter_pubkey ‖ gen)
+challenge_seed = H("v3" ‖ sheep_id ‖ voter_pubkey ‖ gen)
 {
   sheep_id:     ...,
   gen:          u64,
   voter:        pubkey,
-  chunk_hashes: [H(chunk_histogram); M],   // M = 64 (tunable)
+  chunk_hashes: [H(frame_histogram); M],   // M = 64 (tunable)
   sig:          ...
 }
 ```
 
-The **render proof** works because the accumulation histogram is additive:
-the protocol render is defined as the sum of `M` chunks, where chunk `i` runs
-`samples/M` iterations seeded by `H(challenge_seed ‖ i)` with its own burn-in.
-The client renders all chunks (this is also how the progressive-rendering UI
-works — the proof is a by-product of watching the sheep appear), hashes each
-chunk's histogram buffer, and signs the list.
+**Protocol v3 — loop proofs.** The proof's M units are *frames of the sheep's
+animation loop*: frame `i` is the genome animated to phase `i/M`, rendered as
+T=2 temporal sub-steps (motion blur) seeded from `H(challenge_seed ‖ i)`, each
+frame's histogram hashed independently. Proving a vote therefore means
+rendering — watching — one full loop of the sheep (~15M samples, tens of
+seconds of background CPU: a real cost, deliberately), and the frames are
+cached so the proven sheep replays as an animation afterward. The audit
+asymmetry is unchanged: re-render one random frame = 1/M of the cost.
 
 Key properties:
 
@@ -186,6 +188,13 @@ unfinalized window. The full vote history is thus bounded: state size grows
 with sheep, not with votes.
 
 ### Breeding (no coordinator)
+
+Survivor selection is **niched** (fitness sharing): slots go to high-tally
+sheep, but each pick after the first has its tally discounted by genome
+similarity to the already-chosen (variation mix, palette, structure), so one
+aesthetic cannot monopolize a generation no matter how many peers vote for
+near-clones — the monoculture defense for large swarms. Unfilled slots top up
+from the unvoted living (newest first) so the population stays breedable.
 
 At generation close, survivors breed deterministically:
 

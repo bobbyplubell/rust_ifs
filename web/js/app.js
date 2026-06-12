@@ -12,6 +12,7 @@ import {
 } from './net.js';
 import { computeFlock, breedChallenge } from './gens.js';
 import { handle, provenance } from './names.js';
+import { Auditor } from './audit.js';
 import { RELAYS } from '../config.js';
 
 const $ = (s) => document.querySelector(s);
@@ -25,8 +26,9 @@ const cards = new Map();   // sheepId -> {record, canvas, tallyEl, voteBtn, card
 const tallies = new Map(); // sheepId -> Set of vote keys
 const selected = [];       // up to two sheepIds picked as parents
 
-let me, store, net, baked = [];
+let me, store, net, auditor, baked = [];
 let shownGen = -1;
+let bannedVoters = new Set(); // voters with verified fraud proofs (local view)
 
 async function main() {
   me = await loadIdentity();
@@ -44,17 +46,34 @@ async function main() {
     }
   }
 
+  const checkFrameHash = (genomeJson, challengeHex, idx) =>
+    pool.submit({
+      type: 'audit-frame', genomeJson, challengeHex, idx,
+      width: PROOF_SPEC.width, height: PROOF_SPEC.height, ss: PROOF_SPEC.ss,
+      samplesPerFrame: PROOF_SPEC.samplesPerFrame,
+      nFrames: PROOF_SPEC.nFrames, temporal: PROOF_SPEC.temporal,
+    }).done.then((m) => m.hash);
+
   net = new Net({
     transport: new CompositeTransport(transports),
     store,
     pubHex: me.pubHex,
     checkSheepId: (genomeJson) =>
       pool.submit({ type: 'sheep-id', genomeJson }).done.then((m) => m.id),
+    checkFrameHash,
+    lookupSheep: async (id) =>
+      baked.find((s) => s.id === id) ?? (await store.allSheep()).find((s) => s.id === id),
     onSheep: () => scheduleRebuild(),
     onVote: (v) => {
       bumpTally(v);
       if (v.gen < gen()) scheduleRebuild(); // late vote can rewrite a closed gen
     },
+    onFraud: () => scheduleRebuild(), // a discredited voter changes tallies
+  });
+
+  auditor = new Auditor({
+    pool, store, net, me, baked,
+    onUpdate: () => updateStatus(),
   });
 
   // Seed the baked gen-0 flock from the static manifest (local only, not gossiped).
@@ -69,6 +88,13 @@ async function main() {
   await rebuildFlock();
 
   await net.start();
+  if (!new URLSearchParams(location.search).get('noaudit')) auditor.start();
+  // Test hook (e2e) + curious users.
+  window.__sheepStats = {
+    get audits() { return auditor.stats.audits; },
+    get frauds() { return auditor.stats.frauds; },
+    get banned() { return [...bannedVoters]; },
+  };
   shownGen = gen();
   setInterval(() => {
     updateStatus();
@@ -94,10 +120,12 @@ function scheduleRebuild() {
 // Recompute the living flock and diff it against the cards on screen — only
 // changed cards re-render (renders are the expensive part).
 async function rebuildFlock() {
-  const { living } = await computeFlock({ store, baked, breedFn });
+  bannedVoters = new Set((await store.allFraud()).map((f) => f.vote.voter));
+  const { living } = await computeFlock({ store, baked, breedFn, banned: bannedVoters });
   for (const [id, entry] of cards) {
     if (!living.has(id)) {
       if (spinning?.entry === entry) { spinning.stop = true; spinning = null; }
+      stopReplay(entry);
       const at = selected.indexOf(id);
       if (at !== -1) { selected.splice(at, 1); $('#nursery').hidden = true; }
       entry.card.remove();
@@ -140,10 +168,15 @@ function addCard(record) {
   const voteBtn = document.createElement('button');
   voteBtn.textContent = 'vote';
   meta.append(label, tallyEl, spinBtn, voteBtn);
-  card.append(canvas, meta);
+  const bar = document.createElement('div');
+  bar.className = 'bar';
+  const barFill = document.createElement('div');
+  barFill.className = 'bar-fill';
+  bar.append(barFill);
+  card.append(canvas, bar, meta);
   $('#flock').append(card);
 
-  const entry = { record, canvas, tallyEl, spinBtn, voteBtn, card };
+  const entry = { record, canvas, tallyEl, spinBtn, voteBtn, card, barFill };
   cards.set(record.id, entry);
   updateTally(record.id);
 
@@ -228,6 +261,60 @@ function stopSpin() {
     .catch(showError);
 }
 
+// ---- loop proofs (protocol v3) -----------------------------------------------
+
+// Render the 64-frame loop proof, fanned out across the worker pool. Frames
+// paint into `canvas` as they land (watching the loop assemble IS the work);
+// returns ordered hashes + the frames for replay, or null on cancellation.
+async function renderLoopProof(canvas, genomeJson, challengeHex, onProgress) {
+  const ctx = canvas.getContext('2d');
+  const { nFrames } = PROOF_SPEC;
+  const frames = new Array(nFrames);
+  const hashes = new Array(nFrames);
+  let done = 0;
+  const jobs = [];
+  for (let i = 0; i < nFrames; i++) {
+    jobs.push(pool.submit({
+      type: 'proof-frame', genomeJson, challengeHex, idx: i,
+      width: PROOF_SPEC.width, height: PROOF_SPEC.height, ss: PROOF_SPEC.ss,
+      samplesPerFrame: PROOF_SPEC.samplesPerFrame,
+      nFrames, temporal: PROOF_SPEC.temporal,
+    }).done.then((m) => {
+      if (m.type !== 'done') throw new Error('proof cancelled');
+      hashes[m.idx] = m.hash;
+      frames[m.idx] = new ImageData(new Uint8ClampedArray(m.rgba), m.width, m.height);
+      ctx.putImageData(frames[m.idx], 0, 0);
+      onProgress?.(++done, nFrames);
+    }));
+  }
+  try {
+    await Promise.all(jobs);
+  } catch (err) {
+    console.error('loop proof failed:', err?.message || err);
+    return null;
+  }
+  return { hashes, frames };
+}
+
+// Replay a completed proof loop on a card — the reward for voting: your
+// proven sheep dances. Costs nothing (cached frames).
+function startReplay(entry, frames) {
+  stopReplay(entry);
+  const ctx = entry.canvas.getContext('2d');
+  let i = 0;
+  entry.replay = setInterval(() => {
+    ctx.putImageData(frames[i], 0, 0);
+    i = (i + 1) % frames.length;
+  }, Math.round(14_000 / frames.length));
+}
+
+function stopReplay(entry) {
+  if (entry.replay) {
+    clearInterval(entry.replay);
+    entry.replay = null;
+  }
+}
+
 // ---- voting ----------------------------------------------------------------
 
 async function vote(entry) {
@@ -237,22 +324,27 @@ async function vote(entry) {
   if (tallies.get(entry.record.id)?.has(myKey)) return; // already voted this gen
 
   entry.voteBtn.disabled = true;
-  entry.voteBtn.textContent = 'rendering…';
   entry.votePending = true;
-  // The proof render IS watching the sheep: personal challenge, full spec.
+  stopReplay(entry);
+  // The proof render IS watching the sheep: your personal challenge, one full
+  // loop of its animation, hashed frame by frame.
   const challengeHex = await voteChallenge(entry.record.id, me.pubHex, g);
-  const chunkHashes = await drawProgressively(
-    entry.canvas, entry.record.genome, null, challengeHex, PROOF_SPEC);
+  const res = await renderLoopProof(
+    entry.canvas, entry.record.genome, challengeHex,
+    (d, n) => {
+      entry.voteBtn.textContent = `${d}/${n}`;
+      entry.barFill.style.width = `${(100 * d) / n}%`;
+    },
+  );
   entry.votePending = false;
-  if (!chunkHashes) { entry.voteBtn.disabled = false; entry.voteBtn.textContent = 'vote'; return; }
+  entry.barFill.style.width = '0';
+  if (!res) { entry.voteBtn.disabled = false; entry.voteBtn.textContent = 'vote'; return; }
 
-  const record = { sheepId: entry.record.id, gen: g, voter: me.pubHex, chunkHashes };
+  const record = { sheepId: entry.record.id, gen: g, voter: me.pubHex, chunkHashes: res.hashes };
   record.sig = await sign(me.pair, voteSignBytes(record));
   await net.publishVote(record);
   entry.voteBtn.textContent = 'voted ✓';
-  // The proof render is protocol-quality; settle back to display quality.
-  drawProgressively(entry.canvas, entry.record.genome, `view|${entry.record.id}`)
-    .catch(showError);
+  startReplay(entry, res.frames);
 }
 
 function bumpTally(v, quiet) {
@@ -265,9 +357,11 @@ function updateTally(sheepId) {
   const entry = cards.get(sheepId);
   if (!entry) return;
   const set = tallies.get(sheepId);
-  // Display only this generation's votes — they're what selection will use.
+  // Display only this generation's votes, excluding discredited voters.
   const g = gen();
-  const now = set ? [...set].filter((k) => k.endsWith(`:${g}`)).length : 0;
+  const now = set
+    ? [...set].filter((k) => k.endsWith(`:${g}`) && !bannedVoters.has(k.split(':')[0])).length
+    : 0;
   entry.tallyEl.textContent = now ? `${now} ♥` : '';
   if (set?.has(`${me.pubHex}:${sheepId}:${g}`)) {
     entry.voteBtn.textContent = 'voted ✓';
@@ -327,13 +421,14 @@ async function breedSelected() {
   release.textContent = cards.has(childId) ? 'already in flock' : 'render & release';
   release.onclick = async () => {
     release.disabled = true;
-    release.textContent = 'rendering proof…';
-    // Releasing costs the same proof-of-render as voting (challenge bound to
-    // you + this gen), and the same hashes double as your vote for the child.
+    // Releasing costs the same loop proof as voting (challenge bound to you +
+    // this gen), and the same hashes double as your vote for the child.
     const rg = gen();
     const proofChallenge = await voteChallenge(childId, me.pubHex, rg);
-    const chunkHashes = await drawProgressively(canvas, childJson, null, proofChallenge, PROOF_SPEC);
-    if (!chunkHashes) { release.disabled = false; release.textContent = 'render & release'; return; }
+    const res = await renderLoopProof(canvas, childJson, proofChallenge,
+      (d, n) => { release.textContent = `rendering proof ${d}/${n}`; });
+    if (!res) { release.disabled = false; release.textContent = 'render & release'; return; }
+    const chunkHashes = res.hashes;
 
     const record = {
       id: childId, genome: childJson, parents: [aId, bId], gen: rg,
@@ -357,10 +452,11 @@ function updateStatus() {
   const msLeft = GEN_MS - (Date.now() % GEN_MS);
   const mm = String(Math.floor(msLeft / 60_000));
   const ss = String(Math.floor((msLeft % 60_000) / 1000)).padStart(2, '0');
+  const a = auditor?.stats ?? { audits: 0, frauds: 0 };
   $('#status').textContent =
     `gen ${gen() - GENESIS_GEN} closes in ${mm}:${ss} · ` +
     `you are ${handle(me.pubHex)} · ${net.peerCount()} peers · ` +
-    `${pool.chunksRendered} chunks rendered`;
+    `${a.audits} audits${a.frauds ? `, ${a.frauds} frauds!` : ''}`;
 }
 
 function showError(err) {

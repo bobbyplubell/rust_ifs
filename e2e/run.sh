@@ -5,5 +5,5 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 docker run --rm -v "$PWD":/repo:z -w /repo/e2e \
-  mcr.microsoft.com/playwright:v1.49.1-noble \
+  mcr.microsoft.com/playwright:v1.53.0-noble \
   bash -c 'npm install --no-audit --no-fund >/dev/null 2>&1; node test.js'

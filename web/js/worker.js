@@ -37,6 +37,8 @@ import init, {
   breed,
   sheep_id,
   render_frame,
+  proof_frame,
+  audit_frame,
 } from '../pkg/flame_wasm.js';
 
 // Job ids cancelled by the main thread. Checked between chunks; once a job
@@ -64,6 +66,8 @@ self.onmessage = async (event) => {
       case 'breed':      handleBreed(msg); break;
       case 'sheep-id':   handleSheepId(msg); break;
       case 'frame':      handleFrame(msg); break;
+      case 'proof-frame': handleProofFrame(msg); break;
+      case 'audit-frame': handleAuditFrame(msg); break;
       default:
         throw new Error(`unknown message type: ${msg.type}`);
     }
@@ -145,6 +149,35 @@ function handleBreed(msg) {
 }
 
 // Protocol extension (see header): one animation frame at loop `phase`.
+// One frame of a protocol-v3 loop proof: returns the proof hash AND the
+// frame's pixels (the proof render IS watching the loop; frames are cached
+// for replay). {type:'proof-frame', jobId, genomeJson, challengeHex, idx,
+// width, height, ss, samplesPerFrame, nFrames, temporal}
+function handleProofFrame(msg) {
+  const pf = proof_frame(
+    msg.genomeJson, msg.width, msg.height, msg.ss,
+    msg.samplesPerFrame, msg.challengeHex, msg.idx, msg.nFrames, msg.temporal,
+  );
+  if (cancelled.has(msg.jobId)) return;
+  const rgba = pf.rgba.buffer;
+  const hash = pf.hash;
+  pf.free();
+  self.postMessage(
+    { type: 'done', jobId: msg.jobId, idx: msg.idx, hash, rgba, width: msg.width, height: msg.height },
+    [rgba],
+  );
+}
+
+// Audit one loop-proof frame: hash only.
+function handleAuditFrame(msg) {
+  const hash = audit_frame(
+    msg.genomeJson, msg.width, msg.height, msg.ss,
+    msg.samplesPerFrame, msg.challengeHex, msg.idx, msg.nFrames, msg.temporal,
+  );
+  if (cancelled.has(msg.jobId)) return;
+  self.postMessage({ type: 'done', jobId: msg.jobId, idx: msg.idx, hash });
+}
+
 function handleFrame(msg) {
   const { jobId, genomeJson, phase, width, height, samples, seed } = msg;
   // shutter/temporal: flam3-style motion blur (budget split, cost-neutral).
