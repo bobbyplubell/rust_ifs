@@ -23,7 +23,10 @@
   </style>
 </head>
 <body>
-  <div id="stage"><canvas id="cv" width="512" height="512"></canvas></div>
+  <div id="stage">
+    <canvas id="cv" width="512" height="512"></canvas>
+    <canvas id="cvgpu" width="768" height="768" hidden></canvas>
+  </div>
   <div id="hud">
     <span id="info">loading…</span>
     <span id="sheep-id" class="id"></span>
@@ -43,6 +46,7 @@
     import { PEER_NS } from './js/identity.js';
     import { GENESIS_GEN } from './js/net.js';
     import { sha256Hex, utf8 } from './js/hash.js';
+    import { GpuFlame } from './js/gpu.js';
 
     const $ = (s) => document.querySelector(s);
     const params = new URLSearchParams(location.search);
@@ -60,8 +64,17 @@
       high: { width: 768, height: 768, ss: 2, nChunks: 64, samplesPerChunk: 650_000 },
     };
     let quality = localStorage.getItem('sheep-quality') || 'med';
-    const FRAME = { width: 320, height: 320, samples: 450_000, seed: 7 };
+    const FRAME = { width: 320, height: 320, samples: 450_000, seed: 7 };       // CPU fallback spin
+    const GPU_FRAME = { width: 768, height: 768, ss: 1, samples: 10_000_000 };  // WebGPU spin
     const LOOP_MS = 14_000;
+
+    // WebGPU preview (display-only — proofs are CPU-deterministic, the GPU's
+    // per-thread RNG stream is a different sample of the same attractor).
+    let gpu = null;
+    GpuFlame.create().then((g) => {
+      gpu = g;
+      if (g) $('#spin').textContent = 'spin (gpu)';
+    });
 
     async function findRecord() {
       // The store has everything we've seen (gossiped or our own); baked
@@ -114,13 +127,40 @@
     async function toggleSpin() {
       if (spinning) {
         spinning.stop = true; spinning = null;
-        $('#spin').textContent = 'spin';
+        $('#spin').textContent = gpu ? 'spin (gpu)' : 'spin';
+        $('#cvgpu').hidden = true;
+        $('#cv').hidden = false;
         if (still) paint(still); else renderStill();
         return;
       }
       const s = { stop: false };
       spinning = s;
       $('#spin').textContent = 'stop';
+      if (gpu) await spinGpu(s); else await spinCpu(s);
+    }
+
+    async function spinGpu(s) {
+      const cvgpu = $('#cvgpu');
+      try {
+        gpu.configure(cvgpu);
+        cvgpu.hidden = false;
+        $('#cv').hidden = true;
+        while (!s.stop) {
+          const phase = (performance.now() % LOOP_MS) / LOOP_MS;
+          await gpu.frame(record.genome, phase, GPU_FRAME);
+          await new Promise(requestAnimationFrame);
+        }
+      } catch (err) {
+        // GPU died (device loss, validation): fall back to CPU for the session.
+        console.warn('gpu spin failed, falling back to cpu:', err);
+        gpu = null;
+        cvgpu.hidden = true;
+        $('#cv').hidden = false;
+        if (!s.stop) await spinCpu(s);
+      }
+    }
+
+    async function spinCpu(s) {
       const frameJob = () => pool.submit({
         type: 'frame', genomeJson: record.genome,
         phase: (performance.now() % LOOP_MS) / LOOP_MS, ...FRAME,

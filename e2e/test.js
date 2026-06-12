@@ -32,9 +32,14 @@ await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}`;
 console.log('serving web/ at', base);
 
-// Flag needed for WebCrypto Ed25519 on Chromium < 137 (default-on later).
+// Flags: WebCrypto Ed25519 on Chromium < 137 (default-on later), and best-
+// effort software WebGPU so the GPU preview path gets exercised when possible.
 const browser = await chromium.launch({
-  args: ['--enable-experimental-web-platform-features'],
+  args: [
+    '--enable-experimental-web-platform-features',
+    '--enable-unsafe-webgpu',
+    '--use-webgpu-adapter=swiftshader',
+  ],
 });
 const ctx = await browser.newContext();
 ctx.setDefaultTimeout(120_000);
@@ -120,6 +125,45 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
 
   await p1.close();
   await p2.close();
+}
+
+// ---- 3. WebGPU preview (soft: skips when the container has no WebGPU) -------
+{
+  const page = await ctx.newPage();
+  page.on('console', (m) => { if (m.type() === 'error') console.log('gpu console.error:', m.text()); });
+  await page.goto(`${base}/about.html`); // any same-origin page to import from
+  const result = await page.evaluate(async () => {
+    try {
+      const { GpuFlame } = await import('./js/gpu.js');
+      const gpu = await GpuFlame.create();
+      if (!gpu) return { available: false };
+      const canvas = document.createElement('canvas');
+      canvas.width = 128;
+      canvas.height = 128;
+      document.body.append(canvas);
+      gpu.configure(canvas);
+      const genome = await (await fetch('genomes/seed_7.json')).text();
+      await gpu.frame(genome, 0.3, { width: 128, height: 128, ss: 1, samples: 300_000 });
+      const chk = document.createElement('canvas');
+      chk.width = 128;
+      chk.height = 128;
+      const c2 = chk.getContext('2d');
+      c2.drawImage(canvas, 0, 0);
+      const d = c2.getImageData(0, 0, 128, 128).data;
+      let lit = 0;
+      for (let i = 0; i < d.length; i += 4) if (d[i] + d[i + 1] + d[i + 2] > 30) lit++;
+      return { available: true, lit };
+    } catch (err) {
+      return { available: true, error: err.message };
+    }
+  });
+  if (!result.available) {
+    console.log('SKIP  webgpu preview — no WebGPU adapter in this container');
+  } else {
+    check('webgpu preview renders pixels', !result.error && result.lit > 50,
+      result.error || `${result.lit} lit pixels`);
+  }
+  await page.close();
 }
 
 await browser.close();
