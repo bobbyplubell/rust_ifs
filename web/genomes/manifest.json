@@ -1,0 +1,11 @@
+{
+  "title": "Electric Sheep, judged by a machine",
+  "sheep": [
+    { "name": "Sheep #2",  "file": "genomes/seed_2.json",  "seed": 2 },
+    { "name": "Sheep #3",  "file": "genomes/seed_3.json",  "seed": 3 },
+    { "name": "Sheep #7",  "file": "genomes/seed_7.json",  "seed": 7 },
+    { "name": "Sheep #11", "file": "genomes/seed_11.json", "seed": 11 },
+    { "name": "Sheep #23", "file": "genomes/seed_23.json", "seed": 23 },
+    { "name": "Sheep #42", "file": "genomes/seed_42.json", "seed": 42 }
+  ]
+}
