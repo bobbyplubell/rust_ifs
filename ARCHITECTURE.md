@@ -217,9 +217,17 @@ public data.
 
 ## Network
 
-- **Transports:** WebSocket (browser ↔ relay), WebRTC (browser ↔ browser,
-  signaled via circuit relay v2). Browsers cannot accept inbound connections;
-  the relay exists solely to introduce peers, after which data flows direct.
+The protocol logic is written against a minimal transport interface
+(`send(msg)` / `onMessage(fn)` — see `web/js/net.js`), with two
+implementations:
+
+- **BroadcastChannel (dev, implemented):** every same-origin tab joins the
+  bus, so two tabs are a real two-peer network with no infrastructure.
+  `?peer=N` namespaces identity + store per tab so tabs are *distinct* peers.
+- **js-libp2p (production, planned):** WebSocket (browser ↔ relay), WebRTC
+  (browser ↔ browser, signaled via circuit relay v2). Browsers cannot accept
+  inbound connections; the relay exists solely to introduce peers, after which
+  data flows direct.
 - **Pubsub:** gossipsub topics — `sheep/v1/sheep`, `sheep/v1/votes`,
   `sheep/v1/fraud`. Messages are gossip-friendly sizes (genomes ~3 KB, votes
   ~2.5 KB). Blocks are *not* gossiped as objects — only block hashes appear,

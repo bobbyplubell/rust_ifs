@@ -63,6 +63,7 @@ self.onmessage = async (event) => {
       case 'render':     await handleRender(msg); break;
       case 'audit':      handleAudit(msg); break;
       case 'breed':      handleBreed(msg); break;
+      case 'sheep-id':   handleSheepId(msg); break;
       case 'spin-frame': handleSpinFrame(msg); break;
       default:
         throw new Error(`unknown message type: ${msg.type}`);
@@ -128,6 +129,13 @@ function handleAudit(msg) {
   );
   if (cancelled.has(msg.jobId)) return;
   self.postMessage({ type: 'done', jobId: msg.jobId, hash });
+}
+
+// {type:'sheep-id', jobId, genomeJson} -> {type:'done', jobId, id}
+function handleSheepId(msg) {
+  const id = sheep_id(msg.genomeJson);
+  if (cancelled.has(msg.jobId)) return;
+  self.postMessage({ type: 'done', jobId: msg.jobId, id });
 }
 
 function handleBreed(msg) {

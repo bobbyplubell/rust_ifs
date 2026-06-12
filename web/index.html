@@ -3,81 +3,33 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Electric Sheep — WASM fractal flames</title>
+  <title>Electric Sheep</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <header>
-    <h1>Electric <span class="glow">Sheep</span></h1>
-    <p class="sub">
-      Fractal flames rendered <em>live in your browser</em> by Rust
-      <code>flame-core</code> compiled to WASM — chunk by deterministic chunk,
-      on a pool of Web Workers.
+    <h1>electric sheep</h1>
+    <p>
+      fractal flames rendered in your browser by rust→wasm.
+      click a sheep to pick parents — two parents breed their one canonical child.
+      voting renders your personal proof.
+      open <code>?peer=2</code> in another tab to be a second peer.
     </p>
-    <nav>
-      <button class="tab active" data-view="view-flock">Flock</button>
-      <button class="tab" data-view="view-lab">Breeding lab</button>
-      <a class="tab tab-link" href="determinism.html">Determinism check</a>
-    </nav>
   </header>
 
-  <main>
-    <section id="view-flock">
-      <div id="flock-grid" class="grid"></div>
-    </section>
-
-    <section id="view-lab" hidden>
-      <div class="lab-top">
-        <div class="parents">
-          <div id="slot-a" class="slot" title="click to clear">
-            <canvas width="160" height="160"></canvas>
-            <span class="slot-label">pick a sheep</span>
-          </div>
-          <div class="heart">♥</div>
-          <div id="slot-b" class="slot" title="click to clear">
-            <canvas width="160" height="160"></canvas>
-            <span class="slot-label">pick a sheep</span>
-          </div>
-        </div>
-        <div id="lab-picker" class="picker"></div>
-      </div>
-      <p id="lab-hint" class="hint">
-        Pick two parents. Breeding is deterministic — the canonical child of any
-        pair already exists; the lab just lets you look at it early.
-      </p>
-      <div class="lab-results">
-        <div id="lab-child" class="child-mount"></div>
-        <div id="lab-whatif" class="whatif-grid"></div>
-      </div>
-    </section>
-  </main>
-
-  <div id="sheep-modal" hidden>
-    <div class="modal-box">
-      <div class="modal-head">
-        <div>
-          <div id="modal-title" class="modal-title"></div>
-          <div id="modal-sub" class="modal-sub"></div>
-        </div>
-        <button id="modal-close" class="mini-btn" title="close">✕</button>
-      </div>
-      <div class="frame">
-        <canvas id="modal-canvas" width="512" height="512"></canvas>
-        <div id="modal-bar" class="bar"><div id="modal-bar-fill" class="bar-fill"></div></div>
-      </div>
-      <div class="modal-actions">
-        <button id="modal-spin" class="btn">spin</button>
-        <button id="modal-download" class="btn">genome ↓</button>
-      </div>
+  <div id="nursery" hidden>
+    <canvas id="child-canvas" width="256" height="256"></canvas>
+    <div>
+      <p id="nursery-note"></p>
+      <button id="release" hidden></button>
     </div>
   </div>
 
+  <main id="flock"></main>
+
   <footer>
-    <span id="status-bar">starting workers…</span>
-    <span class="footer-credit">
-      <code>flame-core</code> → WASM ·
-      <a href="https://flam3.com/flame_draves.pdf">the Fractal Flame algorithm</a>
-    </span>
+    <span id="status">starting…</span>
+    <a href="determinism.html">determinism check</a>
   </footer>
 
   <script type="module" src="js/app.js"></script>

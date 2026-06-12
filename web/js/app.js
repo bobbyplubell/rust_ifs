@@ -1,410 +1,216 @@
-// app.js — flock view, sheep view (modal), breeding lab.
-// No framework, no build step; everything renders through the worker pool.
+// app.js — minimal UI: a flock grid, click-two-to-breed, render-to-vote.
+// All state comes from the store + network (net.js); all pixels from the
+// worker pool (pool.js). No framework, no build step.
 
 import { WorkerPool } from './pool.js';
 import { sha256Hex, utf8 } from './hash.js';
+import { loadIdentity, sign, PEER_NS } from './identity.js';
+import { openStore } from './store.js';
+import {
+  Net, BroadcastTransport, gen, PROOF_SPEC,
+  sheepSignBytes, voteSignBytes, voteChallenge,
+} from './net.js';
 
-// Render budgets ---------------------------------------------------------
-
-const FLOCK  = { width: 256, height: 256, ss: 1, nChunks: 64, samplesPerChunk: 20_000, tonemapEvery: 4 };
-const DETAIL = { width: 512, height: 512, ss: 1, nChunks: 64, samplesPerChunk: 60_000, tonemapEvery: 4 };
-const CHILD  = { width: 256, height: 256, ss: 1, nChunks: 64, samplesPerChunk: 20_000, tonemapEvery: 4 };
-const WHATIF = { width: 128, height: 128, ss: 1, nChunks: 32, samplesPerChunk: 10_000, tonemapEvery: 4 };
-const SPIN   = { width: 256, height: 256, samples: 400_000 };
-
-// State -------------------------------------------------------------------
-
+const $ = (s) => document.querySelector(s);
 const pool = new WorkerPool();
-const flock = []; // {name, file, seed, genomeJson, card, canvas, handle}
-let parentA = null;
-let parentB = null;
-let labJobs = []; // cancellable handles for the current lab pairing
-let labRun = 0;   // monotonically increasing; stale lab async work checks it
 
-// DOM helpers ---------------------------------------------------------------
+const cards = new Map();   // sheepId -> {record, canvas, tallyEl, voteBtn, card}
+const tallies = new Map(); // sheepId -> Set of vote keys
+const selected = [];       // up to two sheepIds picked as parents
 
-const $ = (sel, root = document) => root.querySelector(sel);
+let me, store, net;
 
-function el(tag, className, text) {
-  const node = document.createElement(tag);
-  if (className) node.className = className;
-  if (text !== undefined) node.textContent = text;
-  return node;
-}
-
-function drawRgba(canvas, rgbaBuffer, w, h) {
-  if (canvas.width !== w || canvas.height !== h) {
-    canvas.width = w;
-    canvas.height = h;
-  }
-  const img = new ImageData(new Uint8ClampedArray(rgbaBuffer), w, h);
-  canvas.getContext('2d').putImageData(img, 0, 0);
-}
-
-// Draw a frame scaled to whatever size the canvas already is.
-const scratch = document.createElement('canvas');
-function drawRgbaScaled(canvas, rgbaBuffer, w, h) {
-  scratch.width = w;
-  scratch.height = h;
-  scratch.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(rgbaBuffer), w, h), 0, 0);
-  const ctx = canvas.getContext('2d');
-  ctx.imageSmoothingEnabled = true;
-  ctx.drawImage(scratch, 0, 0, canvas.width, canvas.height);
-}
-
-function downloadText(filename, text) {
-  const blob = new Blob([text], { type: 'application/json' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-function progressCard(opts) {
-  // Shared card scaffold: canvas + progress bar + caption row.
-  const card = el('div', `card ${opts.className || ''}`);
-  const frame = el('div', 'frame');
-  const canvas = el('canvas');
-  canvas.width = opts.width;
-  canvas.height = opts.height;
-  const bar = el('div', 'bar');
-  const fill = el('div', 'bar-fill');
-  bar.append(fill);
-  frame.append(canvas, bar);
-  card.append(frame);
-  if (opts.caption) card.append(opts.caption);
-  return { card, canvas, fill, bar };
-}
-
-function renderProgressively(canvas, fill, genomeJson, budget, challenge) {
-  // challenge: {challengeHex} or {challengeSeed}
-  const handle = pool.submit({ type: 'render', genomeJson, ...budget, ...challenge });
-  handle.onProgress = (msg) => {
-    fill.style.width = `${(((msg.chunkIdx + 1) / budget.nChunks) * 100).toFixed(1)}%`;
-    if (msg.rgba) drawRgba(canvas, msg.rgba, msg.width, msg.height);
-  };
-  handle.done
-    .then((msg) => {
-      if (msg.type === 'done') {
-        drawRgba(canvas, msg.rgba, msg.width, msg.height);
-        fill.parentElement.classList.add('bar-done');
-      }
-    })
-    .catch((err) => {
-      fill.parentElement.classList.add('bar-error');
-      console.error('render failed:', err);
-    });
-  return handle;
-}
-
-// Tabs ---------------------------------------------------------------------
-
-function initTabs() {
-  const tabs = document.querySelectorAll('nav .tab');
-  tabs.forEach((tab) => {
-    tab.addEventListener('click', () => {
-      tabs.forEach((t) => t.classList.toggle('active', t === tab));
-      document.querySelectorAll('main > section').forEach((s) => {
-        s.hidden = s.id !== tab.dataset.view;
-      });
-    });
+async function main() {
+  me = await loadIdentity();
+  store = await openStore();
+  net = new Net({
+    transport: new BroadcastTransport(),
+    store,
+    pubHex: me.pubHex,
+    checkSheepId: (genomeJson) =>
+      pool.submit({ type: 'sheep-id', genomeJson }).done.then((m) => m.id),
+    onSheep: (r) => addCard(r),
+    onVote: (v) => bumpTally(v),
   });
-}
 
-// Flock view -----------------------------------------------------------------
-
-async function buildFlock() {
+  // Seed the baked gen-0 flock from the static manifest (local only, not gossiped).
   const manifest = await (await fetch('genomes/manifest.json')).json();
-  const grid = $('#flock-grid');
-
-  for (const sheep of manifest.sheep) {
-    const genomeJson = await (await fetch(sheep.file)).text();
-
-    const caption = el('div', 'meta');
-    const name = el('span', 'name', sheep.name);
-    // TODO(integration): show first 8 hex chars of wasm sheep_id(genomeJson)
-    // here; until the new exports land we show the manifest seed instead.
-    const idTag = el('span', 'sheep-id', `#${sheep.seed}`);
-    caption.append(name, idTag);
-
-    const { card, canvas, fill } = progressCard({ ...FLOCK, caption, className: 'flock-card' });
-    grid.append(card);
-
-    const entry = { ...sheep, genomeJson, card, canvas };
-    flock.push(entry);
-
-    // Flock renders are casual: challenge derived in the worker from the
-    // manifest seed via challenge_from_seed (challengeSeed protocol extension).
-    renderProgressively(canvas, fill, genomeJson, FLOCK, { challengeSeed: sheep.seed });
-
-    card.addEventListener('click', () => openSheepModal(entry));
+  for (const s of manifest.sheep) {
+    const genome = await (await fetch(s.file)).text();
+    const id = (await pool.submit({ type: 'sheep-id', genomeJson: genome }).done).id;
+    await store.addSheep({ id, genome, parents: null, gen: 0, author: null, sig: null, baked: true, name: s.name });
   }
 
-  buildLabPicker();
+  for (const v of await store.allVotes()) bumpTally(v, true);
+  for (const r of await store.allSheep()) addCard(r);
+
+  await net.start();
+  setInterval(updateStatus, 2000);
+  updateStatus();
 }
 
-// Sheep view (modal) ---------------------------------------------------------
+// ---- flock -----------------------------------------------------------------
 
-let modalCleanup = null;
+function addCard(record) {
+  if (cards.has(record.id)) return;
 
-function openSheepModal(sheep) {
-  const modal = $('#sheep-modal');
-  const canvas = $('#modal-canvas');
-  const fill = $('#modal-bar-fill');
-  $('#modal-bar').classList.remove('bar-done', 'bar-error');
-  $('#modal-title').textContent = sheep.name;
-  $('#modal-sub').textContent = `seed ${sheep.seed} · ${DETAIL.width}×${DETAIL.height}, ${DETAIL.nChunks} chunks`;
+  const card = document.createElement('div');
+  card.className = 'card';
+  const canvas = document.createElement('canvas');
+  canvas.width = PROOF_SPEC.width;
+  canvas.height = PROOF_SPEC.height;
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  const label = document.createElement('span');
+  label.textContent = record.name || (record.parents ? 'child ' : 'sheep ') + record.id.slice(0, 8);
+  label.title = record.id;
+  const tallyEl = document.createElement('span');
+  tallyEl.className = 'tally';
+  const voteBtn = document.createElement('button');
+  voteBtn.textContent = 'vote';
+  meta.append(label, tallyEl, voteBtn);
+  card.append(canvas, meta);
+  $('#flock').append(card);
 
-  canvas.width = DETAIL.width;
-  canvas.height = DETAIL.height;
-  canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
-  fill.style.width = '0%';
+  const entry = { record, canvas, tallyEl, voteBtn, card };
+  cards.set(record.id, entry);
+  updateTally(record.id);
 
-  let spinning = false;
-  let lastRgba = null; // latest progressive frame, restored when spin stops
+  canvas.addEventListener('click', () => toggleSelect(record.id));
+  voteBtn.addEventListener('click', () => vote(entry).catch(showError));
 
-  const renderHandle = pool.submit({
-    type: 'render',
-    genomeJson: sheep.genomeJson,
-    ...DETAIL,
-    challengeSeed: sheep.seed,
-  });
-  renderHandle.onProgress = (msg) => {
-    fill.style.width = `${(((msg.chunkIdx + 1) / DETAIL.nChunks) * 100).toFixed(1)}%`;
-    if (msg.rgba) {
-      lastRgba = { rgba: msg.rgba, width: msg.width, height: msg.height };
-      if (!spinning) drawRgba(canvas, msg.rgba, msg.width, msg.height);
-    }
+  drawProgressively(canvas, record.genome, `view|${record.id}`).catch(showError);
+}
+
+// Render a genome onto a canvas through the pool, painting as chunks land.
+// Returns the chunk hashes (= the render proof when challenge is a vote challenge).
+async function drawProgressively(canvas, genomeJson, challengeSource, challengeHex) {
+  challengeHex ??= await sha256Hex(utf8(challengeSource));
+  const ctx = canvas.getContext('2d');
+  canvas.classList.add('rendering');
+  const job = pool.submit(
+    { type: 'render', genomeJson, challengeHex, ...PROOF_SPEC, tonemapEvery: 8 },
+    {
+      onProgress: (p) => {
+        if (p.rgba) {
+          ctx.putImageData(
+            new ImageData(new Uint8ClampedArray(p.rgba), p.width, p.height), 0, 0);
+        }
+      },
+    },
+  );
+  const done = await job.done;
+  canvas.classList.remove('rendering');
+  if (done.type === 'done') {
+    ctx.putImageData(new ImageData(new Uint8ClampedArray(done.rgba), done.width, done.height), 0, 0);
+    return done.hashes;
+  }
+  return null;
+}
+
+// ---- voting ----------------------------------------------------------------
+
+async function vote(entry) {
+  const g = gen();
+  const myKey = `${me.pubHex}:${entry.record.id}:${g}`;
+  if (tallies.get(entry.record.id)?.has(myKey)) return; // already voted this gen
+
+  entry.voteBtn.disabled = true;
+  entry.voteBtn.textContent = 'rendering…';
+  // The proof render IS watching the sheep: personal challenge, full spec.
+  const challengeHex = await voteChallenge(entry.record.id, me.pubHex, g);
+  const chunkHashes = await drawProgressively(entry.canvas, entry.record.genome, null, challengeHex);
+  if (!chunkHashes) { entry.voteBtn.disabled = false; entry.voteBtn.textContent = 'vote'; return; }
+
+  const record = { sheepId: entry.record.id, gen: g, voter: me.pubHex, chunkHashes };
+  record.sig = await sign(me.pair, voteSignBytes(record));
+  await net.publishVote(record);
+  entry.voteBtn.textContent = 'voted ✓';
+}
+
+function bumpTally(v, quiet) {
+  if (!tallies.has(v.sheepId)) tallies.set(v.sheepId, new Set());
+  tallies.get(v.sheepId).add(v.key);
+  if (!quiet) updateTally(v.sheepId);
+}
+
+function updateTally(sheepId) {
+  const entry = cards.get(sheepId);
+  if (!entry) return;
+  const set = tallies.get(sheepId);
+  entry.tallyEl.textContent = set?.size ? `${set.size} ♥` : '';
+  const myKey = `${me.pubHex}:${sheepId}:${gen()}`;
+  if (set?.has(myKey)) {
+    entry.voteBtn.textContent = 'voted ✓';
+    entry.voteBtn.disabled = true;
+  }
+}
+
+// ---- breeding ---------------------------------------------------------------
+
+function toggleSelect(sheepId) {
+  const at = selected.indexOf(sheepId);
+  if (at !== -1) selected.splice(at, 1);
+  else {
+    if (selected.length === 2) deselect(selected.shift());
+    selected.push(sheepId);
+  }
+  cards.get(sheepId)?.card.classList.toggle('selected', selected.includes(sheepId));
+  if (selected.length === 2) breedSelected().catch(showError);
+  else $('#nursery').hidden = true;
+}
+
+function deselect(sheepId) {
+  cards.get(sheepId)?.card.classList.remove('selected');
+}
+
+async function breedSelected() {
+  // Sort so a pair has ONE canonical child regardless of click order.
+  const [aId, bId] = [...selected].sort();
+  const a = cards.get(aId).record;
+  const b = cards.get(bId).record;
+  const g = gen();
+  const challengeHex = await sha256Hex(utf8(`breed|${g}|${aId}|${bId}`));
+
+  $('#nursery').hidden = false;
+  $('#nursery-note').textContent = 'breeding…';
+  $('#release').hidden = true;
+
+  const { childJson, childId } = await pool.submit({
+    type: 'breed', aJson: a.genome, bJson: b.genome, challengeHex,
+  }).done;
+  // Stale? (selection changed while breeding)
+  if (selected.length !== 2 || [...selected].sort().join() !== [aId, bId].join()) return;
+
+  $('#nursery-note').textContent =
+    `the canonical child of ${aId.slice(0, 8)} × ${bId.slice(0, 8)} (gen ${g})`;
+  const canvas = $('#child-canvas');
+  await drawProgressively(canvas, childJson, `view|${childId}`);
+
+  const release = $('#release');
+  release.hidden = false;
+  release.disabled = cards.has(childId);
+  release.textContent = cards.has(childId) ? 'already in flock' : 'release into flock';
+  release.onclick = async () => {
+    const record = { id: childId, genome: childJson, parents: [aId, bId], gen: g, author: me.pubHex };
+    record.sig = await sign(me.pair, sheepSignBytes(record));
+    await net.publishSheep(record);
+    release.disabled = true;
+    release.textContent = 'released ✓';
   };
-  renderHandle.done
-    .then((msg) => {
-      if (msg.type !== 'done') return;
-      lastRgba = { rgba: msg.rgba, width: msg.width, height: msg.height };
-      if (!spinning) drawRgba(canvas, msg.rgba, msg.width, msg.height);
-      $('#modal-bar').classList.add('bar-done');
-    })
-    .catch((err) => console.error('sheep render failed:', err));
-
-  // Spin: low-cost render_rgba frames via the worker (spin-frame extension),
-  // drawn scaled up; the progressive ChunkedRender keeps accumulating
-  // underneath and is restored when spin stops.
-  let angle = 0;
-  let spinJob = null;
-  const spinBtn = $('#modal-spin');
-  spinBtn.classList.remove('on');
-  spinBtn.onclick = () => {
-    spinning = !spinning;
-    spinBtn.classList.toggle('on', spinning);
-    if (spinning) spinLoop();
-  };
-
-  async function spinLoop() {
-    while (spinning) {
-      spinJob = pool.submit({
-        type: 'spin-frame',
-        genomeJson: sheep.genomeJson,
-        seed: sheep.seed,
-        ...SPIN,
-        rotate: angle,
-      });
-      let msg;
-      try {
-        msg = await spinJob.done;
-      } catch (err) {
-        console.error('spin frame failed:', err);
-        break;
-      }
-      if (!spinning || msg.type !== 'done') break;
-      drawRgbaScaled(canvas, msg.rgba, msg.width, msg.height);
-      angle += 0.07;
-    }
-    spinJob = null;
-    if (lastRgba) drawRgba(canvas, lastRgba.rgba, lastRgba.width, lastRgba.height);
-  }
-
-  $('#modal-download').onclick = () =>
-    downloadText(`${sheep.name.replace(/\W+/g, '_').toLowerCase()}.json`, sheep.genomeJson);
-
-  modalCleanup = () => {
-    spinning = false;
-    renderHandle.cancel();
-    if (spinJob) spinJob.cancel();
-  };
-  modal.hidden = false;
 }
 
-function closeSheepModal() {
-  if (modalCleanup) modalCleanup();
-  modalCleanup = null;
-  $('#sheep-modal').hidden = true;
+// ---- chrome -----------------------------------------------------------------
+
+function updateStatus() {
+  $('#status').textContent =
+    `peer ${PEER_NS} · ${me.pubHex.slice(0, 8)} · ${net.peerCount()} peers · ` +
+    `${pool.chunksRendered} chunks rendered`;
 }
 
-// Breeding lab ---------------------------------------------------------------
-
-function buildLabPicker() {
-  const picker = $('#lab-picker');
-  picker.textContent = '';
-  for (const sheep of flock) {
-    const chip = el('button', 'pick-chip');
-    const mini = el('canvas', 'pick-mini');
-    mini.width = 64;
-    mini.height = 64;
-    chip.append(mini, el('span', null, sheep.name));
-    chip.addEventListener('click', () => {
-      // Refresh the thumbnail from the flock canvas (may still be rendering).
-      mini.getContext('2d').drawImage(sheep.canvas, 0, 0, 64, 64);
-      pickParent(sheep);
-    });
-    // Initial thumbnail once the flock card has something to show.
-    setTimeout(() => mini.getContext('2d').drawImage(sheep.canvas, 0, 0, 64, 64), 3000);
-    picker.append(chip);
-  }
-
-  $('#slot-a').addEventListener('click', () => clearParent('a'));
-  $('#slot-b').addEventListener('click', () => clearParent('b'));
-}
-
-function pickParent(sheep) {
-  if (!parentA) parentA = sheep;
-  else if (!parentB && sheep !== parentA) parentB = sheep;
-  else { parentA = sheep; parentB = null; } // start a new pairing
-  refreshSlots();
-}
-
-function clearParent(which) {
-  if (which === 'a') parentA = null;
-  else parentB = null;
-  refreshSlots();
-}
-
-function refreshSlots() {
-  fillSlot($('#slot-a'), parentA);
-  fillSlot($('#slot-b'), parentB);
-  resetLabResults();
-  if (parentA && parentB) breedPair(parentA, parentB);
-}
-
-function fillSlot(slot, sheep) {
-  const cv = $('canvas', slot);
-  const label = $('.slot-label', slot);
-  const ctx = cv.getContext('2d');
-  ctx.clearRect(0, 0, cv.width, cv.height);
-  if (sheep) {
-    ctx.drawImage(sheep.canvas, 0, 0, cv.width, cv.height);
-    label.textContent = sheep.name;
-    slot.classList.add('filled');
-  } else {
-    label.textContent = 'pick a sheep';
-    slot.classList.remove('filled');
-  }
-}
-
-function resetLabResults() {
-  labRun++;
-  for (const h of labJobs) h.cancel();
-  labJobs = [];
-  $('#lab-child').textContent = '';
-  $('#lab-whatif').textContent = '';
-  $('#lab-hint').hidden = !!(parentA && parentB);
-}
-
-// Breed one child via the worker and render it progressively into a card.
-async function breedChild(run, { aJson, bJson, challengeStr, mount, budget, label }) {
-  const challengeHex = await sha256Hex(utf8(challengeStr));
-  if (run !== labRun) return;
-
-  const breedHandle = pool.submit({ type: 'breed', aJson, bJson, challengeHex });
-  labJobs.push(breedHandle);
-
-  const caption = el('div', 'meta');
-  const nameSpan = el('span', 'name', label);
-  const dl = el('button', 'mini-btn', 'genome ↓');
-  dl.disabled = true;
-  caption.append(nameSpan, dl);
-
-  const { card, canvas, fill } = progressCard({ ...budget, caption, className: 'child-card' });
-  mount.append(card);
-
-  let bred;
-  try {
-    bred = await breedHandle.done;
-  } catch (err) {
-    if (run === labRun) {
-      card.classList.add('failed');
-      nameSpan.textContent = `${label} — breed failed`;
-    }
-    console.error('breed failed:', err);
-    return;
-  }
-  if (run !== labRun || bred.type !== 'breed-done') return;
-
-  nameSpan.title = bred.childId;
-  nameSpan.textContent = `${label} · ${bred.childId.slice(0, 8)}`;
-  dl.disabled = false;
-  dl.onclick = (e) => {
-    e.stopPropagation();
-    downloadText(`child_${bred.childId.slice(0, 8)}.json`, bred.childJson);
-  };
-
-  const renderHandle = renderProgressively(canvas, fill, bred.childJson, budget, { challengeHex });
-  labJobs.push(renderHandle);
-}
-
-function breedPair(a, b) {
-  const run = labRun;
-  // TODO(integration): use wasm sheep_id for idA/idB; names stand in until
-  // the new exports are merged.
-  const idA = a.name;
-  const idB = b.name;
-
-  breedChild(run, {
-    aJson: a.genomeJson,
-    bJson: b.genomeJson,
-    challengeStr: `breed:0:${idA}:${idB}`,
-    mount: $('#lab-child'),
-    budget: CHILD,
-    label: 'the child these two will have',
-  });
-
-  for (let i = 0; i < 9; i++) {
-    breedChild(run, {
-      aJson: a.genomeJson,
-      bJson: b.genomeJson,
-      challengeStr: `whatif:0:${idA}:${idB}:${i}`,
-      mount: $('#lab-whatif'),
-      budget: WHATIF,
-      label: `what-if ${i}`,
-    });
-  }
-}
-
-// Status footer ---------------------------------------------------------------
-
-function initStatus() {
-  const node = $('#status-bar');
-  pool.onStats = ({ size, queued, running, chunks }) => {
-    node.textContent =
-      `${size} workers · ${running} running · ${queued} queued · ` +
-      `${chunks.toLocaleString()} chunks rendered this session`;
-  };
-  pool.onStats({ size: pool.size, queued: 0, running: 0, chunks: 0 });
-}
-
-// Boot -------------------------------------------------------------------------
-
-initTabs();
-initStatus();
-$('#modal-close').addEventListener('click', closeSheepModal);
-$('#sheep-modal').addEventListener('click', (e) => {
-  if (e.target.id === 'sheep-modal') closeSheepModal();
-});
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') closeSheepModal();
-});
-
-buildFlock().catch((err) => {
-  $('#status-bar').textContent = `failed to load flock: ${err.message}`;
+function showError(err) {
   console.error(err);
-});
+  $('#status').textContent = 'error: ' + (err?.message || err);
+}
+
+main().catch(showError);
