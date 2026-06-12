@@ -11,6 +11,7 @@ header { padding: 32px 0 8px; }
 h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: 0.04em; }
 header p { color: #7d7d92; max-width: 64ch; }
 code { color: #b9b9d6; }
+em { color: #c8b06a; font-style: normal; }
 
 #flock {
   display: grid; gap: 12px; padding: 16px 0 32px;

@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>what is this — electric sheep</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    main { max-width: 68ch; padding-bottom: 48px; }
+    h2 { font-size: 15px; margin: 28px 0 6px; color: #b9b9d6; }
+    p { color: #9d9db2; }
+    em { color: #c8b06a; font-style: normal; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>what is this</h1>
+  </header>
+  <main>
+    <p>
+      A revival of <a href="https://electricsheep.org/">Electric Sheep</a>:
+      abstract creatures called <em>sheep</em> — each one a
+      <a href="https://flam3.com/flame_draves.pdf">fractal flame</a>, invented
+      by Scott Draves — live, breed, and die by popular vote. This version has
+      no server. The site is static files; everything else happens in the
+      browsers of the people watching.
+    </p>
+
+    <h2>rendered, not served</h2>
+    <p>
+      No images are ever transmitted. A sheep is ~3&nbsp;KB of genome JSON; your
+      browser renders it with a Rust renderer compiled to WebAssembly. The
+      renderer is <em>deterministic</em>: the same genome and seed produce
+      byte-identical pixels on every machine. That one property is the
+      foundation for everything below.
+    </p>
+
+    <h2>proof of sheep</h2>
+    <p>
+      Voting costs a render. To vote for a sheep you render it with a challenge
+      derived from your key and the current generation, and sign the hashes of
+      the 64 chunks of work. Anyone can later re-render any one chunk
+      (1/64th of the work) and catch a forged vote — and a confirmed forgery is
+      itself provable to everyone else. There is no vote server to trust:
+      <em>the work is the ballot, and the art is the work</em>. You can watch
+      this machinery agree with itself on the
+      <a href="determinism.html">determinism page</a>.
+    </p>
+
+    <h2>generations</h2>
+    <p>
+      Every 5 minutes a generation closes. The top sheep by votes survive; they
+      pair up and their children are born. Nobody computes this for you — every
+      browser derives the same survivors and the same children from the same
+      votes, because breeding is deterministic too. That's also why the
+      breeding preview is honest: pick any two living sheep and you see
+      <em>the exact child</em> they would have this generation, before it's
+      born. Releasing a sheep you bred costs a render proof, which doubles as
+      your vote for it.
+    </p>
+
+    <h2>the swarm</h2>
+    <p>
+      Sheep and votes travel peer-to-peer as signed, immutable facts; every
+      visitor stores what they've seen and forwards it to peers who missed it.
+      The current build networks across browser tabs (open
+      <a href="index.html?peer=2">?peer=2</a> beside the flock and watch them
+      sync); the same protocol rides js-libp2p between strangers next.
+    </p>
+
+    <p>
+      Code: <code>wasm-sheep</code> — Rust → WASM renderer, vanilla JS,
+      no frameworks, no build step, no server.
+      Fractal flames by <a href="https://flam3.com/">Scott Draves</a>.
+    </p>
+  </main>
+  <footer>
+    <a href="index.html">← back to the flock</a>
+  </footer>
+</body>
+</html>

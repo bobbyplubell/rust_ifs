@@ -1,4 +1,4 @@
-# wasm-sheep — community-bred fractal flames
+# wasm-sheep — a shepherdless flock (Proof of Sheep)
 
 A from-scratch [fractal flame](https://flam3.com/flame_draves.pdf) (Scott Draves)
 renderer in Rust, compiled to WASM, reviving the **Electric Sheep** idea: every
@@ -6,7 +6,9 @@ visitor's browser renders flames ("sheep") locally, and the community votes on
 which sheep survive and breed. Rendering a sheep is what earns you a vote.
 
 The site is fully static (GitHub Pages-deployable); all mutable state lives in
-a browser-to-browser libp2p swarm. See [ARCHITECTURE.md](ARCHITECTURE.md) for
+a browser-to-browser swarm. The trust mechanism is **Proof of Sheep**: a vote
+is a signed, chunk-hashed proof that you rendered the sheep — the work is the
+ballot, and the art is the work. See [ARCHITECTURE.md](ARCHITECTURE.md) for
 the full design: self-certifying render proofs, fraud proofs, and a
 hash-chained history of generations whose fork-choice rule is heaviest
 render-work — including a breeding lab where the next generation's children

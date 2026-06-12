@@ -7,9 +7,10 @@ import { sha256Hex, utf8 } from './hash.js';
 import { loadIdentity, sign, PEER_NS } from './identity.js';
 import { openStore } from './store.js';
 import {
-  Net, BroadcastTransport, gen, PROOF_SPEC,
+  Net, BroadcastTransport, gen, GEN_MS, GENESIS_GEN, PROOF_SPEC,
   sheepSignBytes, voteSignBytes, voteChallenge,
 } from './net.js';
+import { computeFlock, breedChallenge } from './gens.js';
 
 const $ = (s) => document.querySelector(s);
 const pool = new WorkerPool();
@@ -22,7 +23,8 @@ const cards = new Map();   // sheepId -> {record, canvas, tallyEl, voteBtn, card
 const tallies = new Map(); // sheepId -> Set of vote keys
 const selected = [];       // up to two sheepIds picked as parents
 
-let me, store, net;
+let me, store, net, baked = [];
+let shownGen = -1;
 
 async function main() {
   me = await loadIdentity();
@@ -33,8 +35,11 @@ async function main() {
     pubHex: me.pubHex,
     checkSheepId: (genomeJson) =>
       pool.submit({ type: 'sheep-id', genomeJson }).done.then((m) => m.id),
-    onSheep: (r) => addCard(r),
-    onVote: (v) => bumpTally(v),
+    onSheep: () => scheduleRebuild(),
+    onVote: (v) => {
+      bumpTally(v);
+      if (v.gen < gen()) scheduleRebuild(); // late vote can rewrite a closed gen
+    },
   });
 
   // Seed the baked gen-0 flock from the static manifest (local only, not gossiped).
@@ -42,14 +47,55 @@ async function main() {
   for (const s of manifest.sheep) {
     const genome = await (await fetch(s.file)).text();
     const id = (await pool.submit({ type: 'sheep-id', genomeJson: genome }).done).id;
-    await store.addSheep({ id, genome, parents: null, gen: 0, author: null, sig: null, baked: true, name: s.name });
+    baked.push({ id, genome, parents: null, gen: 0, author: null, sig: null, baked: true, name: s.name });
   }
 
   for (const v of await store.allVotes()) bumpTally(v, true);
-  for (const r of await store.allSheep()) addCard(r);
+  await rebuildFlock();
 
   await net.start();
-  setInterval(updateStatus, 2000);
+  shownGen = gen();
+  setInterval(() => {
+    updateStatus();
+    if (gen() !== shownGen) {
+      shownGen = gen();
+      scheduleRebuild(); // generation closed: survivors chosen, children born
+    }
+  }, 1000);
+  updateStatus();
+}
+
+// ---- generation engine glue --------------------------------------------------
+
+const breedFn = (aJson, bJson, challengeHex) =>
+  pool.submit({ type: 'breed', aJson, bJson, challengeHex }).done;
+
+let rebuildTimer = null;
+function scheduleRebuild() {
+  clearTimeout(rebuildTimer);
+  rebuildTimer = setTimeout(() => rebuildFlock().catch(showError), 400);
+}
+
+// Recompute the living flock and diff it against the cards on screen — only
+// changed cards re-render (renders are the expensive part).
+async function rebuildFlock() {
+  const { living } = await computeFlock({ store, baked, breedFn });
+  for (const [id, entry] of cards) {
+    if (!living.has(id)) {
+      if (spinning?.entry === entry) { spinning.stop = true; spinning = null; }
+      const at = selected.indexOf(id);
+      if (at !== -1) { selected.splice(at, 1); $('#nursery').hidden = true; }
+      entry.card.remove();
+      cards.delete(id);
+    }
+  }
+  for (const record of living.values()) addCard(record);
+  // Derived (born) sheep aren't store facts; stash the current ones so
+  // sheep.html can show them full screen.
+  try {
+    localStorage.setItem(`sheep-derived-${PEER_NS}`,
+      JSON.stringify([...living.values()].filter((r) => r.derived)));
+  } catch { /* quota — full-screen view of derived sheep just won't resolve */ }
   updateStatus();
 }
 
@@ -65,9 +111,12 @@ function addCard(record) {
   canvas.height = PROOF_SPEC.height;
   const meta = document.createElement('div');
   meta.className = 'meta';
-  const label = document.createElement('span');
-  label.textContent = record.name || (record.parents ? 'child ' : 'sheep ') + record.id.slice(0, 8);
+  const label = document.createElement('a');
+  label.textContent = record.name ||
+    (record.derived ? `born g${record.gen - GENESIS_GEN} ` : 'sheep ') + record.id.slice(0, 8);
   label.title = record.id;
+  label.href = `sheep.html?id=${record.id}${PEER_NS !== '0' ? `&peer=${PEER_NS}` : ''}`;
+  label.target = '_blank';
   const tallyEl = document.createElement('span');
   tallyEl.className = 'tally';
   const spinBtn = document.createElement('button');
@@ -172,10 +221,12 @@ async function vote(entry) {
 
   entry.voteBtn.disabled = true;
   entry.voteBtn.textContent = 'rendering…';
+  entry.votePending = true;
   // The proof render IS watching the sheep: personal challenge, full spec.
   const challengeHex = await voteChallenge(entry.record.id, me.pubHex, g);
   const chunkHashes = await drawProgressively(
     entry.canvas, entry.record.genome, null, challengeHex, PROOF_SPEC);
+  entry.votePending = false;
   if (!chunkHashes) { entry.voteBtn.disabled = false; entry.voteBtn.textContent = 'vote'; return; }
 
   const record = { sheepId: entry.record.id, gen: g, voter: me.pubHex, chunkHashes };
@@ -197,11 +248,16 @@ function updateTally(sheepId) {
   const entry = cards.get(sheepId);
   if (!entry) return;
   const set = tallies.get(sheepId);
-  entry.tallyEl.textContent = set?.size ? `${set.size} ♥` : '';
-  const myKey = `${me.pubHex}:${sheepId}:${gen()}`;
-  if (set?.has(myKey)) {
+  // Display only this generation's votes — they're what selection will use.
+  const g = gen();
+  const now = set ? [...set].filter((k) => k.endsWith(`:${g}`)).length : 0;
+  entry.tallyEl.textContent = now ? `${now} ♥` : '';
+  if (set?.has(`${me.pubHex}:${sheepId}:${g}`)) {
     entry.voteBtn.textContent = 'voted ✓';
     entry.voteBtn.disabled = true;
+  } else if (!entry.votePending) {
+    entry.voteBtn.textContent = 'vote';
+    entry.voteBtn.disabled = false;
   }
 }
 
@@ -229,7 +285,9 @@ async function breedSelected() {
   const a = cards.get(aId).record;
   const b = cards.get(bId).record;
   const g = gen();
-  const challengeHex = await sha256Hex(utf8(`breed|${g}|${aId}|${bId}`));
+  // Same formula the generation engine uses — this preview IS the exact child
+  // these two would have if they both survive this generation.
+  const challengeHex = await breedChallenge(g, aId, bId);
 
   $('#nursery').hidden = false;
   $('#nursery-note').textContent = 'breeding…';
@@ -249,20 +307,41 @@ async function breedSelected() {
   const release = $('#release');
   release.hidden = false;
   release.disabled = cards.has(childId);
-  release.textContent = cards.has(childId) ? 'already in flock' : 'release into flock';
+  release.textContent = cards.has(childId) ? 'already in flock' : 'render & release';
   release.onclick = async () => {
-    const record = { id: childId, genome: childJson, parents: [aId, bId], gen: g, author: me.pubHex };
+    release.disabled = true;
+    release.textContent = 'rendering proof…';
+    // Releasing costs the same proof-of-render as voting (challenge bound to
+    // you + this gen), and the same hashes double as your vote for the child.
+    const rg = gen();
+    const proofChallenge = await voteChallenge(childId, me.pubHex, rg);
+    const chunkHashes = await drawProgressively(canvas, childJson, null, proofChallenge, PROOF_SPEC);
+    if (!chunkHashes) { release.disabled = false; release.textContent = 'render & release'; return; }
+
+    const record = {
+      id: childId, genome: childJson, parents: [aId, bId], gen: rg,
+      author: me.pubHex, chunkHashes,
+    };
     record.sig = await sign(me.pair, sheepSignBytes(record));
     await net.publishSheep(record);
-    release.disabled = true;
-    release.textContent = 'released ✓';
+
+    const voteRec = { sheepId: childId, gen: rg, voter: me.pubHex, chunkHashes };
+    voteRec.sig = await sign(me.pair, voteSignBytes(voteRec));
+    await net.publishVote(voteRec);
+
+    release.textContent = 'released ✓ (and voted)';
+    scheduleRebuild();
   };
 }
 
 // ---- chrome -----------------------------------------------------------------
 
 function updateStatus() {
+  const msLeft = GEN_MS - (Date.now() % GEN_MS);
+  const mm = String(Math.floor(msLeft / 60_000));
+  const ss = String(Math.floor((msLeft % 60_000) / 1000)).padStart(2, '0');
   $('#status').textContent =
+    `gen ${gen() - GENESIS_GEN} closes in ${mm}:${ss} · ` +
     `peer ${PEER_NS} · ${me.pubHex.slice(0, 8)} · ${net.peerCount()} peers · ` +
     `${pool.chunksRendered} chunks rendered`;
 }

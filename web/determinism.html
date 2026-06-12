@@ -89,8 +89,10 @@
   <script type="module">
     // Main-thread wasm on purpose: this page is a plain, dependency-free
     // reproduction of the protocol render, as close to the contract as
-    // possible (no pool, no worker indirection).
-    import init, { ChunkedRender, challenge_from_seed } from './pkg/flame_wasm.js';
+    // possible (no pool, no worker indirection). Imported dynamically so a
+    // failed/stale module load reports in the banner instead of freezing the
+    // page (a static named import dies before any code runs).
+    let ChunkedRender, challenge_from_seed;
 
     const SPEC = { width: 128, height: 128, ss: 1, nChunks: 8, samplesPerChunk: 50_000 };
 
@@ -187,7 +189,22 @@
     }
 
     async function main() {
-      await init();
+      banner.textContent = 'loading wasm module…';
+      let wasm;
+      try {
+        wasm = await import('./pkg/flame_wasm.js');
+      } catch (err) {
+        throw new Error(
+          `wasm module failed to load (stale cache? hard-refresh): ${err.message}`);
+      }
+      if (!wasm.ChunkedRender) {
+        throw new Error(
+          'wasm module is an old build without ChunkedRender — hard-refresh, ' +
+          'or rebuild with web/build.sh');
+      }
+      ({ ChunkedRender, challenge_from_seed } = wasm);
+      banner.textContent = 'instantiating wasm…';
+      await wasm.default();
       banner.textContent = 'rendering…';
 
       const [manifest, expected] = await Promise.all([

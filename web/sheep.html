@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>sheep</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    body { max-width: none; padding: 0; overflow: hidden; }
+    #stage {
+      position: fixed; inset: 0; display: flex;
+      align-items: center; justify-content: center; background: #000;
+    }
+    #stage canvas { height: min(100vh, 100vw); width: min(100vh, 100vw); }
+    #hud {
+      position: fixed; left: 0; right: 0; bottom: 0;
+      display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap;
+      padding: 10px 14px; font-size: 12px; color: #8d8da4;
+      background: linear-gradient(transparent, rgba(0,0,0,0.7));
+    }
+    #hud .id { color: #62627a; }
+    #hud a { color: #8d8da4; margin-left: auto; }
+  </style>
+</head>
+<body>
+  <div id="stage"><canvas id="cv" width="512" height="512"></canvas></div>
+  <div id="hud">
+    <span id="info">loading…</span>
+    <span id="sheep-id" class="id"></span>
+    <button id="spin">spin</button>
+    <button id="dl">genome ↓</button>
+    <a id="back" href="index.html">← flock</a>
+  </div>
+
+  <script type="module">
+    import { WorkerPool } from './js/pool.js';
+    import { openStore } from './js/store.js';
+    import { PEER_NS } from './js/identity.js';
+    import { GENESIS_GEN } from './js/net.js';
+    import { sha256Hex, utf8 } from './js/hash.js';
+
+    const $ = (s) => document.querySelector(s);
+    const params = new URLSearchParams(location.search);
+    const id = params.get('id');
+    if (PEER_NS !== '0') $('#back').href = `index.html?peer=${PEER_NS}`;
+
+    const pool = new WorkerPool();
+    const cv = $('#cv');
+    const ctx = cv.getContext('2d');
+
+    // High-quality full-screen render; ss 2 + plenty of samples.
+    const BIG = { width: 512, height: 512, ss: 2, nChunks: 64, samplesPerChunk: 250_000 };
+    const FRAME = { width: 320, height: 320, samples: 450_000, seed: 7 };
+    const LOOP_MS = 14_000;
+
+    async function findRecord() {
+      // The store has everything we've seen (gossiped or our own); baked
+      // gen-0 sheep come from the manifest.
+      const store = await openStore();
+      for (const r of await store.allSheep()) if (r.id === id) return r;
+      const manifest = await (await fetch('genomes/manifest.json')).json();
+      for (const s of manifest.sheep) {
+        const genome = await (await fetch(s.file)).text();
+        const sid = (await pool.submit({ type: 'sheep-id', genomeJson: genome }).done).id;
+        if (sid === id) return { id, genome, gen: 0, parents: null, name: s.name, baked: true };
+      }
+      // Derived (born) children aren't store facts — the flock page stashes
+      // the current generation's in localStorage for us.
+      try {
+        const derived = JSON.parse(localStorage.getItem(`sheep-derived-${PEER_NS}`) || '[]');
+        for (const r of derived) if (r.id === id) return r;
+      } catch { /* fall through */ }
+      return null;
+    }
+
+    let record = null;
+    let still = null; // remembered crisp frame
+
+    async function renderStill() {
+      const challengeHex = await sha256Hex(utf8(`view|${id}`));
+      const job = pool.submit(
+        { type: 'render', genomeJson: record.genome, challengeHex, ...BIG, tonemapEvery: 8 },
+        { onProgress: (p) => { if (p.rgba) paint(p); } },
+      );
+      const done = await job.done;
+      if (done.type === 'done') { paint(done); still = done; }
+    }
+
+    function paint(m) {
+      if (cv.width !== m.width) { cv.width = m.width; cv.height = m.height; }
+      ctx.putImageData(new ImageData(new Uint8ClampedArray(m.rgba), m.width, m.height), 0, 0);
+    }
+
+    let spinning = null;
+    async function toggleSpin() {
+      if (spinning) {
+        spinning.stop = true; spinning = null;
+        $('#spin').textContent = 'spin';
+        if (still) paint(still); else renderStill();
+        return;
+      }
+      const s = { stop: false };
+      spinning = s;
+      $('#spin').textContent = 'stop';
+      const frameJob = () => pool.submit({
+        type: 'frame', genomeJson: record.genome,
+        phase: (performance.now() % LOOP_MS) / LOOP_MS, ...FRAME,
+      }).done;
+      let pending = frameJob();
+      while (!s.stop) {
+        const next = frameJob();
+        const done = await pending;
+        pending = next;
+        if (s.stop) break;
+        if (done.type === 'done') paint(done);
+      }
+    }
+
+    async function main() {
+      if (!id) { $('#info').textContent = 'no ?id= given'; return; }
+      record = await findRecord();
+      if (!record) {
+        $('#info').textContent =
+          'sheep not found in this peer\'s store (derived children live only in the flock view)';
+        return;
+      }
+      $('#sheep-id').textContent = id;
+      $('#info').textContent = record.name ||
+        (record.parents ? `born g${record.gen - GENESIS_GEN} of ${record.parents.map(p => p.slice(0, 8)).join(' × ')}` : `sheep ${id.slice(0, 8)}`);
+      $('#spin').onclick = () => toggleSpin().catch(console.error);
+      $('#dl').onclick = () => {
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([record.genome], { type: 'application/json' }));
+        a.download = `${id.slice(0, 12)}.json`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+      };
+      await renderStill();
+    }
+
+    main().catch((e) => { $('#info').textContent = 'error: ' + (e.message || e); console.error(e); });
+  </script>
+</body>
+</html>

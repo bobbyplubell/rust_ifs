@@ -18,18 +18,28 @@
 import { utf8, sha256Hex } from './hash.js';
 import { verify } from './identity.js';
 
-/** Current generation = UTC day number. */
-export const gen = () => Math.floor(Date.now() / 86_400_000);
+/** Generation length: 5 minutes, dev and deployed. */
+export const GEN_MS = 300_000;
+/** The network's first generation (absolute); displayed numbers are relative to it. */
+export const GENESIS_GEN = Math.floor(Date.parse('2026-06-12T00:00:00Z') / GEN_MS);
+/** Current generation (absolute number; clock-derived so peers agree without consensus). */
+export const gen = () => Math.floor(Date.now() / GEN_MS);
+/** Survivors per generation — fixes the automatic-breeding output regardless of peer count. */
+export const SURVIVORS_K = 4;
+/** Deterministic per-author submissions counted per generation (lowest sheep ids win). */
+export const AUTHOR_GEN_CAP = 3;
 
-/** Protocol render spec for vote proofs (PLAN.md tuning constants). */
+/** Protocol render spec for vote AND release proofs (PLAN.md tuning constants). */
 export const PROOF_SPEC = { width: 256, height: 256, ss: 1, nChunks: 64, samplesPerChunk: 20_000 };
 
 export const HEX64 = /^[0-9a-f]{64}$/;
 
 // Canonical bytes each signature covers. The genome itself is covered via the
-// sheep id (sha-256 of canonical genome JSON).
+// sheep id (sha-256 of canonical genome JSON). Releases carry a render proof
+// (same chunk-hash scheme as votes, challenge H(id|author|gen)) — you cannot
+// release a sheep you haven't rendered, which prices submission spam in CPU.
 export const sheepSignBytes = (r) =>
-  utf8(`sheep|${r.id}|${(r.parents || []).join(',')}|${r.gen}|${r.author}`);
+  utf8(`sheep|${r.id}|${(r.parents || []).join(',')}|${r.gen}|${r.author}|${r.chunkHashes.join(',')}`);
 export const voteSignBytes = (v) =>
   utf8(`vote|${v.sheepId}|${v.gen}|${v.voter}|${v.chunkHashes.join(',')}`);
 
@@ -40,7 +50,7 @@ export const voteChallenge = (sheepId, voterHex, g) =>
   sha256Hex(utf8(`${sheepId}|${voterHex}|${g}`));
 
 export class BroadcastTransport {
-  constructor(channel = 'sheep-net-v1') {
+  constructor(channel = 'sheep-net-v2') {
     this.ch = new BroadcastChannel(channel);
   }
   send(msg) {
@@ -115,6 +125,13 @@ export class Net {
     if (!r || !HEX64.test(r.id) || typeof r.genome !== 'string') return;
     if (!Number.isInteger(r.gen) || !HEX64.test(r.author ?? '')) return;
     if (r.parents && !(Array.isArray(r.parents) && r.parents.every((p) => HEX64.test(p)))) return;
+    if (!Array.isArray(r.chunkHashes) || r.chunkHashes.length !== PROOF_SPEC.nChunks) return;
+    if (!r.chunkHashes.every((h) => HEX64.test(h))) return;
+    // Storage sanity bound per (author, gen) — the *selection* cap
+    // (AUTHOR_GEN_CAP, deterministic lowest-ids) is applied in gens.js.
+    const byAuthor = (await this.store.allSheep())
+      .filter((s) => s.author === r.author && s.gen === r.gen).length;
+    if (byAuthor >= AUTHOR_GEN_CAP * 3) return;
     if (!(await verify(r.author, r.sig, sheepSignBytes(r)))) return;
     if ((await this.checkSheepId(r.genome)) !== r.id) return; // forged id or non-canonical genome
     if (await this.store.addSheep(r)) this.onSheep?.(r);

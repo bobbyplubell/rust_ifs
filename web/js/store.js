@@ -7,7 +7,7 @@ import { PEER_NS } from './identity.js';
 
 export async function openStore() {
   const db = await new Promise((resolve, reject) => {
-    const req = indexedDB.open(`sheep-store-${PEER_NS}`, 1);
+    const req = indexedDB.open(`sheep-store-v2-${PEER_NS}`, 1);
     req.onupgradeneeded = () => {
       req.result.createObjectStore('sheep', { keyPath: 'id' });
       req.result.createObjectStore('votes', { keyPath: 'key' });

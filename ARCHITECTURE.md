@@ -65,8 +65,14 @@ otherwise. Votes cost compute, not identity.
 ## Data model
 
 All IDs are SHA-256 over canonical bytes. All signed messages are immutable
-once published. Time divides into **generations** (start: 24 h, UTC-aligned
-wall-clock boundaries; the schedule is public and needs no coordination).
+once published. Time divides into **generations** (5 minutes, wall-clock
+aligned; the schedule is public and needs no coordination). Population
+pressure is built in: survivors are a fixed top-K, automatic births are
+bounded by K, and submissions cost a render proof and are capped per
+(author, generation) — flock size cannot blow up with peer count. A
+work-threshold *early close* ("generation ends after V votes") is designed
+but deferred: it would make generation numbering chain-relative instead of
+clock-derived, which is a consensus step we don't take until needed.
 
 ### Sheep
 
@@ -84,7 +90,7 @@ sheep_id = H(canonical_genome_json)
 Sheep are content-addressed, so the same genome submitted twice — or bred
 independently by two partitioned clients — merges into one.
 
-### Vote (with embedded render proof)
+### Vote (with embedded render proof — "Proof of Sheep")
 
 ```
 challenge_seed = H(sheep_id ‖ voter_pubkey ‖ gen)
@@ -193,7 +199,10 @@ by public data, bred children carry no signature — their legitimacy is checked
 by recomputation, not authority.
 
 New blood: any user may also submit a hand-tuned, random, or
-breeding-lab-discovered genome as a signed gen-0 sheep (rate-limited per peer).
+breeding-lab-discovered genome as a signed gen-0 sheep. Releasing costs a
+render proof (same chunk-hash scheme as votes, challenge bound to the author
+and generation — and it doubles as the author's vote), with a deterministic
+per-(author, generation) cap.
 
 ### The future is previewable (breeding lab)
 
@@ -351,7 +360,7 @@ Current API is a single synchronous `render_rgba(genome_json, …)`. Needed:
   (objective), and a fake chain must out-weigh the real one in verifiable
   work. The attacker can only hide state, not forge it.
 - **Tuning constants.** M=64 chunks, audit fraction p, K survivors, generation
-  length (24 h), finality window W=2, proof sample count (browser-render
+  length (5 min), finality window W=2, proof sample count (browser-render
   budget ~1–2 M samples) — all TBD by experiment; version them in a protocol
   config.
 
