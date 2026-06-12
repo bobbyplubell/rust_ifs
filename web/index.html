@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Electric Sheep — WASM fractal flames</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: #07070b; color: #e8e8f0;
+      font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    header { padding: 48px 24px 8px; text-align: center; }
+    h1 { margin: 0; font-size: 30px; font-weight: 700; letter-spacing: -0.02em; }
+    .sub { margin: 8px auto 0; max-width: 640px; color: #9a9ab0; }
+    .sub code { color: #c7c7e0; background: #16161f; padding: 1px 5px; border-radius: 4px; }
+    main {
+      display: grid; gap: 20px; padding: 28px;
+      grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+      max-width: 1200px; margin: 0 auto;
+    }
+    .card {
+      background: #0d0d14; border: 1px solid #1c1c28; border-radius: 12px;
+      overflow: hidden; cursor: pointer; transition: border-color .15s, transform .15s;
+    }
+    .card:hover { border-color: #3a3a55; transform: translateY(-2px); }
+    .card canvas { display: block; width: 100%; aspect-ratio: 1; background: #000; }
+    .meta { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; }
+    .meta .name { font-weight: 600; }
+    .meta .hint { font-size: 12px; color: #71718a; }
+    footer { text-align: center; padding: 24px; color: #6a6a82; font-size: 13px; }
+    footer a { color: #9a9ad0; }
+    #status { text-align: center; color: #8a8aa0; padding: 8px; min-height: 22px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Electric Sheep, reborn in your browser</h1>
+    <p class="sub">
+      Fractal flames rendered <em>live in your browser</em> by Rust
+      <code>flame-core</code> compiled to WASM. Click a sheep to watch it spin.
+    </p>
+  </header>
+  <div id="status">loading WASM renderer…</div>
+  <main id="gallery"></main>
+  <footer>
+    Rendered with <code>flame-core</code> → WASM ·
+    <a href="https://flam3.com/flame_draves.pdf">the Fractal Flame algorithm</a>
+  </footer>
+
+  <script type="module">
+    import init, { render_rgba } from './pkg/flame_wasm.js';
+
+    // Render quality for the in-browser CPU renderer (kept modest so it's snappy).
+    const THUMB = { w: 280, h: 280, ss: 1, samples: 1_400_000 };
+    const ANIM  = { w: 240, h: 240, ss: 1, samples: 900_000 };
+
+    const status = document.getElementById('status');
+    const gallery = document.getElementById('gallery');
+
+    function draw(canvas, genomeJson, seed, opts, rotate) {
+      const rgba = render_rgba(genomeJson, opts.w, opts.h, opts.ss, opts.samples, seed, rotate);
+      canvas.width = opts.w; canvas.height = opts.h;
+      const ctx = canvas.getContext('2d');
+      const img = new ImageData(new Uint8ClampedArray(rgba), opts.w, opts.h);
+      ctx.putImageData(img, 0, 0);
+    }
+
+    async function main() {
+      await init();
+      const manifest = await (await fetch('genomes/manifest.json')).json();
+      status.textContent = `${manifest.sheep.length} sheep · click to animate`;
+
+      for (const sheep of manifest.sheep) {
+        const genomeJson = await (await fetch(sheep.file)).text();
+
+        const card = document.createElement('div');
+        card.className = 'card';
+        const canvas = document.createElement('canvas');
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        meta.innerHTML = `<span class="name">${sheep.name}</span><span class="hint">click ▶</span>`;
+        card.append(canvas, meta);
+        gallery.append(card);
+
+        // Initial still.
+        draw(canvas, genomeJson, sheep.seed, THUMB, 0);
+
+        // Click to toggle a spinning animation (re-render per frame).
+        let raf = null, angle = 0;
+        card.addEventListener('click', () => {
+          if (raf) { cancelAnimationFrame(raf); raf = null; draw(canvas, genomeJson, sheep.seed, THUMB, 0); return; }
+          const tick = () => {
+            angle += 0.06;
+            draw(canvas, genomeJson, sheep.seed, ANIM, angle);
+            raf = requestAnimationFrame(tick);
+          };
+          tick();
+        });
+      }
+    }
+
+    main().catch(e => { status.textContent = 'error: ' + e; console.error(e); });
+  </script>
+</body>
+</html>

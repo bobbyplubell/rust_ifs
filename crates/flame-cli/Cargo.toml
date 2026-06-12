@@ -1,0 +1,15 @@
+[package]
+name = "flame-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "flame"
+path = "src/main.rs"
+
+[dependencies]
+flame-core = { workspace = true }
+png = "0.17"
+serde_json = "1"
