@@ -1,5 +1,5 @@
 {
-  "title": "Electric Sheep, judged by a machine",
+  "title": "Electric Sheep, reborn in your browser",
   "sheep": [
     { "name": "Sheep #2",  "file": "genomes/seed_2.json",  "seed": 2 },
     { "name": "Sheep #3",  "file": "genomes/seed_3.json",  "seed": 3 },
