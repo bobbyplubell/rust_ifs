@@ -483,7 +483,13 @@ async function breedSelected() {
 
 // ---- chrome -----------------------------------------------------------------
 
+let swarmLinkSet = false;
 function updateStatus() {
+  if (!swarmLinkSet) {
+    const link = document.querySelector('a[href="swarm.html"]');
+    if (link && PEER_NS !== '0') link.href = `swarm.html?peer=${PEER_NS}`;
+    swarmLinkSet = true;
+  }
   const msLeft = GEN_MS - (Date.now() % GEN_MS);
   const mm = String(Math.floor(msLeft / 60_000));
   const ss = String(Math.floor((msLeft % 60_000) / 1000)).padStart(2, '0');

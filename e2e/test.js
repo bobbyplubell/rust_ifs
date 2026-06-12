@@ -188,6 +188,23 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
   await p2.close();
 }
 
+// ---- 2b. swarm status page reflects contributions and the ban ---------------
+{
+  section('swarm page');
+  const page = await ctx.newPage();
+  page.on('console', (m) => { if (m.type() === 'error') console.log('swarm console.error:', m.text()); });
+  await page.goto(`${base}/swarm.html?peer=1`);
+  await page.locator('#rows tr').first().waitFor({ timeout: 120_000 });
+  await page.waitForFunction(() =>
+    document.querySelectorAll('#rows tr').length >= 2 &&
+    document.body.textContent.includes('♥'), undefined, { timeout: 60_000 });
+  const text = await page.textContent('body');
+  check('swarm page shows weighted contributions', text.includes('♥') && /B pts|M pts/.test(text));
+  check('swarm page shows the banned forger', text.includes('banned (fraud)'));
+  check('swarm page shows totals', /votes proving/.test(text), '');
+  await page.close();
+}
+
 // ---- 3. generation engine: one vote must still breed children ---------------
 {
   section('generation engine');
