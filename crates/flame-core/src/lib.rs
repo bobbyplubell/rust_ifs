@@ -9,6 +9,9 @@
 //! produces a byte-identical image on every target.
 
 pub mod affine;
+pub mod breed;
+#[cfg(feature = "serde")]
+pub mod canonical;
 pub mod genome;
 pub mod interpolate;
 pub mod palette;
@@ -17,6 +20,9 @@ pub mod rng;
 pub mod variations;
 
 pub use affine::Affine;
+pub use breed::{breed, crossover, mutate, BREED_MUTATION_RATE};
+#[cfg(feature = "serde")]
+pub use canonical::{canonical_json, canonicalize, sheep_id, sheep_id_hex};
 pub use genome::{Camera, Genome, Transform};
 pub use palette::{Palette, Stop};
 pub use render::{iterate, render, RenderOpts};

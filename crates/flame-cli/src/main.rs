@@ -34,6 +34,8 @@ fn main() {
         "dump" => cmd_dump(&opts),
         "from-json" => cmd_from_json(&opts),
         "frames-json" => cmd_frames_json(&opts),
+        "sheep-id" => cmd_sheep_id(&opts),
+        "breed" => cmd_breed(&opts),
         "-h" | "--help" | "help" => usage(),
         other => {
             eprintln!("unknown command: {other}\n");
@@ -52,7 +54,9 @@ fn usage() {
          \x20 animate      --seed-a A --seed-b B --frames N [--out-dir dir] [--rotate 1] [size/quality opts]\n\
          \x20 dump         --seed N [--out g.json] [--transforms T]\n\
          \x20 from-json    --in g.json [--out f.png] [--seed N] [size/quality opts]\n\
-         \x20 frames-json  --in g.json --frames N [--out-dir dir] [size/quality opts]   (rotation loop)\n"
+         \x20 frames-json  --in g.json --frames N [--out-dir dir] [size/quality opts]   (rotation loop)\n\
+         \x20 sheep-id     --in g.json   (prints the sha-256 of the canonical genome json)\n\
+         \x20 breed        --in-a a.json --in-b b.json --challenge <64-hex> [--out child.json]\n"
     );
 }
 
@@ -170,6 +174,63 @@ fn cmd_from_json(opts: &HashMap<String, String>) {
     let rgba = render(&genome, &ropts);
     save_png(&out, &rgba, ropts.width, ropts.height);
     eprintln!("wrote {out} from {input}");
+}
+
+fn load_genome(path: &str, what: &str) -> Genome {
+    let text = fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("cannot read {what} ({path}): {e}");
+        exit(1);
+    });
+    let genome: Genome = serde_json::from_str(&text).unwrap_or_else(|e| {
+        eprintln!("bad genome json in {path}: {e}");
+        exit(1);
+    });
+    if let Err(e) = genome.validate() {
+        eprintln!("invalid genome in {path}: {e}");
+        exit(1);
+    }
+    genome
+}
+
+fn decode_challenge(hex: &str) -> [u8; 32] {
+    let hex = hex.trim();
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        eprintln!("--challenge must be 64 hex chars (32 bytes)");
+        exit(1);
+    }
+    let mut bytes = [0u8; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("checked hex");
+    }
+    bytes
+}
+
+fn cmd_sheep_id(opts: &HashMap<String, String>) {
+    let input = opts.get("in").expect("--in genome.json required");
+    let genome = load_genome(input, "--in");
+    println!("{}", flame_core::canonical::sheep_id_hex(&genome));
+}
+
+fn cmd_breed(opts: &HashMap<String, String>) {
+    let in_a = opts.get("in-a").expect("--in-a a.json required");
+    let in_b = opts.get("in-b").expect("--in-b b.json required");
+    let challenge = opts.get("challenge").expect("--challenge <64-hex> required");
+    let out = opts.get("out").cloned().unwrap_or_else(|| "child.json".into());
+
+    let a = load_genome(in_a, "--in-a");
+    let b = load_genome(in_b, "--in-b");
+    let bytes = decode_challenge(challenge);
+    let seed = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+
+    let child = flame_core::breed::breed(&a, &b, seed);
+    if let Err(e) = child.validate() {
+        eprintln!("bred child failed validation: {e}");
+        exit(1);
+    }
+    let json = flame_core::canonical::canonical_json(&child);
+    fs::write(&out, &json).expect("write child json");
+    eprintln!("wrote {out}");
+    println!("{}", flame_core::canonical::sheep_id_hex(&child));
 }
 
 fn cmd_frames_json(opts: &HashMap<String, String>) {

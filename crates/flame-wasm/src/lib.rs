@@ -42,3 +42,89 @@ pub fn render_rgba(
     };
     Ok(render(&genome, &opts))
 }
+
+// ---- genetics: canonical JSON, sheep_id, breeding ---------------------------
+
+fn parse_genome(json: &str, what: &str) -> Result<Genome, JsValue> {
+    let genome: Genome = serde_json::from_str(json)
+        .map_err(|e| JsValue::from_str(&format!("bad {what} genome json: {e}")))?;
+    genome
+        .validate()
+        .map_err(|e| JsValue::from_str(&format!("invalid {what} genome: {e}")))?;
+    Ok(genome)
+}
+
+/// Decode a 32-byte challenge hex string and derive the breeding rng seed
+/// (u64 from the first 8 bytes, little-endian).
+fn challenge_seed(challenge_hex: &str) -> Result<u64, JsValue> {
+    let hex = challenge_hex.trim();
+    if hex.len() != 64 {
+        return Err(JsValue::from_str(&format!(
+            "challenge must be 64 hex chars (32 bytes), got {}",
+            hex.len()
+        )));
+    }
+    let mut bytes = [0u8; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| JsValue::from_str("challenge is not valid hex"))?;
+    }
+    Ok(u64::from_le_bytes(bytes[0..8].try_into().unwrap()))
+}
+
+/// Re-serialize genome JSON into its canonical byte form.
+#[wasm_bindgen]
+pub fn canonicalize(genome_json: &str) -> Result<String, JsValue> {
+    let genome = parse_genome(genome_json, "input")?;
+    Ok(flame_core::canonical::canonical_json(&genome))
+}
+
+/// SHA-256 of the canonical genome JSON, as lowercase hex.
+#[wasm_bindgen]
+pub fn sheep_id(genome_json: &str) -> Result<String, JsValue> {
+    let genome = parse_genome(genome_json, "input")?;
+    Ok(flame_core::canonical::sheep_id_hex(&genome))
+}
+
+/// Deterministically breed two genomes. The rng seed is the first 8 bytes
+/// (little-endian) of the decoded 32-byte challenge; mutation rate is 0.15.
+/// Returns the child's canonical JSON.
+#[wasm_bindgen]
+pub fn breed(a_json: &str, b_json: &str, challenge_hex: &str) -> Result<String, JsValue> {
+    let a = parse_genome(a_json, "parent a")?;
+    let b = parse_genome(b_json, "parent b")?;
+    let seed = challenge_seed(challenge_hex)?;
+    let child = flame_core::breed::breed(&a, &b, seed);
+    child
+        .validate()
+        .map_err(|e| JsValue::from_str(&format!("bred child failed validation: {e}")))?;
+    Ok(flame_core::canonical::canonical_json(&child))
+}
+
+/// Mutate a genome with the given per-site rate, seeded from the challenge
+/// like `breed`. Returns the mutant's canonical JSON.
+#[wasm_bindgen]
+pub fn mutate_genome(genome_json: &str, challenge_hex: &str, rate: f64) -> Result<String, JsValue> {
+    if !rate.is_finite() || !(0.0..=1.0).contains(&rate) {
+        return Err(JsValue::from_str("rate must be in [0, 1]"));
+    }
+    let mut genome = parse_genome(genome_json, "input")?;
+    let seed = challenge_seed(challenge_hex)?;
+    let mut rng = flame_core::rng::Rng::new(seed);
+    flame_core::breed::mutate(&mut genome, &mut rng, rate);
+    genome
+        .validate()
+        .map_err(|e| JsValue::from_str(&format!("mutant failed validation: {e}")))?;
+    Ok(flame_core::canonical::canonical_json(&genome))
+}
+
+/// A random genome (same generator as `flame dump`), as canonical JSON.
+#[wasm_bindgen]
+pub fn random_genome_json(seed: u32, transforms: u32) -> Result<String, JsValue> {
+    if !(1..=8).contains(&transforms) {
+        return Err(JsValue::from_str("transforms must be in 1..=8"));
+    }
+    let mut rng = flame_core::rng::Rng::new(seed as u64);
+    let genome = Genome::random(&mut rng, transforms as usize);
+    Ok(flame_core::canonical::canonical_json(&genome))
+}

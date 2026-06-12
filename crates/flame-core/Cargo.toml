@@ -9,9 +9,12 @@ description = "Fractal-flame (Draves) IFS core: genomes, variations, chaos game,
 [features]
 default = ["serde"]
 # Genome (de)serialization to JSON for the Python breeder and baked web assets.
-serde = ["dep:serde"]
+serde = ["dep:serde", "dep:serde_json"]
 
 [dependencies]
 libm = "0.2"
 serde = { version = "1", features = ["derive"], optional = true }
+# float_roundtrip is REQUIRED: without it serde_json parses floats lossily
+# (off by an ULP), breaking canonical-JSON fixed-point and thus sheep_id.
+serde_json = { version = "1", optional = true, features = ["float_roundtrip"] }
 sha2 = "0.10"
