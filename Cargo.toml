@@ -1,11 +1,22 @@
-[package]
-name = "fractals"
+[workspace]
+resolver = "2"
+members = [
+  "crates/flame-core",
+  "crates/flame-cli",
+  "crates/flame-wasm",
+]
+
+[workspace.package]
 version = "0.1.0"
-authors = ["Bobby Plubell <rlp8xx@mail.umkc.edu>"]
-edition = "2018"
+edition = "2021"
+authors = ["Bobby Plubell <bobbyplubell@gmail.com>"]
+license = "MIT"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[workspace.dependencies]
+flame-core = { path = "crates/flame-core" }
 
-[dependencies]
-png = "0.15.3"
-rand = "0.7.3"
+# Release renders should be fast.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,7 @@
+/target
+**/*.png
+/frames
+/baked
+/web/pkg
+*.gif
+*.mp4

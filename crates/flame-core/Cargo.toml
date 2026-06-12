@@ -1,0 +1,17 @@
+[package]
+name = "flame-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Fractal-flame (Draves) IFS core: genomes, variations, chaos game, tone mapping, interpolation. No I/O, deterministic, wasm-friendly."
+
+[features]
+default = ["serde"]
+# Genome (de)serialization to JSON for the Python breeder and baked web assets.
+serde = ["dep:serde"]
+
+[dependencies]
+libm = "0.2"
+serde = { version = "1", features = ["derive"], optional = true }
+sha2 = "0.10"
