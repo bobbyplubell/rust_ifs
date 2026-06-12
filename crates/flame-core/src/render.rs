@@ -187,9 +187,98 @@ pub fn tonemap(accum: &Accum, genome: &Genome, width: usize, height: usize, ss: 
         }
     }
 
-    // 2. Max density for log normalization.
-    let max_count = down.iter().map(|c| c[3]).fold(0.0f64, f64::max);
-    let log_max = fmath::log(1.0 + max_count).max(1e-12);
+    // 2. Density-estimation lite (the flam3 idea, simplified): sparse regions
+    // get blurred, dense regions stay sharp, so low-sample speckle melts into
+    // the glow instead of reading as grain. We blend each cell toward its
+    // 5x5 gaussian-weighted neighborhood with strength falling off as the
+    // cell's own density approaches the image's mean nonzero density. Pure
+    // function of the buffer — display-side only; chunk hashes (the proof
+    // layer) cover the raw accumulation and are untouched by this.
+    let mean_nz = {
+        let (mut sum, mut n) = (0.0f64, 0u64);
+        for c in down.iter() {
+            if c[3] > 0.0 {
+                sum += c[3];
+                n += 1;
+            }
+        }
+        if n == 0 { 0.0 } else { sum / n as f64 }
+    };
+    if mean_nz > 0.0 {
+        // Gaussian weights exp(-d2 / (2*sigma^2)), sigma = 1.1, precomputed as
+        // literals so the kernel is bit-identical on every target. In a 5x5
+        // neighborhood d2 takes only the values 0, 1, 2, 4, 5, 8.
+        const W: [[f64; 5]; 5] = {
+            let mut w = [[0.0; 5]; 5];
+            let mut y = 0;
+            while y < 5 {
+                let mut x = 0;
+                while x < 5 {
+                    let dx = x as i64 - 2;
+                    let dy = y as i64 - 2;
+                    w[y][x] = match dx * dx + dy * dy {
+                        0 => 1.0,
+                        1 => 0.6616,
+                        2 => 0.4376,
+                        4 => 0.1915,
+                        5 => 0.1267,
+                        _ => 0.0367, // 8
+                    };
+                    x += 1;
+                }
+                y += 1;
+            }
+            w
+        };
+        let sharp = down.clone();
+        for oy in 0..oh {
+            for ox in 0..ow {
+                let me = &sharp[oy * ow + ox];
+                // t in [0,1]: 1 = dense (keep sharp), 0 = empty (full blur).
+                let t = (me[3] / mean_nz).min(1.0);
+                if t >= 1.0 {
+                    continue;
+                }
+                let mut acc = [0.0f64; 4];
+                let mut wsum = 0.0f64;
+                for dy in -2i64..=2 {
+                    for dx in -2i64..=2 {
+                        let nx = ox as i64 + dx;
+                        let ny = oy as i64 + dy;
+                        if nx < 0 || ny < 0 || nx >= ow as i64 || ny >= oh as i64 {
+                            continue;
+                        }
+                        let w = W[(dy + 2) as usize][(dx + 2) as usize];
+                        let c = &sharp[ny as usize * ow + nx as usize];
+                        acc[0] += w * c[0];
+                        acc[1] += w * c[1];
+                        acc[2] += w * c[2];
+                        acc[3] += w * c[3];
+                        wsum += w;
+                    }
+                }
+                let cell = &mut down[oy * ow + ox];
+                for k in 0..4 {
+                    cell[k] = t * me[k] + (1.0 - t) * (acc[k] / wsum);
+                }
+            }
+        }
+    }
+
+    // 3. Exposure: normalize log-density by a high percentile of the nonzero
+    // counts instead of the strict max — one super-hot cell no longer dims the
+    // whole image, and the densest filaments saturate into highlights (the
+    // flam3 look). Deterministic: total_cmp sort, fixed percentile.
+    let norm_count = {
+        let mut counts: Vec<f64> = down.iter().map(|c| c[3]).filter(|&c| c > 0.0).collect();
+        if counts.is_empty() {
+            0.0
+        } else {
+            counts.sort_unstable_by(f64::total_cmp);
+            counts[((counts.len() - 1) as f64 * 0.995) as usize]
+        }
+    };
+    let log_max = fmath::log(1.0 + norm_count).max(1e-12);
     let inv_gamma = 1.0 / genome.gamma;
     let vib = genome.vibrancy.clamp(0.0, 1.0);
 

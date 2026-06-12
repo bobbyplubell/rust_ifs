@@ -62,6 +62,22 @@ impl Affine {
         )
     }
 
+    /// Rotate the linear part (basis) by `theta`, keeping the translation.
+    /// This is the flam3 animation primitive: spinning each transform's basis
+    /// through 2π produces the classic Electric Sheep swirl, and is exactly
+    /// 2π-periodic so loops close perfectly.
+    pub fn rotated(&self, theta: f64) -> Affine {
+        let (sin, cos) = crate::fmath::sincos(theta);
+        Affine::new(
+            self.a * cos + self.b * sin,
+            -self.a * sin + self.b * cos,
+            self.c,
+            self.d * cos + self.e * sin,
+            -self.d * sin + self.e * cos,
+            self.f,
+        )
+    }
+
     /// Component-wise linear interpolation (crude but adequate for v1 animation;
     /// see `interpolate` module for the rotation-aware path).
     pub fn lerp(&self, other: &Affine, t: f64) -> Affine {

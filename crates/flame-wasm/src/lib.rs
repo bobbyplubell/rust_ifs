@@ -44,6 +44,33 @@ pub fn render_rgba(
     Ok(render(&genome, &opts))
 }
 
+/// Render one animation frame: the genome at loop `phase` (0..1) — flam3-style
+/// transform-basis rotation plus palette drift (see flame_core::animate).
+/// Display-only; proofs always render the base genome.
+#[wasm_bindgen]
+pub fn render_frame(
+    genome_json: &str,
+    phase: f64,
+    width: usize,
+    height: usize,
+    ss: usize,
+    samples: u32,
+    seed: u32,
+) -> Result<Vec<u8>, JsValue> {
+    let genome: Genome = serde_json::from_str(genome_json)
+        .map_err(|e| JsValue::from_str(&format!("bad genome json: {e}")))?;
+    let g = flame_core::animate::animated(&genome, phase);
+    let opts = RenderOpts {
+        width,
+        height,
+        ss,
+        samples: samples as u64,
+        burn_in: 20,
+        seed: seed as u64,
+    };
+    Ok(render(&g, &opts))
+}
+
 // ---- genetics: canonical JSON, sheep_id, breeding ---------------------------
 
 fn parse_genome(json: &str, what: &str) -> Result<Genome, JsValue> {

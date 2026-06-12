@@ -176,7 +176,12 @@ fn cmd_from_json(opts: &HashMap<String, String>) {
     let ropts = render_opts(opts);
     let input = opts.get("in").expect("--in genome.json required");
     let text = fs::read_to_string(input).expect("read genome json");
-    let genome: Genome = serde_json::from_str(&text).expect("parse genome json");
+    let mut genome: Genome = serde_json::from_str(&text).expect("parse genome json");
+    // Optional flam3-style animation phase (0..1): rotated bases + palette drift.
+    let phase: f64 = get(opts, "phase", 0.0);
+    if phase != 0.0 {
+        genome = flame_core::animate::animated(&genome, phase);
+    }
     let out = opts.get("out").cloned().unwrap_or_else(|| "flame.png".into());
     let rgba = render(&genome, &ropts);
     save_png(&out, &rgba, ropts.width, ropts.height);

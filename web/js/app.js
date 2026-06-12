@@ -14,6 +14,10 @@ import {
 const $ = (s) => document.querySelector(s);
 const pool = new WorkerPool();
 
+// Display quality (free to change): supersampled + more samples than the
+// protocol PROOF_SPEC, which vote renders must match exactly.
+const VIEW_SPEC = { width: 256, height: 256, ss: 2, nChunks: 32, samplesPerChunk: 120_000 };
+
 const cards = new Map();   // sheepId -> {record, canvas, tallyEl, voteBtn, card}
 const tallies = new Map(); // sheepId -> Set of vote keys
 const selected = [];       // up to two sheepIds picked as parents
@@ -66,17 +70,20 @@ function addCard(record) {
   label.title = record.id;
   const tallyEl = document.createElement('span');
   tallyEl.className = 'tally';
+  const spinBtn = document.createElement('button');
+  spinBtn.textContent = 'spin';
   const voteBtn = document.createElement('button');
   voteBtn.textContent = 'vote';
-  meta.append(label, tallyEl, voteBtn);
+  meta.append(label, tallyEl, spinBtn, voteBtn);
   card.append(canvas, meta);
   $('#flock').append(card);
 
-  const entry = { record, canvas, tallyEl, voteBtn, card };
+  const entry = { record, canvas, tallyEl, spinBtn, voteBtn, card };
   cards.set(record.id, entry);
   updateTally(record.id);
 
   canvas.addEventListener('click', () => toggleSelect(record.id));
+  spinBtn.addEventListener('click', () => toggleSpin(entry).catch(showError));
   voteBtn.addEventListener('click', () => vote(entry).catch(showError));
 
   drawProgressively(canvas, record.genome, `view|${record.id}`).catch(showError);
@@ -84,12 +91,12 @@ function addCard(record) {
 
 // Render a genome onto a canvas through the pool, painting as chunks land.
 // Returns the chunk hashes (= the render proof when challenge is a vote challenge).
-async function drawProgressively(canvas, genomeJson, challengeSource, challengeHex) {
+async function drawProgressively(canvas, genomeJson, challengeSource, challengeHex, spec = VIEW_SPEC) {
   challengeHex ??= await sha256Hex(utf8(challengeSource));
   const ctx = canvas.getContext('2d');
   canvas.classList.add('rendering');
   const job = pool.submit(
-    { type: 'render', genomeJson, challengeHex, ...PROOF_SPEC, tonemapEvery: 8 },
+    { type: 'render', genomeJson, challengeHex, ...spec, tonemapEvery: 8 },
     {
       onProgress: (p) => {
         if (p.rgba) {
@@ -108,9 +115,57 @@ async function drawProgressively(canvas, genomeJson, challengeSource, challengeH
   return null;
 }
 
+// ---- spin (flam3-style animation, not a camera move) ------------------------
+//
+// "spin" rotates each transform's affine basis through 2π over the loop and
+// drifts the palette — the original Electric Sheep motion. One sheep spins at
+// a time; frames pipeline two-deep through the pool for ~2x the frame rate.
+
+const LOOP_MS = 14_000;
+const FRAME = { width: 256, height: 256, samples: 350_000, seed: 7 };
+let spinning = null; // {entry, stop}
+
+async function toggleSpin(entry) {
+  if (spinning?.entry === entry) { stopSpin(); return; }
+  stopSpin();
+  const s = { entry, stop: false };
+  spinning = s;
+  entry.spinBtn.textContent = 'stop';
+  const ctx = entry.canvas.getContext('2d');
+
+  const frameJob = () => pool.submit({
+    type: 'frame', genomeJson: entry.record.genome,
+    phase: (performance.now() % LOOP_MS) / LOOP_MS, ...FRAME,
+  }).done;
+
+  let pending = frameJob();
+  while (!s.stop) {
+    const next = frameJob();
+    const done = await pending;
+    pending = next;
+    if (s.stop) break;
+    if (done.type === 'done') {
+      ctx.putImageData(
+        new ImageData(new Uint8ClampedArray(done.rgba), done.width, done.height), 0, 0);
+    }
+  }
+}
+
+function stopSpin() {
+  if (!spinning) return;
+  const { entry } = spinning;
+  spinning.stop = true;
+  spinning = null;
+  entry.spinBtn.textContent = 'spin';
+  // Settle back to the crisp base render.
+  drawProgressively(entry.canvas, entry.record.genome, `view|${entry.record.id}`)
+    .catch(showError);
+}
+
 // ---- voting ----------------------------------------------------------------
 
 async function vote(entry) {
+  if (spinning?.entry === entry) stopSpin();
   const g = gen();
   const myKey = `${me.pubHex}:${entry.record.id}:${g}`;
   if (tallies.get(entry.record.id)?.has(myKey)) return; // already voted this gen
@@ -119,13 +174,17 @@ async function vote(entry) {
   entry.voteBtn.textContent = 'rendering…';
   // The proof render IS watching the sheep: personal challenge, full spec.
   const challengeHex = await voteChallenge(entry.record.id, me.pubHex, g);
-  const chunkHashes = await drawProgressively(entry.canvas, entry.record.genome, null, challengeHex);
+  const chunkHashes = await drawProgressively(
+    entry.canvas, entry.record.genome, null, challengeHex, PROOF_SPEC);
   if (!chunkHashes) { entry.voteBtn.disabled = false; entry.voteBtn.textContent = 'vote'; return; }
 
   const record = { sheepId: entry.record.id, gen: g, voter: me.pubHex, chunkHashes };
   record.sig = await sign(me.pair, voteSignBytes(record));
   await net.publishVote(record);
   entry.voteBtn.textContent = 'voted ✓';
+  // The proof render is protocol-quality; settle back to display quality.
+  drawProgressively(entry.canvas, entry.record.genome, `view|${entry.record.id}`)
+    .catch(showError);
 }
 
 function bumpTally(v, quiet) {

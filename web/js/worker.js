@@ -8,11 +8,10 @@
 //      wasm export `challenge_from_seed(seed)`. Used by the flock view for
 //      casual (non-proof) renders keyed by the manifest seed.
 //
-//   2. `{type:'spin-frame', jobId, genomeJson, seed, width, height,
-//       samples, rotate}` — a one-shot frame via the OLD `render_rgba`
-//      export (which still exists), used for the sheep-view spin animation
-//      where ChunkedRender would be far too slow per frame. Replies with a
-//      normal `done` message carrying the RGBA buffer (empty `hashes`).
+//   2. `{type:'frame', jobId, genomeJson, phase, width, height, samples,
+//       seed}` — one animation frame at loop `phase` (0..1) via the wasm
+//      `render_frame` export (flam3-style transform rotation + palette
+//      drift). Replies with a normal `done` message (empty `hashes`).
 //
 // main -> worker:
 //   {type:'render', jobId, genomeJson, challengeHex | challengeSeed,
@@ -37,7 +36,7 @@ import init, {
   challenge_from_seed,
   breed,
   sheep_id,
-  render_rgba,
+  render_frame,
 } from '../pkg/flame_wasm.js';
 
 // Job ids cancelled by the main thread. Checked between chunks; once a job
@@ -64,7 +63,7 @@ self.onmessage = async (event) => {
       case 'audit':      handleAudit(msg); break;
       case 'breed':      handleBreed(msg); break;
       case 'sheep-id':   handleSheepId(msg); break;
-      case 'spin-frame': handleSpinFrame(msg); break;
+      case 'frame':      handleFrame(msg); break;
       default:
         throw new Error(`unknown message type: ${msg.type}`);
     }
@@ -145,10 +144,10 @@ function handleBreed(msg) {
   self.postMessage({ type: 'breed-done', jobId: msg.jobId, childJson, childId });
 }
 
-// Protocol extension (see header): single fast frame for spin animation.
-function handleSpinFrame(msg) {
-  const { jobId, genomeJson, seed, width, height, samples, rotate } = msg;
-  const rgba = render_rgba(genomeJson, width, height, 1, samples, seed, rotate);
+// Protocol extension (see header): one animation frame at loop `phase`.
+function handleFrame(msg) {
+  const { jobId, genomeJson, phase, width, height, samples, seed } = msg;
+  const rgba = render_frame(genomeJson, phase, width, height, 1, samples, seed ?? 7);
   if (cancelled.has(jobId)) return;
   const buf = rgba.buffer;
   self.postMessage({ type: 'done', jobId, hashes: [], rgba: buf, width, height }, [buf]);
