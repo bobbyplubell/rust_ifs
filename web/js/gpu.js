@@ -7,7 +7,7 @@
 // tonemap is the older max-normalized one. What it buys is raw speed: full
 //-screen animation at frame rates the CPU path cannot approach.
 
-const STRIDE = 36; // floats per transform: [weight, color, affine6, post6, var22]
+const STRIDE = 59; // floats per transform: [weight, color, affine6, post6, var29, pvals16]
 const COLOR_SCALE = 256.0;
 const BURN_IN = 20;
 const THREADS = 1 << 16; // parallel trajectories per frame (preview-sized)
@@ -42,7 +42,8 @@ function packTransform(out, base, t) {
   out[base + 1] = t.color;
   const A = t.affine, P = t.post;
   out.set([A.a, A.b, A.c, A.d, A.e, A.f, P.a, P.b, P.c, P.d, P.e, P.f], base + 2);
-  for (let v = 0; v < 22; v++) out[base + 14 + v] = t.variations[v] || 0;
+  for (let v = 0; v < 29; v++) out[base + 14 + v] = t.variations[v] || 0;
+  for (let k = 0; k < 16; k++) out[base + 43 + k] = (t.pvals && t.pvals[k]) || 0;
 }
 
 function packGenome(g) {

@@ -98,6 +98,9 @@ async function main() {
     get audits() { return auditor.stats.audits; },
     get frauds() { return auditor.stats.frauds; },
     get banned() { return [...bannedVoters]; },
+    get pool() {
+      return { queued: pool.queue.length, running: pool.running, chunks: pool.chunksRendered };
+    },
   };
   shownGen = gen();
   setInterval(() => {

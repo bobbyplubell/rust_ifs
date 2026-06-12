@@ -8,7 +8,10 @@
 // Env: PORT (ws listen, default 4001), ANNOUNCE (comma-separated public
 // multiaddrs to advertise, e.g. /dns4/relay.example.com/tcp/443/wss).
 
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import { createLibp2p } from 'libp2p';
+import { generateKeyPair, privateKeyToProtobuf, privateKeyFromProtobuf } from '@libp2p/crypto/keys';
 import { webSockets } from '@libp2p/websockets';
 import { circuitRelayServer } from '@libp2p/circuit-relay-v2';
 import { noise } from '@chainsafe/libp2p-noise';
@@ -20,7 +23,22 @@ import { TOPIC } from './common.js';
 const port = process.env.PORT || 4001;
 const announce = (process.env.ANNOUNCE || '').split(',').filter(Boolean);
 
+// Persist the peer key: the relay's peer id is baked into every client's
+// config.js, so it must survive restarts (compose mounts /app/keys).
+const keyFile = process.env.KEY_FILE || 'keys/relay.key';
+let privateKey;
+try {
+  privateKey = privateKeyFromProtobuf(new Uint8Array(await readFile(keyFile)));
+  console.log('loaded peer key from', keyFile);
+} catch {
+  privateKey = await generateKeyPair('Ed25519');
+  await mkdir(dirname(keyFile), { recursive: true });
+  await writeFile(keyFile, privateKeyToProtobuf(privateKey));
+  console.log('generated new peer key ->', keyFile);
+}
+
 const node = await createLibp2p({
+  privateKey,
   addresses: {
     listen: [`/ip4/0.0.0.0/tcp/${port}/ws`],
     ...(announce.length ? { announce } : {}),

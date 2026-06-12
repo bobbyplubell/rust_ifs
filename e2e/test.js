@@ -174,8 +174,11 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
         audits: window.__sheepStats.audits,
         frauds: window.__sheepStats.frauds,
         banned: window.__sheepStats.banned,
+        pool: window.__sheepStats.pool,
       }));
       if (stats.frauds > 0 && stats.banned.includes(voter)) { caught = true; break; }
+      console.log(`[${ts()}] fraud poll: audits=${stats.audits} frauds=${stats.frauds} ` +
+        `pool=${JSON.stringify(stats.pool)}`);
       await new Promise((r) => setTimeout(r, 3000));
     }
     check('auditor catches forged vote and bans the key', caught,

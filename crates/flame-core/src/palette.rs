@@ -47,16 +47,26 @@ impl Palette {
         ]
     }
 
-    /// A random palette with `n` interior stops plus locked endpoints.
+    /// A random palette from a cosine gradient (Quilez-style):
+    /// `color(t) = a + b*cos(2pi*(c*t + d))` per channel — hue-correlated,
+    /// smooth, with a built-in bright-to-dark ramp that reads as lighting.
+    /// Uniform-random stops average into pastel mud; these don't.
     pub fn random(rng: &mut Rng) -> Palette {
-        let n = 2 + rng.below(4); // 2..=5 control colors
-        let mut stops = Vec::with_capacity(n);
-        for i in 0..n {
-            let pos = i as f64 / (n as f64 - 1.0);
-            stops.push(Stop {
-                pos,
-                rgb: [rng.f64(), rng.f64(), rng.f64()],
-            });
+        use crate::fmath;
+        const N: usize = 8;
+        let a = [rng.range(0.35, 0.6), rng.range(0.35, 0.6), rng.range(0.35, 0.6)];
+        let b = [rng.range(0.25, 0.5), rng.range(0.25, 0.5), rng.range(0.25, 0.5)];
+        let c = rng.range(0.6, 1.4); // shared frequency keeps hues correlated
+        let d = [rng.f64(), rng.f64(), rng.f64()];
+        let mut stops = Vec::with_capacity(N);
+        for i in 0..N {
+            let t = i as f64 / (N as f64 - 1.0);
+            let mut rgb = [0.0; 3];
+            for k in 0..3 {
+                rgb[k] = (a[k] + b[k] * fmath::cos(core::f64::consts::TAU * (c * t + d[k])))
+                    .clamp(0.0, 1.0);
+            }
+            stops.push(Stop { pos: t, rgb });
         }
         Palette { stops }
     }

@@ -4,10 +4,11 @@
 // (also compute) produce the final image. No CPU point generation.
 //
 // Genome is uploaded as a flat f32 buffer; each transform occupies STRIDE
-// floats: [weight, color, affine(6), post(6), variations(22)] = 36.
+// floats: [weight, color, affine(6), post(6), variations(29), pvals(16)] = 59.
+// pvals layout mirrors flame-core variations::pval.
 
 const PI: f32 = 3.14159265358979;
-const STRIDE: u32 = 36u;
+const STRIDE: u32 = 59u;
 
 struct Params {
     dims: vec4<u32>,   // hw, hh, n_transforms, has_final
@@ -42,7 +43,11 @@ fn rnd(state: ptr<function, u32>) -> f32 {
 
 // ---- variations (mirror of flame-core variations.rs) -----------------------
 
-fn variation(idx: u32, x: f32, y: f32, state: ptr<function, u32>) -> vec2<f32> {
+fn pv(t: u32, k: u32) -> f32 {
+    return genome[t * STRIDE + 43u + k];
+}
+
+fn variation(idx: u32, t: u32, x: f32, y: f32, state: ptr<function, u32>) -> vec2<f32> {
     let r2 = x * x + y * y;
     let r = sqrt(r2);
     let theta = atan2(x, y);
@@ -79,6 +84,56 @@ fn variation(idx: u32, x: f32, y: f32, state: ptr<function, u32>) -> vec2<f32> {
         case 19u { return vec2(sin(x), y); }
         case 20u { return vec2(sin(x) / cos(y), tan(y)); }
         case 21u { let d = x * x - y * y; let s = sqrt(1.0 / (d * d + 1e-12)); return vec2(s * x, s * y); }
+        // -- parametric (read the transform's pval block) --
+        case 22u { // julian
+            var power = pv(t, 0u); if (abs(power) < 1e-6) { power = 2.0; }
+            let dist = pv(t, 1u);
+            let k = trunc(abs(power) * rnd(state));
+            let tt = (atan2(y, x) + 6.28318530717958648 * k) / power;
+            let m = pow(r, dist / power);
+            return vec2(m * cos(tt), m * sin(tt));
+        }
+        case 23u { // juliascope
+            var power = pv(t, 2u); if (abs(power) < 1e-6) { power = 2.0; }
+            let dist = pv(t, 3u);
+            let k = trunc(abs(power) * rnd(state));
+            let phi = atan2(y, x);
+            let dir = select(phi, -phi, (u32(k) & 1u) == 1u);
+            let tt = (6.28318530717958648 * k + dir) / power;
+            let m = pow(r, dist / power);
+            return vec2(m * cos(tt), m * sin(tt));
+        }
+        case 24u { // blob
+            let low = pv(t, 4u); let high = pv(t, 5u); let waves = pv(t, 6u);
+            let pr = r * (low + 0.5 * (high - low) * (sin(waves * theta) + 1.0));
+            return vec2(pr * sin(theta), pr * cos(theta));
+        }
+        case 25u { // curl
+            let c1 = pv(t, 7u); let c2 = pv(t, 8u);
+            let re = 1.0 + c1 * x + c2 * (x * x - y * y);
+            let im = c1 * y + 2.0 * c2 * x * y;
+            let s = 1.0 / (re * re + im * im + 1e-12);
+            return vec2((x * re + y * im) * s, (y * re - x * im) * s);
+        }
+        case 26u { // fan2
+            let fx = pv(t, 9u); let fy = pv(t, 10u);
+            let dx = PI * (fx * fx + 1e-10);
+            let dx2 = 0.5 * dx;
+            let tt = theta + fy - dx * trunc((theta + fy) / dx);
+            let a = select(theta + dx2, theta - dx2, tt > dx2);
+            return vec2(r * sin(a), r * cos(a));
+        }
+        case 27u { // rings2
+            let v = pv(t, 11u);
+            let p = v * v + 1e-10;
+            let tt = r - 2.0 * p * trunc((r + p) / (2.0 * p)) + r * (1.0 - p);
+            return vec2(tt * sin(theta), tt * cos(theta));
+        }
+        case 28u { // pdj
+            return vec2(
+                sin(pv(t, 12u) * y) - cos(pv(t, 13u) * x),
+                sin(pv(t, 14u) * x) - cos(pv(t, 15u) * y));
+        }
         default { return vec2(x, y); }
     }
 }
@@ -91,10 +146,10 @@ fn apply_tx(t: u32, p: vec2<f32>, state: ptr<function, u32>) -> vec2<f32> {
     let px = field(t, 2u) * p.x + field(t, 3u) * p.y + field(t, 4u);
     let py = field(t, 5u) * p.x + field(t, 6u) * p.y + field(t, 7u);
     var b = vec2<f32>(0.0, 0.0);
-    for (var v = 0u; v < 22u; v = v + 1u) {
+    for (var v = 0u; v < 29u; v = v + 1u) {
         let w = field(t, 14u + v);
         if (w != 0.0) {
-            b = b + w * variation(v, px, py, state);
+            b = b + w * variation(v, t, px, py, state);
         }
     }
     // post affine

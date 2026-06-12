@@ -26,12 +26,17 @@ impl Transform {
         } else {
             self.variations.clone()
         };
+        let mut pvals = self.pvals;
+        for (i, v) in pvals.iter_mut().enumerate() {
+            *v = lerp(*v, other.pvals[i], t);
+        }
         Transform {
             weight: lerp(self.weight, other.weight, t),
             color: lerp(self.color, other.color, t),
             affine: self.affine.lerp(&other.affine, t),
             post: self.post.lerp(&other.post, t),
             variations,
+            pvals,
         }
     }
 }

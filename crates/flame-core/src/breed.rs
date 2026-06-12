@@ -100,6 +100,15 @@ fn mutate_transform(t: &mut Transform, rng: &mut Rng, rate: f64) {
         let idx = rng.below(t.variations.len());
         t.variations[idx] = rng.range(0.2, 1.0);
     }
+    if rng.chance(rate) {
+        // Jitter one parametric value; occasionally re-roll the whole block.
+        if rng.chance(0.2) {
+            t.pvals = Transform::random_pvals(rng);
+        } else {
+            let i = rng.below(t.pvals.len());
+            t.pvals[i] += rng.range(-0.25, 0.25);
+        }
+    }
 }
 
 /// Mutate a genome in place. `rate` is the per-site mutation probability;
@@ -146,6 +155,9 @@ pub fn breed(a: &Genome, b: &Genome, seed: u64) -> Genome {
     let mut rng = Rng::new(seed);
     let mut child = crossover(a, b, &mut rng);
     mutate(&mut child, &mut rng, BREED_MUTATION_RATE);
+    // Re-frame on the child's own attractor (deterministic probe), so bred
+    // sheep arrive centered no matter where the parents' cameras pointed.
+    child.auto_frame();
     child
 }
 
@@ -180,6 +192,9 @@ impl Genome {
             }
             if t.variations.iter().any(|v| !v.is_finite()) {
                 return Err(format!("{what}: non-finite variation weight"));
+            }
+            if t.pvals.iter().any(|v| !v.is_finite()) {
+                return Err(format!("{what}: non-finite variation parameter"));
             }
             Ok(())
         };
