@@ -12,6 +12,8 @@ pub mod affine;
 pub mod breed;
 #[cfg(feature = "serde")]
 pub mod canonical;
+pub mod chunked;
+pub mod fmath;
 pub mod genome;
 pub mod interpolate;
 pub mod palette;
@@ -23,8 +25,12 @@ pub use affine::Affine;
 pub use breed::{breed, crossover, mutate, BREED_MUTATION_RATE};
 #[cfg(feature = "serde")]
 pub use canonical::{canonical_json, canonicalize, sheep_id, sheep_id_hex};
+pub use chunked::{
+    challenge_from_hex, challenge_from_seed, chunk_hash, chunk_hash_hex, chunk_seed, render_chunk,
+    sha256_hex, to_hex, Challenge, CHUNK_BURN_IN,
+};
 pub use genome::{Camera, Genome, Transform};
 pub use palette::{Palette, Stop};
-pub use render::{iterate, render, RenderOpts};
+pub use render::{accumulate, iterate, render, tonemap, Accum, RenderOpts};
 pub use rng::Rng;
 pub use variations::Variation;

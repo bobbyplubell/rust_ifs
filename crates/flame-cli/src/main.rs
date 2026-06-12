@@ -6,6 +6,11 @@
 //!   dump          random genome from --seed -> genome JSON
 //!   from-json     render a genome JSON -> PNG
 //!   frames-json   render a genome JSON over a rotation loop -> PNG frames
+//!   chunk-hashes  chunked protocol render of a genome JSON -> per-chunk +
+//!                 final-RGBA SHA-256 hashes (native side of the browser
+//!                 determinism check)
+//!   sheep-id      genome JSON -> sha-256 of its canonical form
+//!   breed         deterministically breed two genome JSONs
 //!
 //! Arg parsing is intentionally dependency-free `--key value`.
 
@@ -36,6 +41,7 @@ fn main() {
         "frames-json" => cmd_frames_json(&opts),
         "sheep-id" => cmd_sheep_id(&opts),
         "breed" => cmd_breed(&opts),
+        "chunk-hashes" => cmd_chunk_hashes(&opts),
         "-h" | "--help" | "help" => usage(),
         other => {
             eprintln!("unknown command: {other}\n");
@@ -56,7 +62,8 @@ fn usage() {
          \x20 from-json    --in g.json [--out f.png] [--seed N] [size/quality opts]\n\
          \x20 frames-json  --in g.json --frames N [--out-dir dir] [size/quality opts]   (rotation loop)\n\
          \x20 sheep-id     --in g.json   (prints the sha-256 of the canonical genome json)\n\
-         \x20 breed        --in-a a.json --in-b b.json --challenge <64-hex> [--out child.json]\n"
+         \x20 breed        --in-a a.json --in-b b.json --challenge <64-hex> [--out child.json]\n\
+         \x20 chunk-hashes --in g.json --challenge <hex> --chunks N --samples-per-chunk N --width W --height H --ss S\n"
     );
 }
 
@@ -250,4 +257,36 @@ fn cmd_frames_json(opts: &HashMap<String, String>) {
         save_png(&path, &rgba, ropts.width, ropts.height);
     }
     eprintln!("wrote {frames} rotation frames to {dir}/ from {input}");
+}
+
+fn cmd_chunk_hashes(opts: &HashMap<String, String>) {
+    let input = opts.get("in").expect("--in genome.json required");
+    let challenge_hex = opts.get("challenge").expect("--challenge <hex> required");
+    let challenge = flame_core::chunked::challenge_from_hex(challenge_hex)
+        .unwrap_or_else(|e| panic!("bad --challenge: {e}"));
+    let chunks: u32 = get(opts, "chunks", 8);
+    let samples_per_chunk: u64 = get(opts, "samples-per-chunk", 50_000);
+    let width: usize = get(opts, "width", 64);
+    let height: usize = get(opts, "height", 64);
+    let ss: usize = get(opts, "ss", 1);
+
+    let text = fs::read_to_string(input).expect("read genome json");
+    let genome: Genome = serde_json::from_str(&text).expect("parse genome json");
+
+    let mut running = flame_core::render::Accum::new(width * ss, height * ss);
+    for idx in 0..chunks {
+        let chunk = flame_core::chunked::render_chunk(
+            &genome,
+            width,
+            height,
+            ss,
+            samples_per_chunk,
+            &challenge,
+            idx,
+        );
+        println!("{idx}: {}", flame_core::chunked::chunk_hash_hex(&chunk));
+        running.merge(&chunk);
+    }
+    let rgba = flame_core::render::tonemap(&running, &genome, width, height, ss);
+    println!("rgba: {}", flame_core::chunked::sha256_hex(&rgba));
 }

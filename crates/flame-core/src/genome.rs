@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::affine::Affine;
+use crate::fmath;
 use crate::palette::Palette;
 use crate::rng::Rng;
 use crate::variations::Variation;
@@ -97,7 +98,7 @@ impl Camera {
     /// image of `width`x`height`. World units are scaled by `scale * min(w,h)`.
     pub fn world_to_image(&self, width: usize, height: usize) -> Affine {
         let s = self.scale * width.min(height) as f64;
-        let (sin, cos) = self.rotate.sin_cos();
+        let (sin, cos) = fmath::sincos(self.rotate);
         // rotate+scale about the camera center, then move to image center.
         Affine::new(
             s * cos,
