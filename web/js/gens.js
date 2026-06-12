@@ -30,8 +30,8 @@ const childCache = new Map(); // challengeHex -> {id, genome} (derivation is pur
  * @returns {living: Map(id -> record), genActive: number} — records carry
  *          .derived = true when they were born here rather than gossiped.
  */
-export async function computeFlock({ store, baked, breedFn }) {
-  const current = gen();
+export async function computeFlock({ store, baked, breedFn, currentGen }) {
+  const current = currentGen ?? gen();
 
   // Submissions per generation, after the deterministic per-author cap
   // (lowest sheep ids win — same subset on every peer, any partition).
@@ -78,7 +78,18 @@ export async function computeFlock({ store, baked, breedFn }) {
       .sort((a, b) => b[1] - a[1] || (a[0].id < b[0].id ? -1 : 1));
     if (!voted.length) continue; // quiet generation: carry over unchanged
 
+    // Voted sheep take survivor slots first; remaining slots (of K) fill from
+    // the unvoted living, newest first (deterministic). Without the fill, a
+    // lone vote would collapse the population to one un-breedable sheep.
     const survivors = voted.slice(0, SURVIVORS_K).map(([r]) => r);
+    if (survivors.length < SURVIVORS_K) {
+      const taken = new Set(survivors.map((r) => r.id));
+      const fill = [...living.values()]
+        .filter((r) => !taken.has(r.id))
+        .sort((a, b) => b.gen - a.gen || (a.id < b.id ? -1 : 1))
+        .slice(0, SURVIVORS_K - survivors.length);
+      survivors.push(...fill);
+    }
 
     // Births: cyclic pairing of survivors; pair (a,b) sorted+deduped so the
     // child set is order-independent.

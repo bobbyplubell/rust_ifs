@@ -127,7 +127,50 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
   await p2.close();
 }
 
-// ---- 3. WebGPU preview (soft: skips when the container has no WebGPU) -------
+// ---- 3. generation engine: one vote must still breed children ---------------
+{
+  const page = await ctx.newPage();
+  page.on('console', (m) => { if (m.type() === 'error') console.log('gen console.error:', m.text()); });
+  await page.goto(`${base}/about.html`);
+  const result = await page.evaluate(async () => {
+    const wasm = await import('./pkg/flame_wasm.js');
+    await wasm.default();
+    const { computeFlock } = await import('./js/gens.js');
+    const { gen } = await import('./js/net.js');
+
+    const manifest = await (await fetch('genomes/manifest.json')).json();
+    const baked = [];
+    for (const s of manifest.sheep) {
+      const genome = await (await fetch(s.file)).text();
+      baked.push({ id: wasm.sheep_id(genome), genome, parents: null, gen: 0, baked: true, name: s.name });
+    }
+    const g = gen() - 2;
+    const store = {
+      allSheep: async () => [],
+      allVotes: async () => [{
+        sheepId: baked[0].id, gen: g, voter: 'f'.repeat(64),
+        chunkHashes: [], key: `x:${baked[0].id}:${g}`,
+      }],
+    };
+    const breedFn = async (aJson, bJson, challengeHex) => {
+      const childJson = wasm.breed(aJson, bJson, challengeHex);
+      return { childJson, childId: wasm.sheep_id(childJson) };
+    };
+    const { living } = await computeFlock({ store, baked, breedFn, currentGen: g + 1 });
+    const records = [...living.values()];
+    return {
+      size: records.length,
+      born: records.filter((r) => r.derived).length,
+      votedSurvives: living.has(baked[0].id),
+    };
+  });
+  check('gen close with one vote breeds children',
+    result.votedSurvives && result.born >= 3 && result.size >= 7,
+    `living=${result.size}, born=${result.born}, voted-survives=${result.votedSurvives}`);
+  await page.close();
+}
+
+// ---- 4. WebGPU preview (soft: skips when the container has no WebGPU) -------
 {
   const page = await ctx.newPage();
   page.on('console', (m) => { if (m.type() === 'error') console.log('gpu console.error:', m.text()); });
