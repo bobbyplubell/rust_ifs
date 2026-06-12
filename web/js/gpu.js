@@ -100,6 +100,7 @@ export class GpuFlame {
         { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
         { binding: 6, visibility: GPUShaderStage.COMPUTE,
           storageTexture: { access: 'write-only', format: 'rgba8unorm' } },
+        { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       ],
     });
     this.layout = layout;
@@ -138,6 +139,7 @@ export class GpuFlame {
       palette: d.createBuffer({ size: 768 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
       down: d.createBuffer({ size: w * h * 16, usage: GPUBufferUsage.STORAGE }),
       max: d.createBuffer({ size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
+      stats: d.createBuffer({ size: 8, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
     };
     this.tex = d.createTexture({
       size: { width: w, height: h },
@@ -154,6 +156,7 @@ export class GpuFlame {
         { binding: 4, resource: { buffer: this.buf.down } },
         { binding: 5, resource: { buffer: this.buf.max } },
         { binding: 6, resource: this.tex.createView() },
+        { binding: 7, resource: { buffer: this.buf.stats } },
       ],
     }));
   }
@@ -212,7 +215,8 @@ export class GpuFlame {
 
     const enc = d.createCommandEncoder();
     enc.clearBuffer(this.buf.hist);
-    if (!keepExposure) enc.clearBuffer(this.buf.max);
+    enc.clearBuffer(this.buf.stats); // density stats are per-frame
+    if (!keepExposure) enc.clearBuffer(this.buf.max); // exposure may be sticky
     const pass = enc.beginComputePass();
     pass.setPipeline(this.pipelines.cs_chaos);
     for (let k = 0; k < steps; k++) {

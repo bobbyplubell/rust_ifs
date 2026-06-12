@@ -73,7 +73,13 @@
     let gpu = null;
     GpuFlame.create().then((g) => {
       gpu = g;
-      if (g) $('#spin').textContent = 'spin (gpu)';
+      if (g) {
+        $('#spin').textContent = 'spin (gpu)';
+        $('#spin').title = 'animating on WebGPU';
+      } else {
+        $('#spin').title =
+          'WebGPU unavailable in this browser — spin uses the slower CPU fallback';
+      }
     });
 
     async function findRecord() {
@@ -142,10 +148,10 @@
     async function spinGpu(s) {
       const cvgpu = $('#cvgpu');
       try {
-        // Render at the canvas's real on-screen resolution (capped) so the
-        // spin isn't an upscaled blur next to the high-res still.
+        // Render near the canvas's on-screen resolution, supersampled 2x like
+        // the high-quality still (cap keeps the ss2 histogram within budget).
         const px = Math.min(window.innerWidth, window.innerHeight) * (window.devicePixelRatio || 1);
-        const size = Math.min(1024, Math.max(384, Math.round(px / 8) * 8));
+        const size = Math.min(768, Math.max(384, Math.round(px / 8) * 8));
         cvgpu.width = size;
         cvgpu.height = size;
         gpu.configure(cvgpu);
@@ -154,15 +160,15 @@
 
         // Adaptive quality: float the sample count toward a frame-time budget
         // so weak GPUs stay smooth and strong ones get dense, clean frames.
-        let samples = 6_000_000;
-        const MIN_S = 1_500_000, MAX_S = 30_000_000, BUDGET_MS = 38;
+        let samples = 12_000_000;
+        const MIN_S = 3_000_000, MAX_S = 64_000_000, BUDGET_MS = 38;
         let first = true;
         let dt = BUDGET_MS;
         while (!s.stop) {
           const phase = (performance.now() % LOOP_MS) / LOOP_MS;
           const t0 = performance.now();
           await gpu.frame(record.genome, phase, {
-            width: size, height: size, ss: 1, samples, keepExposure: !first,
+            width: size, height: size, ss: 2, samples, keepExposure: !first,
             // Motion blur shutter = the actual frame interval, so blur length
             // always matches playback speed (flam3 temporal samples).
             shutter: Math.min(dt, 100) / LOOP_MS, temporal: 4,
@@ -170,7 +176,7 @@
           first = false;
           dt = performance.now() - t0;
           if (dt > BUDGET_MS * 1.5) samples = Math.max(MIN_S, samples * 0.7);
-          else if (dt < BUDGET_MS * 0.6) samples = Math.min(MAX_S, samples * 1.15);
+          else if (dt < BUDGET_MS * 0.6) samples = Math.min(MAX_S, samples * 1.3);
           await new Promise(requestAnimationFrame);
         }
       } catch (err) {

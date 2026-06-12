@@ -26,6 +26,7 @@ struct Params {
 @group(0) @binding(4) var<storage, read_write> down: array<u32>; // out_w*out_h*4
 @group(0) @binding(5) var<storage, read_write> maxbuf: array<atomic<u32>>; // [0]
 @group(0) @binding(6) var out_tex: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(7) var<storage, read_write> stats: array<atomic<u32>>; // [sum counts, nonzero cells]
 
 // ---- PRNG (PCG, per-thread) ------------------------------------------------
 
@@ -194,9 +195,36 @@ fn cs_downsample(@builtin(global_invocation_id) gid: vec3<u32>) {
     down[base + 2u] = c.z;
     down[base + 3u] = c.w;
     atomicMax(&maxbuf[0], c.x);
+    // Density stats for the DE blur in cs_tonemap (sum fits u32: total
+    // plotted points per preview frame << 2^32).
+    atomicAdd(&stats[0], c.x);
+    if (c.x > 0u) {
+        atomicAdd(&stats[1], 1u);
+    }
 }
 
 // ---- pass 3: tone map ------------------------------------------------------
+
+// Density-estimation lite (mirror of the CPU tonemap in render.rs): sparse
+// cells blend toward their 5x5 gaussian neighborhood so speckle melts into
+// glow; dense cells stay sharp. Same precomputed kernel constants.
+fn de_w(d2: u32) -> f32 {
+    switch d2 {
+        case 0u { return 1.0; }
+        case 1u { return 0.6616; }
+        case 2u { return 0.4376; }
+        case 4u { return 0.1915; }
+        case 5u { return 0.1267; }
+        default { return 0.0367; } // 8
+    }
+}
+
+// Cell as (count, r, g, b) in f32; count = -1 marks out of bounds.
+fn de_cell(ix: i32, iy: i32, ow: i32, oh: i32) -> vec4<f32> {
+    if (ix < 0 || iy < 0 || ix >= ow || iy >= oh) { return vec4(-1.0, 0.0, 0.0, 0.0); }
+    let b = (u32(iy) * u32(ow) + u32(ix)) * 4u;
+    return vec4(f32(down[b]), f32(down[b + 1u]), f32(down[b + 2u]), f32(down[b + 3u]));
+}
 
 @compute @workgroup_size(8, 8)
 fn cs_tonemap(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -204,8 +232,29 @@ fn cs_tonemap(@builtin(global_invocation_id) gid: vec3<u32>) {
     let oh = params.out_dims.y;
     if (gid.x >= ow || gid.y >= oh) { return; }
 
-    let base = (gid.y * ow + gid.x) * 4u;
-    let freq = f32(down[base]);
+    var me = de_cell(i32(gid.x), i32(gid.y), i32(ow), i32(oh));
+    let nzc = atomicLoad(&stats[1]);
+    if (nzc > 0u) {
+        let mean_nz = f32(atomicLoad(&stats[0])) / f32(nzc);
+        let t = clamp(me.x / max(mean_nz, 1e-12), 0.0, 1.0);
+        if (t < 1.0) {
+            var acc = vec4(0.0, 0.0, 0.0, 0.0);
+            var ws = 0.0;
+            for (var dy = -2; dy <= 2; dy = dy + 1) {
+                for (var dx = -2; dx <= 2; dx = dx + 1) {
+                    let c = de_cell(i32(gid.x) + dx, i32(gid.y) + dy, i32(ow), i32(oh));
+                    if (c.x >= 0.0) {
+                        let w = de_w(u32(dx * dx + dy * dy));
+                        acc = acc + w * c;
+                        ws = ws + w;
+                    }
+                }
+            }
+            me = t * me + (1.0 - t) * (acc / ws);
+        }
+    }
+
+    let freq = me.x;
     let bg = params.bg.rgb;
     if (freq <= 0.0) {
         textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4(bg, 1.0));
@@ -219,11 +268,7 @@ fn cs_tonemap(@builtin(global_invocation_id) gid: vec3<u32>) {
     let inv_gamma = 1.0 / gamma;
     let log_max = max(log(1.0 + f32(atomicLoad(&maxbuf[0]))), 1e-12);
 
-    let avg = vec3(
-        f32(down[base + 1u]) / scale,
-        f32(down[base + 2u]) / scale,
-        f32(down[base + 3u]) / scale,
-    ) / freq;
+    let avg = me.yzw / scale / freq;
     let l = clamp(log(1.0 + freq) / log_max * brightness, 0.0, 1.0);
     let lg = pow(l, inv_gamma);
     let by_brightness = avg * lg;
