@@ -29,6 +29,30 @@ pub fn animated(genome: &Genome, phase: f64) -> Genome {
     g
 }
 
+/// Render one animation frame with flam3-style **temporal samples** (motion
+/// blur): the sample budget is split across `steps` sub-phases spanning
+/// `shutter` (in loop-phase units), all accumulated into ONE histogram before
+/// the log-density tone map. Linear-space accumulation then log mapping is
+/// what gives original Electric Sheep its smooth motion; a single-instant
+/// frame looks strobed by comparison. Display-only (proofs are static).
+pub fn render_motion(
+    genome: &crate::genome::Genome,
+    phase: f64,
+    shutter: f64,
+    steps: u32,
+    opts: &crate::render::RenderOpts,
+) -> Vec<u8> {
+    let steps = steps.max(1);
+    let mut accum = crate::render::Accum::new(opts.width * opts.ss, opts.height * opts.ss);
+    let per_step = (opts.samples / steps as u64).max(1);
+    for k in 0..steps {
+        let p = phase + shutter * (k as f64 / steps as f64);
+        let g = animated(genome, p);
+        crate::render::accumulate(&g, per_step, opts.burn_in, opts.seed ^ (k as u64), &mut accum);
+    }
+    crate::render::tonemap(&accum, genome, opts.width, opts.height, opts.ss)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

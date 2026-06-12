@@ -147,7 +147,11 @@ function handleBreed(msg) {
 // Protocol extension (see header): one animation frame at loop `phase`.
 function handleFrame(msg) {
   const { jobId, genomeJson, phase, width, height, samples, seed } = msg;
-  const rgba = render_frame(genomeJson, phase, width, height, 1, samples, seed ?? 7);
+  // shutter/temporal: flam3-style motion blur (budget split, cost-neutral).
+  const rgba = render_frame(
+    genomeJson, phase, width, height, 1, samples, seed ?? 7,
+    msg.shutter ?? 0, msg.temporal ?? 1,
+  );
   if (cancelled.has(jobId)) return;
   const buf = rgba.buffer;
   self.postMessage({ type: 'done', jobId, hashes: [], rgba: buf, width, height }, [buf]);

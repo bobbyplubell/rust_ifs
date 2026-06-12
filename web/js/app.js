@@ -11,6 +11,7 @@ import {
   sheepSignBytes, voteSignBytes, voteChallenge,
 } from './net.js';
 import { computeFlock, breedChallenge } from './gens.js';
+import { handle, provenance } from './names.js';
 import { RELAYS } from '../config.js';
 
 const $ = (s) => document.querySelector(s);
@@ -120,15 +121,16 @@ function addCard(record) {
 
   const card = document.createElement('div');
   card.className = 'card';
+  card.dataset.id = record.id;
   const canvas = document.createElement('canvas');
   canvas.width = PROOF_SPEC.width;
   canvas.height = PROOF_SPEC.height;
   const meta = document.createElement('div');
   meta.className = 'meta';
+  const prov = provenance(record);
   const label = document.createElement('a');
-  label.textContent = record.name ||
-    (record.derived ? `born g${record.gen - GENESIS_GEN} ` : 'sheep ') + record.id.slice(0, 8);
-  label.title = record.id;
+  label.textContent = prov.who;
+  label.title = `${prov.how}\n${record.id}`;
   label.href = `sheep.html?id=${record.id}${PEER_NS !== '0' ? `&peer=${PEER_NS}` : ''}`;
   label.target = '_blank';
   const tallyEl = document.createElement('span');
@@ -199,6 +201,7 @@ async function toggleSpin(entry) {
   const frameJob = () => pool.submit({
     type: 'frame', genomeJson: entry.record.genome,
     phase: (performance.now() % LOOP_MS) / LOOP_MS, ...FRAME,
+    shutter: 0.012, temporal: 4, // flam3 temporal samples (motion blur)
   }).done;
 
   let pending = frameJob();
@@ -356,7 +359,7 @@ function updateStatus() {
   const ss = String(Math.floor((msLeft % 60_000) / 1000)).padStart(2, '0');
   $('#status').textContent =
     `gen ${gen() - GENESIS_GEN} closes in ${mm}:${ss} · ` +
-    `peer ${PEER_NS} · ${me.pubHex.slice(0, 8)} · ${net.peerCount()} peers · ` +
+    `you are ${handle(me.pubHex)} · ${net.peerCount()} peers · ` +
     `${pool.chunksRendered} chunks rendered`;
 }
 

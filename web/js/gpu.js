@@ -121,15 +121,19 @@ export class GpuFlame {
     });
   }
 
-  _ensure(w, h, ss, genomeFloats) {
-    const key = `${w}x${h}x${ss}x${genomeFloats}`;
+  _ensure(w, h, ss, genomeFloats, steps) {
+    const key = `${w}x${h}x${ss}x${genomeFloats}x${steps}`;
     if (this.dims === key) return;
     this.dims = key;
     const d = this.device;
     const hw = w * ss, hh = h * ss;
     this.buf = {
-      genome: d.createBuffer({ size: genomeFloats * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
-      params: d.createBuffer({ size: 112, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+      // Per temporal step: its own genome + params (sub-phase, seed); the
+      // histogram and everything downstream are shared (that's the blur).
+      genome: Array.from({ length: steps }, () =>
+        d.createBuffer({ size: genomeFloats * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST })),
+      params: Array.from({ length: steps }, () =>
+        d.createBuffer({ size: 112, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })),
       hist: d.createBuffer({ size: hw * hh * 16, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
       palette: d.createBuffer({ size: 768 * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
       down: d.createBuffer({ size: w * h * 16, usage: GPUBufferUsage.STORAGE }),
@@ -140,62 +144,82 @@ export class GpuFlame {
       format: 'rgba8unorm',
       usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.COPY_SRC,
     });
-    this.bindGroup = d.createBindGroup({
+    this.bindGroups = Array.from({ length: steps }, (_, k) => d.createBindGroup({
       layout: this.layout,
       entries: [
-        { binding: 0, resource: { buffer: this.buf.genome } },
-        { binding: 1, resource: { buffer: this.buf.params } },
+        { binding: 0, resource: { buffer: this.buf.genome[k] } },
+        { binding: 1, resource: { buffer: this.buf.params[k] } },
         { binding: 2, resource: { buffer: this.buf.hist } },
         { binding: 3, resource: { buffer: this.buf.palette } },
         { binding: 4, resource: { buffer: this.buf.down } },
         { binding: 5, resource: { buffer: this.buf.max } },
         { binding: 6, resource: this.tex.createView() },
       ],
-    });
+    }));
   }
 
   /** Render one frame of `genomeJson` at loop `phase` into the configured
-   *  canvas. Resolves when the GPU work is submitted and done. */
-  async frame(genomeJson, phase, { width, height, ss = 1, samples = 4_000_000, seed = 7 } = {}) {
-    const g = animated(typeof genomeJson === 'string' ? JSON.parse(genomeJson) : genomeJson, phase);
-    const { data, n, hasFinal } = packGenome(g);
-    this._ensure(width, height, ss, data.length);
+   *  canvas. Resolves when the GPU work is submitted and done.
+   *
+   *  `keepExposure`: don't reset the running max-density used for tone-map
+   *  normalization. Per-frame normalization makes a spinning flame's global
+   *  brightness pump/flicker (the max moves as the attractor rotates); keeping
+   *  the running max across a spin stabilizes exposure within one loop. */
+  async frame(genomeJson, phase, {
+    width, height, ss = 1, samples = 4_000_000, seed = 7, keepExposure = false,
+    shutter = 0, temporal = 1,
+  } = {}) {
+    const base = typeof genomeJson === 'string' ? JSON.parse(genomeJson) : genomeJson;
+    const steps = shutter > 0 ? Math.max(1, temporal) : 1;
+
+    // flam3-style temporal samples: split the budget across `steps` sub-phases
+    // spanning `shutter` (loop-phase units), all into ONE histogram — motion
+    // blur in linear space ahead of the log tone map. Cost-neutral.
+    const subs = Array.from({ length: steps }, (_, k) =>
+      animated(base, phase + (steps > 1 ? shutter * (k / steps) : 0)));
+    const packed = subs.map(packGenome);
+    this._ensure(width, height, ss, packed[0].data.length, steps);
 
     const d = this.device;
-    d.queue.writeBuffer(this.buf.genome, 0, data);
-    d.queue.writeBuffer(this.buf.palette, 0, packPalette(g.palette));
+    d.queue.writeBuffer(this.buf.palette, 0, packPalette(subs[0].palette));
 
     // Camera world->image affine for the supersampled grid (Camera::world_to_image).
     const hw = width * ss, hh = height * ss;
-    const cam = g.camera;
+    const cam = subs[0].camera;
     const s = cam.scale * Math.min(hw, hh);
     const cos = Math.cos(cam.rotate), sin = Math.sin(cam.rotate);
     const a = s * cos, b = -s * sin, c = hw * 0.5 - s * (cos * cam.center_x - sin * cam.center_y);
     const dd = s * sin, e = s * cos, f = hh * 0.5 - s * (sin * cam.center_x + cos * cam.center_y);
-    const totalWeight = g.transforms.reduce((acc, t) => acc + t.weight, 0);
-    const plotIters = Math.max(1, Math.ceil(samples / THREADS));
+    const totalWeight = subs[0].transforms.reduce((acc, t) => acc + t.weight, 0);
+    const plotIters = Math.max(1, Math.ceil(samples / steps / THREADS));
 
-    const params = new ArrayBuffer(112);
-    new Uint32Array(params, 0, 12).set([
-      hw, hh, n, hasFinal,
-      plotIters, BURN_IN, seed >>> 0, ss,
-      width, height, 0, 0,
-    ]);
-    new Float32Array(params, 48, 16).set([
-      a, b, c, dd,
-      e, f, COLOR_SCALE, totalWeight,
-      g.gamma, g.brightness, Math.min(Math.max(g.vibrancy, 0), 1), 0,
-      g.background[0], g.background[1], g.background[2], 0,
-    ]);
-    d.queue.writeBuffer(this.buf.params, 0, params);
+    for (let k = 0; k < steps; k++) {
+      d.queue.writeBuffer(this.buf.genome[k], 0, packed[k].data);
+      const params = new ArrayBuffer(112);
+      new Uint32Array(params, 0, 12).set([
+        hw, hh, packed[k].n, packed[k].hasFinal,
+        plotIters, BURN_IN, (seed + k * 0x9e3779b9) >>> 0, ss,
+        width, height, 0, 0,
+      ]);
+      new Float32Array(params, 48, 16).set([
+        a, b, c, dd,
+        e, f, COLOR_SCALE, totalWeight,
+        subs[0].gamma, subs[0].brightness, Math.min(Math.max(subs[0].vibrancy, 0), 1), 0,
+        subs[0].background[0], subs[0].background[1], subs[0].background[2], 0,
+      ]);
+      d.queue.writeBuffer(this.buf.params[k], 0, params);
+    }
 
     const enc = d.createCommandEncoder();
     enc.clearBuffer(this.buf.hist);
-    enc.clearBuffer(this.buf.max);
+    if (!keepExposure) enc.clearBuffer(this.buf.max);
     const pass = enc.beginComputePass();
-    pass.setBindGroup(0, this.bindGroup);
     pass.setPipeline(this.pipelines.cs_chaos);
-    pass.dispatchWorkgroups(THREADS / 64);
+    for (let k = 0; k < steps; k++) {
+      pass.setBindGroup(0, this.bindGroups[k]);
+      pass.dispatchWorkgroups(THREADS / 64);
+    }
+    pass.setBindGroup(0, this.bindGroups[0]);
     pass.setPipeline(this.pipelines.cs_downsample);
     pass.dispatchWorkgroups(Math.ceil((width * height) / 64));
     pass.setPipeline(this.pipelines.cs_tonemap);

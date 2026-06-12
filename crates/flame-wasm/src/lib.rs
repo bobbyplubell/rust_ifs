@@ -45,7 +45,9 @@ pub fn render_rgba(
 }
 
 /// Render one animation frame: the genome at loop `phase` (0..1) — flam3-style
-/// transform-basis rotation plus palette drift (see flame_core::animate).
+/// transform-basis rotation plus palette drift, with temporal samples (motion
+/// blur): the budget is split over `temporal` sub-phases spanning `shutter`
+/// loop-phase units (temporal <= 1 or shutter <= 0 = single instant).
 /// Display-only; proofs always render the base genome.
 #[wasm_bindgen]
 pub fn render_frame(
@@ -56,10 +58,11 @@ pub fn render_frame(
     ss: usize,
     samples: u32,
     seed: u32,
+    shutter: f64,
+    temporal: u32,
 ) -> Result<Vec<u8>, JsValue> {
     let genome: Genome = serde_json::from_str(genome_json)
         .map_err(|e| JsValue::from_str(&format!("bad genome json: {e}")))?;
-    let g = flame_core::animate::animated(&genome, phase);
     let opts = RenderOpts {
         width,
         height,
@@ -68,7 +71,12 @@ pub fn render_frame(
         burn_in: 20,
         seed: seed as u64,
     };
-    Ok(render(&g, &opts))
+    if temporal > 1 && shutter > 0.0 {
+        Ok(flame_core::animate::render_motion(&genome, phase, shutter, temporal, &opts))
+    } else {
+        let g = flame_core::animate::animated(&genome, phase);
+        Ok(render(&g, &opts))
+    }
 }
 
 // ---- genetics: canonical JSON, sheep_id, breeding ---------------------------

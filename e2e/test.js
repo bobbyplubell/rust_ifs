@@ -96,12 +96,12 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
   check('p1 first card rendered pixels', true);
 
   // Vote on the first card in p1; the proof render runs, then p2's tally bumps.
-  const firstId = await p1.locator('.card .meta a').first().getAttribute('title');
+  const firstId = await p1.locator('.card').first().getAttribute('data-id');
   await p1.locator('.card button', { hasText: /^vote$/ }).first().click();
   await p1.locator('.card button', { hasText: 'voted ✓' }).first().waitFor({ timeout: 180_000 });
   check('p1 vote completed (proof rendered + signed)', true);
 
-  const tally2 = p2.locator(`.card:has(a[title="${firstId}"]) .tally`);
+  const tally2 = p2.locator(`.card[data-id="${firstId}"] .tally`);
   await tally2.filter({ hasText: '♥' }).waitFor({ timeout: 30_000 });
   check('p2 sees p1 vote in tally', true, await tally2.textContent());
 

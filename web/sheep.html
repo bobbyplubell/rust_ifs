@@ -47,6 +47,7 @@
     import { GENESIS_GEN } from './js/net.js';
     import { sha256Hex, utf8 } from './js/hash.js';
     import { GpuFlame } from './js/gpu.js';
+    import { provenance } from './js/names.js';
 
     const $ = (s) => document.querySelector(s);
     const params = new URLSearchParams(location.search);
@@ -64,8 +65,7 @@
       high: { width: 768, height: 768, ss: 2, nChunks: 64, samplesPerChunk: 650_000 },
     };
     let quality = localStorage.getItem('sheep-quality') || 'med';
-    const FRAME = { width: 320, height: 320, samples: 450_000, seed: 7 };       // CPU fallback spin
-    const GPU_FRAME = { width: 768, height: 768, ss: 1, samples: 10_000_000 };  // WebGPU spin
+    const FRAME = { width: 320, height: 320, samples: 450_000, seed: 7 };  // CPU fallback spin
     const LOOP_MS = 14_000;
 
     // WebGPU preview (display-only — proofs are CPU-deterministic, the GPU's
@@ -142,12 +142,35 @@
     async function spinGpu(s) {
       const cvgpu = $('#cvgpu');
       try {
+        // Render at the canvas's real on-screen resolution (capped) so the
+        // spin isn't an upscaled blur next to the high-res still.
+        const px = Math.min(window.innerWidth, window.innerHeight) * (window.devicePixelRatio || 1);
+        const size = Math.min(1024, Math.max(384, Math.round(px / 8) * 8));
+        cvgpu.width = size;
+        cvgpu.height = size;
         gpu.configure(cvgpu);
         cvgpu.hidden = false;
         $('#cv').hidden = true;
+
+        // Adaptive quality: float the sample count toward a frame-time budget
+        // so weak GPUs stay smooth and strong ones get dense, clean frames.
+        let samples = 6_000_000;
+        const MIN_S = 1_500_000, MAX_S = 30_000_000, BUDGET_MS = 38;
+        let first = true;
+        let dt = BUDGET_MS;
         while (!s.stop) {
           const phase = (performance.now() % LOOP_MS) / LOOP_MS;
-          await gpu.frame(record.genome, phase, GPU_FRAME);
+          const t0 = performance.now();
+          await gpu.frame(record.genome, phase, {
+            width: size, height: size, ss: 1, samples, keepExposure: !first,
+            // Motion blur shutter = the actual frame interval, so blur length
+            // always matches playback speed (flam3 temporal samples).
+            shutter: Math.min(dt, 100) / LOOP_MS, temporal: 4,
+          });
+          first = false;
+          dt = performance.now() - t0;
+          if (dt > BUDGET_MS * 1.5) samples = Math.max(MIN_S, samples * 0.7);
+          else if (dt < BUDGET_MS * 0.6) samples = Math.min(MAX_S, samples * 1.15);
           await new Promise(requestAnimationFrame);
         }
       } catch (err) {
@@ -164,6 +187,7 @@
       const frameJob = () => pool.submit({
         type: 'frame', genomeJson: record.genome,
         phase: (performance.now() % LOOP_MS) / LOOP_MS, ...FRAME,
+        shutter: 0.012, temporal: 4, // ~CPU frame interval of motion blur
       }).done;
       let pending = frameJob();
       while (!s.stop) {
@@ -184,8 +208,7 @@
         return;
       }
       $('#sheep-id').textContent = id;
-      $('#info').textContent = record.name ||
-        (record.parents ? `born g${record.gen - GENESIS_GEN} of ${record.parents.map(p => p.slice(0, 8)).join(' × ')}` : `sheep ${id.slice(0, 8)}`);
+      $('#info').textContent = provenance(record).how;
       markQuality();
       for (const b of document.querySelectorAll('#quality button')) {
         b.onclick = () => {
