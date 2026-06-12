@@ -34,6 +34,7 @@
       <button data-q="low">low</button>
       <button data-q="med">med</button>
       <button data-q="high">high</button>
+      <button data-q="ultra">ultra</button>
     </span>
     <button id="spin">spin</button>
     <button id="dl">genome ↓</button>
@@ -59,13 +60,29 @@
     const ctx = cv.getContext('2d');
 
     // Display-quality presets (display-only — proofs always use PROOF_SPEC).
+    // One knob governs both the still and the spin. Spin budgets trade frame
+    // rate for density: ultra runs ~9 fps but the motion-blur shutter spans
+    // the real frame interval, so slower playback means longer blur, not jank.
     const QUALITY = {
-      low:  { width: 384, height: 384, ss: 1, nChunks: 32, samplesPerChunk: 120_000 },
-      med:  { width: 512, height: 512, ss: 2, nChunks: 64, samplesPerChunk: 250_000 },
-      high: { width: 768, height: 768, ss: 2, nChunks: 64, samplesPerChunk: 650_000 },
+      low:   { width: 384,  height: 384,  ss: 1, nChunks: 32, samplesPerChunk: 120_000 },
+      med:   { width: 512,  height: 512,  ss: 2, nChunks: 64, samplesPerChunk: 250_000 },
+      high:  { width: 768,  height: 768,  ss: 2, nChunks: 64, samplesPerChunk: 650_000 },
+      ultra: { width: 1024, height: 1024, ss: 2, nChunks: 64, samplesPerChunk: 1_500_000 },
+    };
+    const SPIN = {
+      low:   { budgetMs: 30,  maxS: 32_000_000,  startS: 6_000_000,  sizeCap: 640,  ss: 1, temporal: 4 },
+      med:   { budgetMs: 38,  maxS: 64_000_000,  startS: 12_000_000, sizeCap: 768,  ss: 2, temporal: 4 },
+      high:  { budgetMs: 60,  maxS: 128_000_000, startS: 24_000_000, sizeCap: 896,  ss: 2, temporal: 5 },
+      ultra: { budgetMs: 110, maxS: 256_000_000, startS: 48_000_000, sizeCap: 1024, ss: 2, temporal: 6 },
+    };
+    const CPU_FRAME = {
+      low:   { width: 256, height: 256, samples: 300_000, seed: 7 },
+      med:   { width: 320, height: 320, samples: 450_000, seed: 7 },
+      high:  { width: 384, height: 384, samples: 700_000, seed: 7 },
+      ultra: { width: 448, height: 448, samples: 1_000_000, seed: 7 },
     };
     let quality = localStorage.getItem('sheep-quality') || 'med';
-    const FRAME = { width: 320, height: 320, samples: 450_000, seed: 7 };  // CPU fallback spin
+    if (!QUALITY[quality]) quality = 'med';
     const LOOP_MS = 14_000;
 
     // WebGPU preview (display-only — proofs are CPU-deterministic, the GPU's
@@ -148,10 +165,11 @@
     async function spinGpu(s) {
       const cvgpu = $('#cvgpu');
       try {
-        // Render near the canvas's on-screen resolution, supersampled 2x like
-        // the high-quality still (cap keeps the ss2 histogram within budget).
+        // Render near the canvas's on-screen resolution (quality-capped),
+        // supersampled like the still.
+        const cfg = SPIN[quality];
         const px = Math.min(window.innerWidth, window.innerHeight) * (window.devicePixelRatio || 1);
-        const size = Math.min(768, Math.max(384, Math.round(px / 8) * 8));
+        const size = Math.min(cfg.sizeCap, Math.max(384, Math.round(px / 8) * 8));
         cvgpu.width = size;
         cvgpu.height = size;
         gpu.configure(cvgpu);
@@ -160,23 +178,23 @@
 
         // Adaptive quality: float the sample count toward a frame-time budget
         // so weak GPUs stay smooth and strong ones get dense, clean frames.
-        let samples = 12_000_000;
-        const MIN_S = 3_000_000, MAX_S = 64_000_000, BUDGET_MS = 38;
+        let samples = cfg.startS;
+        const MIN_S = 3_000_000;
         let first = true;
-        let dt = BUDGET_MS;
+        let dt = cfg.budgetMs;
         while (!s.stop) {
           const phase = (performance.now() % LOOP_MS) / LOOP_MS;
           const t0 = performance.now();
           await gpu.frame(record.genome, phase, {
-            width: size, height: size, ss: 2, samples, keepExposure: !first,
+            width: size, height: size, ss: cfg.ss, samples, keepExposure: !first,
             // Motion blur shutter = the actual frame interval, so blur length
             // always matches playback speed (flam3 temporal samples).
-            shutter: Math.min(dt, 100) / LOOP_MS, temporal: 4,
+            shutter: Math.min(dt, 160) / LOOP_MS, temporal: cfg.temporal,
           });
           first = false;
           dt = performance.now() - t0;
-          if (dt > BUDGET_MS * 1.5) samples = Math.max(MIN_S, samples * 0.7);
-          else if (dt < BUDGET_MS * 0.6) samples = Math.min(MAX_S, samples * 1.3);
+          if (dt > cfg.budgetMs * 1.5) samples = Math.max(MIN_S, samples * 0.7);
+          else if (dt < cfg.budgetMs * 0.6) samples = Math.min(cfg.maxS, samples * 1.3);
           await new Promise(requestAnimationFrame);
         }
       } catch (err) {
@@ -192,7 +210,7 @@
     async function spinCpu(s) {
       const frameJob = () => pool.submit({
         type: 'frame', genomeJson: record.genome,
-        phase: (performance.now() % LOOP_MS) / LOOP_MS, ...FRAME,
+        phase: (performance.now() % LOOP_MS) / LOOP_MS, ...CPU_FRAME[quality],
         shutter: 0.012, temporal: 4, // ~CPU frame interval of motion blur
       }).done;
       let pending = frameJob();
@@ -222,7 +240,13 @@
           localStorage.setItem('sheep-quality', quality);
           markQuality();
           still = null;
-          if (!spinning) renderStill().catch(console.error);
+          if (spinning) {
+            // Restart the spin with the new budgets/resolution.
+            toggleSpin().catch(console.error); // stop (paints still placeholder)
+            toggleSpin().catch(console.error); // start fresh
+          } else {
+            renderStill().catch(console.error);
+          }
         };
       }
       $('#spin').onclick = () => toggleSpin().catch(console.error);
