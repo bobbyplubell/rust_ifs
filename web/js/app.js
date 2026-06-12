@@ -7,7 +7,8 @@ import { sha256Hex, utf8 } from './hash.js';
 import { loadIdentity, sign, PEER_NS } from './identity.js';
 import { openStore } from './store.js';
 import {
-  Net, BroadcastTransport, CompositeTransport, gen, GEN_MS, GENESIS_GEN, PROOF_SPEC,
+  Net, BroadcastTransport, CompositeTransport, gen, GEN_MS, GENESIS_GEN,
+  PROOF_SPEC, PROOF_TIERS, voteWeight,
   sheepSignBytes, voteSignBytes, voteChallenge,
 } from './net.js';
 import { computeFlock, breedChallenge } from './gens.js';
@@ -24,6 +25,7 @@ const VIEW_SPEC = { width: 256, height: 256, ss: 2, nChunks: 32, samplesPerChunk
 
 const cards = new Map();   // sheepId -> {record, canvas, tallyEl, voteBtn, card}
 const tallies = new Map(); // sheepId -> Set of vote keys
+const voteWeights = new Map(); // vote key -> tier weight
 const selected = [];       // up to two sheepIds picked as parents
 
 let me, store, net, auditor, baked = [];
@@ -46,13 +48,15 @@ async function main() {
     }
   }
 
-  const checkFrameHash = (genomeJson, challengeHex, idx) =>
-    pool.submit({
+  const checkFrameHash = (genomeJson, challengeHex, idx, tier = 'std') => {
+    const spec = PROOF_TIERS[tier] ?? PROOF_TIERS.std;
+    return pool.submit({
       type: 'audit-frame', genomeJson, challengeHex, idx,
-      width: PROOF_SPEC.width, height: PROOF_SPEC.height, ss: PROOF_SPEC.ss,
-      samplesPerFrame: PROOF_SPEC.samplesPerFrame,
-      nFrames: PROOF_SPEC.nFrames, temporal: PROOF_SPEC.temporal,
+      width: spec.width, height: spec.height, ss: spec.ss,
+      samplesPerFrame: spec.samplesPerFrame,
+      nFrames: spec.nFrames, temporal: spec.temporal,
     }).done.then((m) => m.hash);
+  };
 
   net = new Net({
     transport: new CompositeTransport(transports),
@@ -167,7 +171,11 @@ function addCard(record) {
   spinBtn.textContent = 'spin';
   const voteBtn = document.createElement('button');
   voteBtn.textContent = 'vote';
-  meta.append(label, tallyEl, spinBtn, voteBtn);
+  const ultraBtn = document.createElement('button');
+  ultraBtn.textContent = '2×';
+  ultraBtn.title = 'ultra proof: ~2.7× the render work for a double-weight ' +
+    'vote and a larger, denser replay loop';
+  meta.append(label, tallyEl, spinBtn, voteBtn, ultraBtn);
   const bar = document.createElement('div');
   bar.className = 'bar';
   const barFill = document.createElement('div');
@@ -176,13 +184,14 @@ function addCard(record) {
   card.append(canvas, bar, meta);
   $('#flock').append(card);
 
-  const entry = { record, canvas, tallyEl, spinBtn, voteBtn, card, barFill };
+  const entry = { record, canvas, tallyEl, spinBtn, voteBtn, ultraBtn, card, barFill };
   cards.set(record.id, entry);
   updateTally(record.id);
 
   canvas.addEventListener('click', () => toggleSelect(record.id));
   spinBtn.addEventListener('click', () => toggleSpin(entry).catch(showError));
-  voteBtn.addEventListener('click', () => vote(entry).catch(showError));
+  voteBtn.addEventListener('click', () => vote(entry, 'std').catch(showError));
+  ultraBtn.addEventListener('click', () => vote(entry, 'ultra').catch(showError));
 
   drawProgressively(canvas, record.genome, `view|${record.id}`).catch(showError);
 }
@@ -266,9 +275,9 @@ function stopSpin() {
 // Render the 64-frame loop proof, fanned out across the worker pool. Frames
 // paint into `canvas` as they land (watching the loop assemble IS the work);
 // returns ordered hashes + the frames for replay, or null on cancellation.
-async function renderLoopProof(canvas, genomeJson, challengeHex, onProgress) {
+async function renderLoopProof(canvas, genomeJson, challengeHex, onProgress, spec = PROOF_TIERS.std) {
   const ctx = canvas.getContext('2d');
-  const { nFrames } = PROOF_SPEC;
+  const { nFrames } = spec;
   const frames = new Array(nFrames);
   const hashes = new Array(nFrames);
   let done = 0;
@@ -276,13 +285,14 @@ async function renderLoopProof(canvas, genomeJson, challengeHex, onProgress) {
   for (let i = 0; i < nFrames; i++) {
     jobs.push(pool.submit({
       type: 'proof-frame', genomeJson, challengeHex, idx: i,
-      width: PROOF_SPEC.width, height: PROOF_SPEC.height, ss: PROOF_SPEC.ss,
-      samplesPerFrame: PROOF_SPEC.samplesPerFrame,
-      nFrames, temporal: PROOF_SPEC.temporal,
+      width: spec.width, height: spec.height, ss: spec.ss,
+      samplesPerFrame: spec.samplesPerFrame,
+      nFrames, temporal: spec.temporal,
     }).done.then((m) => {
       if (m.type !== 'done') throw new Error('proof cancelled');
       hashes[m.idx] = m.hash;
       frames[m.idx] = new ImageData(new Uint8ClampedArray(m.rgba), m.width, m.height);
+      if (canvas.width !== m.width) { canvas.width = m.width; canvas.height = m.height; }
       ctx.putImageData(frames[m.idx], 0, 0);
       onProgress?.(++done, nFrames);
     }));
@@ -300,6 +310,10 @@ async function renderLoopProof(canvas, genomeJson, challengeHex, onProgress) {
 // proven sheep dances. Costs nothing (cached frames).
 function startReplay(entry, frames) {
   stopReplay(entry);
+  if (entry.canvas.width !== frames[0].width) {
+    entry.canvas.width = frames[0].width;
+    entry.canvas.height = frames[0].height;
+  }
   const ctx = entry.canvas.getContext('2d');
   let i = 0;
   entry.replay = setInterval(() => {
@@ -317,17 +331,19 @@ function stopReplay(entry) {
 
 // ---- voting ----------------------------------------------------------------
 
-async function vote(entry) {
+async function vote(entry, tier = 'std') {
   if (spinning?.entry === entry) stopSpin();
   const g = gen();
   const myKey = `${me.pubHex}:${entry.record.id}:${g}`;
   if (tallies.get(entry.record.id)?.has(myKey)) return; // already voted this gen
 
   entry.voteBtn.disabled = true;
+  entry.ultraBtn.disabled = true;
   entry.votePending = true;
   stopReplay(entry);
   // The proof render IS watching the sheep: your personal challenge, one full
-  // loop of its animation, hashed frame by frame.
+  // loop of its animation, hashed frame by frame. Tier sets the work and the
+  // vote's weight (the challenge is tier-independent).
   const challengeHex = await voteChallenge(entry.record.id, me.pubHex, g);
   const res = await renderLoopProof(
     entry.canvas, entry.record.genome, challengeHex,
@@ -335,21 +351,30 @@ async function vote(entry) {
       entry.voteBtn.textContent = `${d}/${n}`;
       entry.barFill.style.width = `${(100 * d) / n}%`;
     },
+    PROOF_TIERS[tier],
   );
   entry.votePending = false;
   entry.barFill.style.width = '0';
-  if (!res) { entry.voteBtn.disabled = false; entry.voteBtn.textContent = 'vote'; return; }
+  if (!res) {
+    entry.voteBtn.disabled = false;
+    entry.ultraBtn.disabled = false;
+    entry.voteBtn.textContent = 'vote';
+    return;
+  }
 
-  const record = { sheepId: entry.record.id, gen: g, voter: me.pubHex, chunkHashes: res.hashes };
+  const record = {
+    sheepId: entry.record.id, gen: g, voter: me.pubHex, tier, chunkHashes: res.hashes,
+  };
   record.sig = await sign(me.pair, voteSignBytes(record));
   await net.publishVote(record);
-  entry.voteBtn.textContent = 'voted ✓';
+  entry.voteBtn.textContent = tier === 'ultra' ? 'voted 2× ✓' : 'voted ✓';
   startReplay(entry, res.frames);
 }
 
 function bumpTally(v, quiet) {
   if (!tallies.has(v.sheepId)) tallies.set(v.sheepId, new Set());
   tallies.get(v.sheepId).add(v.key);
+  voteWeights.set(v.key, voteWeight(v));
   if (!quiet) updateTally(v.sheepId);
 }
 
@@ -357,18 +382,28 @@ function updateTally(sheepId) {
   const entry = cards.get(sheepId);
   if (!entry) return;
   const set = tallies.get(sheepId);
-  // Display only this generation's votes, excluding discredited voters.
+  // Display this generation's weighted votes, excluding discredited voters.
   const g = gen();
-  const now = set
-    ? [...set].filter((k) => k.endsWith(`:${g}`) && !bannedVoters.has(k.split(':')[0])).length
-    : 0;
+  let now = 0;
+  let mine = false;
+  if (set) {
+    for (const k of set) {
+      if (!k.endsWith(`:${g}`)) continue;
+      const voter = k.split(':')[0];
+      if (bannedVoters.has(voter)) continue;
+      now += voteWeights.get(k) ?? 1;
+      if (voter === me.pubHex) mine = true;
+    }
+  }
   entry.tallyEl.textContent = now ? `${now} ♥` : '';
-  if (set?.has(`${me.pubHex}:${sheepId}:${g}`)) {
-    entry.voteBtn.textContent = 'voted ✓';
+  if (mine) {
+    if (!entry.votePending) entry.voteBtn.textContent = 'voted ✓';
     entry.voteBtn.disabled = true;
+    entry.ultraBtn.disabled = true;
   } else if (!entry.votePending) {
     entry.voteBtn.textContent = 'vote';
     entry.voteBtn.disabled = false;
+    entry.ultraBtn.disabled = false;
   }
 }
 
@@ -437,7 +472,7 @@ async function breedSelected() {
     record.sig = await sign(me.pair, sheepSignBytes(record));
     await net.publishSheep(record);
 
-    const voteRec = { sheepId: childId, gen: rg, voter: me.pubHex, chunkHashes };
+    const voteRec = { sheepId: childId, gen: rg, voter: me.pubHex, tier: 'std', chunkHashes };
     voteRec.sig = await sign(me.pair, voteSignBytes(voteRec));
     await net.publishVote(voteRec);
 

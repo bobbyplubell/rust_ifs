@@ -122,6 +122,15 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
   await p2.locator('#release', { hasText: 'released ✓' }).waitFor({ timeout: 300_000 });
   check('p2 bred and released a child (with proof)', true);
 
+  // Ultra (2x weight) vote from p1 on the SECOND card; p2 must show '2'.
+  const secondId = await p1.locator('.card').nth(1).getAttribute('data-id');
+  await p1.locator('.card').nth(1).locator('button', { hasText: '2×' }).click();
+  await p1.locator('.card button', { hasText: /voted 2× ✓/ }).first().waitFor({ timeout: 300_000 });
+  check('p1 ultra vote completed', true);
+  const tally2u = p2.locator(`.card[data-id="${secondId}"] .tally`);
+  await tally2u.filter({ hasText: '2' }).waitFor({ timeout: 30_000 });
+  check('p2 sees double weight for ultra vote', true, await tally2u.textContent());
+
   section('fraud injection');
   // Fraud: inject a validly-signed vote with garbage hashes from a fresh key.
   // The background auditor must re-render a frame, catch the mismatch, gossip
@@ -140,18 +149,18 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
     };
 
     const voter = await step('forge + inject vote', async (sheepId) => {
-      const { voteSignBytes, voteKey, gen, PROOF_SPEC } = await import('./js/net.js');
+      const { voteSignBytes, voteKey, gen, PROOF_SPEC, CHANNEL } = await import('./js/net.js');
       const { hex } = await import('./js/hash.js');
       const pair = await crypto.subtle.generateKey(
         { name: 'Ed25519' }, false, ['sign', 'verify']);
       const voter = hex(new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey)));
       const chunkHashes = Array.from({ length: PROOF_SPEC.nFrames }, (_, i) =>
         (i % 10).toString().repeat(64)); // garbage, but well-formed
-      const record = { sheepId, gen: gen(), voter, chunkHashes };
+      const record = { sheepId, gen: gen(), voter, tier: 'std', chunkHashes };
       record.sig = hex(new Uint8Array(
         await crypto.subtle.sign({ name: 'Ed25519' }, pair.privateKey, voteSignBytes(record))));
       record.key = voteKey(record);
-      new BroadcastChannel('sheep-net-v3').postMessage({ kind: 'vote', record });
+      new BroadcastChannel(CHANNEL).postMessage({ kind: 'vote', record });
       return voter;
     }, firstId);
 

@@ -81,8 +81,8 @@
       high:  { width: 384, height: 384, samples: 700_000, seed: 7 },
       ultra: { width: 448, height: 448, samples: 1_000_000, seed: 7 },
     };
-    let quality = localStorage.getItem('sheep-quality') || 'med';
-    if (!QUALITY[quality]) quality = 'med';
+    let quality = localStorage.getItem('sheep-quality');
+    if (!QUALITY[quality]) quality = null; // null -> auto-benched in main()
     const LOOP_MS = 14_000;
 
     // WebGPU preview (display-only — proofs are CPU-deterministic, the GPU's
@@ -223,6 +223,20 @@
       }
     }
 
+    // First visit: pick a default quality from measured wasm throughput
+    // (one 200k-sample frame). Thresholds are rough CPU tiers.
+    async function benchQuality() {
+      const t0 = performance.now();
+      await pool.submit({
+        type: 'frame', genomeJson: record.genome, phase: 0,
+        width: 192, height: 192, samples: 200_000, seed: 7,
+      }).done;
+      const ms = performance.now() - t0;
+      const q = ms < 60 ? 'ultra' : ms < 120 ? 'high' : ms < 300 ? 'med' : 'low';
+      console.log(`auto quality: ${q} (bench frame ${Math.round(ms)}ms)`);
+      return q;
+    }
+
     async function main() {
       if (!id) { $('#info').textContent = 'no ?id= given'; return; }
       record = await findRecord();
@@ -233,6 +247,7 @@
       }
       $('#sheep-id').textContent = id;
       $('#info').textContent = provenance(record).how;
+      if (!quality) quality = await benchQuality();
       markQuality();
       for (const b of document.querySelectorAll('#quality button')) {
         b.onclick = () => {

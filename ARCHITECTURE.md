@@ -107,10 +107,18 @@ challenge_seed = H("v3" ‖ sheep_id ‖ voter_pubkey ‖ gen)
 animation loop*: frame `i` is the genome animated to phase `i/M`, rendered as
 T=2 temporal sub-steps (motion blur) seeded from `H(challenge_seed ‖ i)`, each
 frame's histogram hashed independently. Proving a vote therefore means
-rendering — watching — one full loop of the sheep (~15M samples, tens of
-seconds of background CPU: a real cost, deliberately), and the frames are
-cached so the proven sheep replays as an animation afterward. The audit
-asymmetry is unchanged: re-render one random frame = 1/M of the cost.
+rendering — watching — one full loop of the sheep (~15M samples, seconds of
+background CPU: a real cost, deliberately), and the frames are cached so the
+proven sheep replays as an animation afterward. The audit asymmetry is
+unchanged: re-render one random frame = 1/M of the cost.
+
+**Proof tiers.** A vote declares a `tier` (signed): `std` (the spec above) is
+worth 1 vote; `ultra` (~2.7× the samples at 384px) is worth 2. Spending more
+CPU is a choice with a reward — weight plus a denser cached replay — not a
+tax, so weak devices stay first-class voters. The challenge is
+tier-independent (the hashes differ because the spec does, so a std render
+cannot pass as ultra); audits and fraud verification re-render under the
+vote's declared tier.
 
 Key properties:
 

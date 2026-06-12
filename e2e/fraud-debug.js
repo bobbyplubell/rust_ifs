@@ -57,18 +57,18 @@ await page.evaluate(() => {
 });
 
 if (!process.env.NOINJECT) await page.evaluate(async (unused) => {
-  const { voteSignBytes, voteKey, gen, PROOF_SPEC } = await import('./js/net.js');
+  const { voteSignBytes, voteKey, gen, PROOF_SPEC, CHANNEL } = await import('./js/net.js');
   const { hex } = await import('./js/hash.js');
   const sheepId = document.querySelector('.card').dataset.id;
   const pair = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']);
   const voter = hex(new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey)));
   const chunkHashes = Array.from({ length: PROOF_SPEC.nFrames }, (_, i) =>
     (i % 10).toString().repeat(64));
-  const record = { sheepId, gen: gen(), voter, chunkHashes };
+  const record = { sheepId, gen: gen(), voter, tier: 'std', chunkHashes };
   record.sig = hex(new Uint8Array(
     await crypto.subtle.sign({ name: 'Ed25519' }, pair.privateKey, voteSignBytes(record))));
   record.key = voteKey(record);
-  new BroadcastChannel('sheep-net-v3').postMessage({ kind: 'vote', record });
+  new BroadcastChannel(CHANNEL).postMessage({ kind: 'vote', record });
   console.log('forged vote injected for', sheepId.slice(0, 12), 'by', voter.slice(0, 12));
 }, 0);
 

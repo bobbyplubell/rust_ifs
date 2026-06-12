@@ -8,7 +8,7 @@
 // see net.js _ingestFraud). All votes from a discredited key are excluded
 // from tallies everywhere a verified fraud proof reaches.
 
-import { PROOF_SPEC, voteChallenge, fraudSignBytes } from './net.js';
+import { PROOF_TIERS, voteChallenge, fraudSignBytes } from './net.js';
 import { sign } from './identity.js';
 
 export class Auditor {
@@ -36,14 +36,16 @@ export class Auditor {
     if (!candidates.length) return;
 
     const v = candidates[Math.floor(Math.random() * candidates.length)];
-    const idx = Math.floor(Math.random() * PROOF_SPEC.nFrames);
-    console.log('[audit] checking', v.key.slice(0, 16), 'frame', idx);
+    const spec = PROOF_TIERS[v.tier];
+    if (!spec) return;
+    const idx = Math.floor(Math.random() * spec.nFrames);
+    console.log('[audit] checking', v.key.slice(0, 16), 'tier', v.tier, 'frame', idx);
     const challengeHex = await voteChallenge(v.sheepId, v.voter, v.gen);
     const m = await this.pool.submit({
       type: 'audit-frame', genomeJson: sheep.get(v.sheepId).genome, challengeHex, idx,
-      width: PROOF_SPEC.width, height: PROOF_SPEC.height, ss: PROOF_SPEC.ss,
-      samplesPerFrame: PROOF_SPEC.samplesPerFrame,
-      nFrames: PROOF_SPEC.nFrames, temporal: PROOF_SPEC.temporal,
+      width: spec.width, height: spec.height, ss: spec.ss,
+      samplesPerFrame: spec.samplesPerFrame,
+      nFrames: spec.nFrames, temporal: spec.temporal,
     }).done;
     if (m.type !== 'done') return;
 

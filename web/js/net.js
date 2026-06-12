@@ -29,14 +29,21 @@ export const SURVIVORS_K = 4;
 /** Deterministic per-author submissions counted per generation (lowest sheep ids win). */
 export const AUTHOR_GEN_CAP = 3;
 
-/** Protocol v3 "loop proof" spec for vote AND release proofs: the proof's 64
- *  units are FRAMES of the sheep's animation loop (frame i = phase i/64, with
- *  2 temporal sub-steps of motion blur), so proving = watching one full loop,
- *  and the frames replay as a cached animation afterward. ~15M samples total:
- *  heavy enough to be a real cost, light enough for several votes per gen. */
-export const PROOF_SPEC = {
-  width: 256, height: 256, ss: 1, nFrames: 64, samplesPerFrame: 240_000, temporal: 2,
+/** Loop-proof tiers: the proof's 64 units are FRAMES of the sheep's animation
+ *  loop (frame i = phase i/64, 2 temporal sub-steps of motion blur), so
+ *  proving = watching one full loop, and the frames replay as a cached
+ *  animation afterward.
+ *
+ *  std   (~15M samples, seconds of CPU)  = 1 vote — everyone can afford it.
+ *  ultra (~41M samples at 384px, ~2.7x)  = 2 votes — spending more CPU is a
+ *  choice with a reward (weight + a larger, denser replay loop), not a tax.
+ *  The challenge is tier-independent; hashes differ because the spec does. */
+export const PROOF_TIERS = {
+  std: { width: 256, height: 256, ss: 1, nFrames: 64, samplesPerFrame: 240_000, temporal: 2, weight: 1 },
+  ultra: { width: 384, height: 384, ss: 1, nFrames: 64, samplesPerFrame: 640_000, temporal: 2, weight: 2 },
 };
+export const PROOF_SPEC = PROOF_TIERS.std; // default tier
+export const voteWeight = (v) => PROOF_TIERS[v.tier]?.weight ?? 1;
 
 export const HEX64 = /^[0-9a-f]{64}$/;
 
@@ -47,7 +54,7 @@ export const HEX64 = /^[0-9a-f]{64}$/;
 export const sheepSignBytes = (r) =>
   utf8(`sheep|${r.id}|${(r.parents || []).join(',')}|${r.gen}|${r.author}|${r.chunkHashes.join(',')}`);
 export const voteSignBytes = (v) =>
-  utf8(`vote|${v.sheepId}|${v.gen}|${v.voter}|${v.chunkHashes.join(',')}`);
+  utf8(`vote|${v.sheepId}|${v.gen}|${v.voter}|${v.tier}|${v.chunkHashes.join(',')}`);
 
 export const voteKey = (v) => `${v.voter}:${v.sheepId}:${v.gen}`;
 
@@ -62,8 +69,11 @@ export const fraudKey = (f) => `${f.voteKey}:${f.frame}`;
 export const fraudSignBytes = (f) =>
   utf8(`fraud|${f.voteKey}|${f.frame}|${f.expected}|${f.reporter}`);
 
+/** BroadcastChannel bus name — bumped on wire-format breaks. */
+export const CHANNEL = 'sheep-net-v4';
+
 export class BroadcastTransport {
-  constructor(channel = 'sheep-net-v3') {
+  constructor(channel = CHANNEL) {
     this.ch = new BroadcastChannel(channel);
   }
   send(msg) {
@@ -95,7 +105,7 @@ export class Net {
    * @param store       store.js instance
    * @param pubHex      our peer id (used to address anti-entropy fills)
    * @param checkSheepId  async (genomeJson) => sheep_id hex, via the wasm worker
-   * @param checkFrameHash async (genomeJson, challengeHex, frameIdx) => hash —
+   * @param checkFrameHash async (genomeJson, challengeHex, frameIdx, tier) => hash —
    *                       re-renders one proof frame; used to verify incoming
    *                       fraud claims before believing them
    * @param onSheep/onVote/onFraud callbacks fired when a NEW record is accepted
@@ -184,7 +194,9 @@ export class Net {
 
   async _ingestVote(v) {
     if (!v || !HEX64.test(v.sheepId) || !HEX64.test(v.voter) || !Number.isInteger(v.gen)) return;
-    if (!Array.isArray(v.chunkHashes) || v.chunkHashes.length !== PROOF_SPEC.nFrames) return;
+    const tier = PROOF_TIERS[v.tier];
+    if (!tier) return;
+    if (!Array.isArray(v.chunkHashes) || v.chunkHashes.length !== tier.nFrames) return;
     if (!v.chunkHashes.every((h) => HEX64.test(h))) return;
     if (!(await verify(v.voter, v.sig, voteSignBytes(v)))) return;
     v.key = voteKey(v);
@@ -199,7 +211,8 @@ export class Net {
     if (!f || !f.vote || !Number.isInteger(f.frame) || !HEX64.test(f.expected ?? '')) return;
     if (!HEX64.test(f.reporter ?? '')) return;
     const v = f.vote;
-    if (f.frame < 0 || f.frame >= PROOF_SPEC.nFrames) return;
+    if (!PROOF_TIERS[v.tier]) return;
+    if (f.frame < 0 || f.frame >= PROOF_TIERS[v.tier].nFrames) return;
     if (f.voteKey !== voteKey(v)) return;
     if (!(await verify(f.reporter, f.sig, fraudSignBytes(f)))) return;
     // The embedded vote must be genuinely signed by the accused...
@@ -209,7 +222,7 @@ export class Net {
     const sheep = await this.lookupSheep(v.sheepId);
     if (!sheep) return; // can't verify yet
     const challenge = await voteChallenge(v.sheepId, v.voter, v.gen);
-    const actual = await this.checkFrameHash(sheep.genome, challenge, f.frame);
+    const actual = await this.checkFrameHash(sheep.genome, challenge, f.frame, v.tier);
     if (actual !== f.expected || actual === v.chunkHashes[f.frame]) return; // false accusation
     f.key = fraudKey(f);
     if (await this.store.addFraud(f)) this.onFraud?.(f);

@@ -8,7 +8,7 @@
 // and are capped per (author, generation) — so the flock cannot blow up with
 // peer count. Quiet generations (no votes) carry the flock forward unchanged.
 
-import { gen, SURVIVORS_K, AUTHOR_GEN_CAP } from './net.js';
+import { gen, SURVIVORS_K, AUTHOR_GEN_CAP, voteWeight } from './net.js';
 import { sha256Hex, utf8 } from './hash.js';
 
 // Canonical child challenge for a pair in generation g (ids sorted, so a pair
@@ -120,7 +120,7 @@ export async function computeFlock({ store, baked, breedFn, currentGen, banned =
     if (banned.has(v.voter)) continue;
     if (!tallyByGen.has(v.gen)) tallyByGen.set(v.gen, new Map());
     const t = tallyByGen.get(v.gen);
-    t.set(v.sheepId, (t.get(v.sheepId) || 0) + 1);
+    t.set(v.sheepId, (t.get(v.sheepId) || 0) + voteWeight(v));
   }
 
   let living = new Map(baked.map((r) => [r.id, r]));
