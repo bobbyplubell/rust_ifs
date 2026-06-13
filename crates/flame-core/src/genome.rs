@@ -28,6 +28,11 @@ pub struct Transform {
     pub variations: Vec<f64>,
     /// Parameter block for the parametric variations (see `variations::pval`).
     pub pvals: [f64; N_PVALS],
+    /// How strongly this transform pulls the color coordinate toward its own
+    /// color: `c <- c*(1-s) + color*s`. 0.5 is the classic Draves blend;
+    /// 0 leaves color untouched (REQUIRED for symmetry transforms, per the
+    /// paper sec. 7, or colors wash out).
+    pub color_speed: f64,
 }
 
 impl Transform {
@@ -51,8 +56,9 @@ impl Transform {
         let (fx, fy) = self.post.apply(bx, by);
         *x = fx;
         *y = fy;
-        // Draves color blending: pull halfway toward this transform's color.
-        *color = (*color + self.color) * 0.5;
+        // Draves color blending, weighted by color_speed (0.5 = classic).
+        let s = self.color_speed;
+        *color = *color * (1.0 - s) + self.color * s;
     }
 
     /// Random parameter block with sensible ranges for every parametric
@@ -125,6 +131,7 @@ impl Transform {
             post: Affine::identity(),
             variations,
             pvals: Self::random_pvals(rng),
+            color_speed: 0.5,
         }
     }
 }
@@ -241,24 +248,36 @@ impl Genome {
     pub fn random(rng: &mut Rng, n: usize) -> Genome {
         let mut transforms: Vec<Transform> = (0..n).map(|_| Transform::random(rng)).collect();
 
-        // Rotational symmetry: pure-rotation linear transforms make the
-        // attractor read as one object instead of scattered gauze. (Skipped
-        // when it would push past the 8-transform validation cap.)
-        if rng.chance(0.4) && n + 3 <= 8 {
-            let order = 2 + rng.below(3); // 2..=4 fold
-            let avg = transforms.iter().map(|t| t.weight).sum::<f64>() / transforms.len() as f64;
-            for k in 1..order {
-                let theta = k as f64 / order as f64 * core::f64::consts::TAU;
+        // Symmetry per the paper (sec. 7): each symmetry transform gets
+        // weight equal to the SUM of all other weights (half the jumps cross
+        // arms — equal-density branches, not shadows), and color_speed 0 so
+        // the color coordinate is untouched (else colors wash out).
+        if rng.chance(0.45) && n + 3 <= 8 {
+            let base_sum: f64 = transforms.iter().map(|t| t.weight).sum();
+            let mut symmetry = |affine: Affine, rng: &mut Rng| {
                 let mut variations = vec![0.0; Variation::ALL.len()];
                 variations[Variation::Linear.index()] = 1.0;
-                transforms.push(Transform {
-                    weight: avg,
-                    color: rng.f64(),
-                    affine: Affine::identity().rotated(theta),
+                Transform {
+                    weight: base_sum,
+                    color: rng.f64(), // irrelevant at color_speed 0
+                    affine,
                     post: Affine::identity(),
                     variations,
                     pvals: Transform::random_pvals(rng),
-                });
+                    color_speed: 0.0,
+                }
+            };
+            if rng.chance(0.25) {
+                // Dihedral: mirror across the y axis.
+                let t = symmetry(Affine::new(-1.0, 0.0, 0.0, 0.0, 1.0, 0.0), rng);
+                transforms.push(t);
+            } else {
+                let order = 2 + rng.below(3); // 2..=4 fold rotational
+                for k in 1..order {
+                    let theta = k as f64 / order as f64 * core::f64::consts::TAU;
+                    let t = symmetry(Affine::identity().rotated(theta), rng);
+                    transforms.push(t);
+                }
             }
         }
 

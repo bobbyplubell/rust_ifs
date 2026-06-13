@@ -37,6 +37,7 @@ impl Transform {
             post: self.post.lerp(&other.post, t),
             variations,
             pvals,
+            color_speed: lerp(self.color_speed, other.color_speed, t),
         }
     }
 }

@@ -4,11 +4,11 @@
 // (also compute) produce the final image. No CPU point generation.
 //
 // Genome is uploaded as a flat f32 buffer; each transform occupies STRIDE
-// floats: [weight, color, affine(6), post(6), variations(29), pvals(16)] = 59.
+// floats: [weight, color, affine(6), post(6), variations(29), pvals(16), color_speed] = 60.
 // pvals layout mirrors flame-core variations::pval.
 
 const PI: f32 = 3.14159265358979;
-const STRIDE: u32 = 59u;
+const STRIDE: u32 = 60u;
 
 struct Params {
     dims: vec4<u32>,   // hw, hh, n_transforms, has_final
@@ -190,7 +190,8 @@ fn cs_chaos(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var i = 0u; i < total; i = i + 1u) {
         let t = pick(&state);
         let np = apply_tx(t, vec2(x, y), &state);
-        color = (color + field(t, 1u)) * 0.5;
+        let cs = field(t, 59u);
+        color = color * (1.0 - cs) + field(t, 1u) * cs;
         x = np.x;
         y = np.y;
 
@@ -205,7 +206,8 @@ fn cs_chaos(@builtin(global_invocation_id) gid: vec3<u32>) {
         var px = x; var py = y; var pc = color;
         if (has_final == 1u) {
             let fp = apply_tx(n, vec2(px, py), &state);
-            pc = (pc + field(n, 1u)) * 0.5;
+            let fcs = field(n, 59u);
+            pc = pc * (1.0 - fcs) + field(n, 1u) * fcs;
             px = fp.x; py = fp.y;
         }
 

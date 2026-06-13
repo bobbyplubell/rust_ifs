@@ -96,6 +96,9 @@ fn mutate_transform(t: &mut Transform, rng: &mut Rng, rate: f64) {
         t.color = (t.color + rng.range(-0.15, 0.15)).clamp(0.0, 1.0);
     }
     if rng.chance(rate * 0.5) {
+        t.color_speed = (t.color_speed + rng.range(-0.15, 0.15)).clamp(0.0, 1.0);
+    }
+    if rng.chance(rate * 0.5) {
         // Re-roll one variation weight, same style as Transform::random.
         let idx = rng.below(t.variations.len());
         t.variations[idx] = rng.range(0.2, 1.0);
@@ -195,6 +198,9 @@ impl Genome {
             }
             if t.pvals.iter().any(|v| !v.is_finite()) {
                 return Err(format!("{what}: non-finite variation parameter"));
+            }
+            if !t.color_speed.is_finite() || !(0.0..=1.0).contains(&t.color_speed) {
+                return Err(format!("{what}: color_speed {} outside [0, 1]", t.color_speed));
             }
             Ok(())
         };
