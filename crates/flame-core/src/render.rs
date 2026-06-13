@@ -329,9 +329,15 @@ pub fn tonemap(accum: &Accum, genome: &Genome, width: usize, height: usize, ss: 
     }
 
     // 2. Adaptive density estimation at supersample resolution. Radius per
-    // cell from its own count relative to the image mean: empty/sparse cells
-    // gather wide (glow), dense cells gather narrow (detail). Weights are
-    // 1/(d2+1) — close enough to gaussian, exact and cheap.
+    // cell from its own ABSOLUTE sample count (flam3's scheme), NOT count/mean:
+    // a flame's density is heavy-tailed, so the dim majority of cells sit below
+    // the mean at every sample count — a radius keyed to count/mean would blur
+    // them into permanent "shaped fog" no matter how long the render runs. Keyed
+    // to absolute count, every cell crosses SHARP as samples accumulate, so the
+    // fog resolves into solid structure the longer it renders. Below that, the
+    // gather widens (smooth glow) to hide undersampling. Weights are 1/(d2+1) —
+    // close enough to gaussian, exact and cheap.
+    const SHARP: f64 = 16.0; // samples/cell above which a cell needs no blur
     let de = if mean_nz > 0.0 {
         // Occupancy mask dilated by the max gather radius: empty cells far
         // from any density gather all-zeros anyway — skip them outright.
@@ -376,12 +382,11 @@ pub fn tonemap(accum: &Accum, genome: &Genome, width: usize, height: usize, ss: 
                     continue; // provably zero result
                 }
                 let c = accum.data[y * hw + x][3];
-                let rel = c / mean_nz;
-                let rad: i64 = if rel >= 1.0 {
+                let rad: i64 = if c >= SHARP {
                     0
-                } else if rel >= 0.25 {
+                } else if c >= SHARP * 0.25 {
                     1
-                } else if rel >= 0.05 {
+                } else if c >= SHARP * 0.06 {
                     2
                 } else {
                     3

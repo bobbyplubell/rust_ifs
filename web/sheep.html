@@ -143,11 +143,14 @@
       }
     }
 
-    function showSamples(n) {
-      $('#samples').textContent = !n ? ''
-        : n >= 1e9 ? `${(n / 1e9).toFixed(1)}B samples`
-        : n >= 1e6 ? `${Math.round(n / 1e6)}M samples`
-        : `${Math.round(n / 1e3)}k samples`;
+    function showSamples(n, spp) {
+      if (!n) { $('#samples').textContent = ''; return; }
+      const s = n >= 1e9 ? `${(n / 1e9).toFixed(1)}B`
+        : n >= 1e6 ? `${Math.round(n / 1e6)}M`
+        : `${Math.round(n / 1e3)}k`;
+      // samples/pixel is the real quality figure — a solid render wants
+      // hundreds. (flam3's "quality" parameter is exactly this number.)
+      $('#samples').textContent = spp ? `${s} samples · ${Math.round(spp)}/px` : `${s} samples`;
     }
 
     function useCanvas(which) { // 'cpu' (#cv) | 'gpu' (#cvgpu)
@@ -198,7 +201,8 @@
           },
           { onProgress: (p) => {
             if (ctl.stop || !p.rgba) return;
-            paint(p); rendered = true; showSamples(p.samples);
+            paint(p); rendered = true;
+            showSamples(p.samples, p.samples / (spec.width * spec.height));
           } },
         );
       });
