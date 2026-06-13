@@ -17,7 +17,10 @@ import { Auditor } from './audit.js';
 import { RELAYS } from '../config.js';
 
 const $ = (s) => document.querySelector(s);
-const pool = new WorkerPool();
+// ?workers=N caps the worker pool (stress testing packs hundreds of peers on
+// one machine; idle peers don't need 4 workers each).
+const WORKERS_OVERRIDE = Number(new URLSearchParams(location.search).get('workers')) || null;
+const pool = new WorkerPool(WORKERS_OVERRIDE ?? undefined);
 
 // Display quality (free to change): supersampled + more samples than the
 // protocol PROOF_SPEC, which vote renders must match exactly.
@@ -119,6 +122,82 @@ async function main() {
       return { queued: pool.queue.length, running: pool.running, chunks: pool.chunksRendered };
     },
   };
+  // Stress-driver hooks (?stress=1): programmatic actions + metrics dump.
+  if (new URLSearchParams(location.search).get('stress')) {
+    window.__sheepAct = {
+      // Vote on a random not-yet-voted living sheep; resolves when published.
+      async voteRandom() {
+        const open = [...cards.values()].filter(
+          (e) => !e.voteBtn.disabled && !e.votePending);
+        if (!open.length) return null;
+        const entry = open[Math.floor(Math.random() * open.length)];
+        await vote(entry);
+        return entry.record.id;
+      },
+      // Breed two random living sheep and release the child (full proof).
+      async breedRandom() {
+        const ids = [...cards.keys()];
+        if (ids.length < 2) return null;
+        const aId = ids[Math.floor(Math.random() * ids.length)];
+        let bId = aId;
+        while (bId === aId) bId = ids[Math.floor(Math.random() * ids.length)];
+        const [x, y] = [aId, bId].sort();
+        const g = gen();
+        const challengeHex = await breedChallenge(g, x, y);
+        const bred = await pool.submit({
+          type: 'breed', aJson: cards.get(x).record.genome,
+          bJson: cards.get(y).record.genome, challengeHex,
+        }).done;
+        if (bred.type !== 'breed-done' || cards.has(bred.childId)) return null;
+        const off = document.createElement('canvas');
+        const proofChallenge = await voteChallenge(bred.childId, me.pubHex, g);
+        const res = await renderLoopProof(off, bred.childJson, proofChallenge);
+        if (!res) return null;
+        const record = {
+          id: bred.childId, genome: bred.childJson, parents: [x, y], gen: g,
+          author: me.pubHex, chunkHashes: res.hashes,
+        };
+        record.sig = await sign(me.pair, sheepSignBytes(record));
+        await net.publishSheep(record);
+        const voteRec = {
+          sheepId: bred.childId, gen: g, voter: me.pubHex, tier: 'std',
+          sumHash: res.sumHash, chunkHashes: res.hashes,
+        };
+        voteRec.sig = await sign(me.pair, voteSignBytes(voteRec));
+        await net.publishVote(voteRec);
+        await store.putSum(voteRec.key, res.sum.buffer);
+        return bred.childId;
+      },
+    };
+    window.__sheepDump = async () => {
+      const [votes, sheep, fraud] = await Promise.all([
+        store.allVotes(), store.allSheep(), store.allFraud(),
+      ]);
+      // Convergence fingerprint: current-gen weighted tallies, sorted.
+      const g = gen();
+      const t = [...tallies.entries()]
+        .map(([id, set]) => {
+          let w = 0;
+          for (const k of set) {
+            if (k.endsWith(`:${g}`) && !bannedVoters.has(k.split(':')[0])) {
+              w += voteWeights.get(k) ?? 1;
+            }
+          }
+          return [id, w];
+        })
+        .filter(([, w]) => w > 0)
+        .sort();
+      return {
+        peer: PEER_NS, gen: g - GENESIS_GEN,
+        votes: votes.length, sheep: sheep.length, fraud: fraud.length,
+        cards: cards.size, sums: sumsReceived,
+        audits: auditor.stats.audits, frauds: auditor.stats.frauds,
+        net: JSON.parse(JSON.stringify(net.counts)),
+        tallyFingerprint: await sha256Hex(utf8(JSON.stringify(t))),
+      };
+    };
+  }
+
   shownGen = gen();
   setInterval(() => {
     updateStatus();

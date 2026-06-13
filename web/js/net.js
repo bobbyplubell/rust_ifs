@@ -113,10 +113,21 @@ export class Net {
       onSheep, onVote, onFraud, onSumData,
     });
     this.peers = new Map(); // pubHex -> last inv timestamp
+    // Wire telemetry (stress testing / swarm page): message counts + bytes.
+    this.counts = { sent: {}, recv: {}, sentBytes: 0, recvBytes: 0 };
+  }
+
+  _send(msg) {
+    this.counts.sent[msg.kind] = (this.counts.sent[msg.kind] ?? 0) + 1;
+    try { this.counts.sentBytes += JSON.stringify(msg).length; } catch { /* buffers */ }
+    this.transport.send(msg);
   }
 
   async start() {
-    this.transport.onMessage((msg) => this._recv(msg).catch(console.error));
+    this.transport.onMessage((msg) => {
+      this.counts.recv[msg.kind] = (this.counts.recv[msg.kind] ?? 0) + 1;
+      this._recv(msg).catch(console.error);
+    });
     await this._sendInv();
     this._invTimer = setInterval(() => this._sendInv().catch(console.error), 5000);
   }
@@ -133,7 +144,7 @@ export class Net {
 
   async publishSheep(record) {
     if (await this.store.addSheep(record)) {
-      this.transport.send({ kind: 'sheep', record });
+      this._send({ kind: 'sheep', record });
       this.onSheep?.(record);
     }
   }
@@ -141,19 +152,19 @@ export class Net {
   async publishVote(record) {
     record.key = voteKey(record);
     if (await this.store.addVote(record)) {
-      this.transport.send({ kind: 'vote', record });
+      this._send({ kind: 'vote', record });
       this.onVote?.(record);
     }
   }
 
   requestSum(voteKey) {
-    this.transport.send({ kind: 'want-sum', from: this.pubHex, voteKey });
+    this._send({ kind: 'want-sum', from: this.pubHex, voteKey });
   }
 
   async publishFraud(record) {
     record.key = fraudKey(record);
     if (await this.store.addFraud(record)) {
-      this.transport.send({ kind: 'fraud', record });
+      this._send({ kind: 'fraud', record });
       this.onFraud?.(record);
     }
   }
@@ -172,7 +183,7 @@ export class Net {
         if (!msg.voteKey || msg.from === this.pubHex) return;
         const buf = await this.store.getSum(msg.voteKey);
         if (buf) {
-          this.transport.send({ kind: 'sum-data', to: msg.from, voteKey: msg.voteKey, buf });
+          this._send({ kind: 'sum-data', to: msg.from, voteKey: msg.voteKey, buf });
         }
         return;
       }
@@ -251,7 +262,7 @@ export class Net {
     const sheep = (await this.store.allSheep()).filter((r) => !r.baked).map((r) => r.id);
     const votes = (await this.store.allVotes()).map((v) => v.key);
     const fraud = (await this.store.allFraud()).map((f) => f.key);
-    this.transport.send({ kind: 'inv', from: this.pubHex, sheep, votes, fraud });
+    this._send({ kind: 'inv', from: this.pubHex, sheep, votes, fraud });
   }
 
   async _onInv(msg) {
@@ -264,7 +275,7 @@ export class Net {
     const votes = (await this.store.allVotes()).filter((v) => !theirVotes.has(v.key));
     const fraud = (await this.store.allFraud()).filter((f) => !theirFraud.has(f.key));
     if (sheep.length || votes.length || fraud.length) {
-      this.transport.send({ kind: 'data', to: msg.from, sheep, votes, fraud });
+      this._send({ kind: 'data', to: msg.from, sheep, votes, fraud });
     }
   }
 }
