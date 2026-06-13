@@ -17,7 +17,7 @@ import { openStore } from './store.js';
 import {
   Net, BroadcastTransport, CompositeTransport, gen, GEN_MS, GENESIS_GEN,
   BATCH_SPEC, BATCH_SPP, batchKey, batchSignBytes, sheepSignBytes, fraudSignBytes,
-  BREED_MIN_TILES, PROTOCOL_VERSION,
+  BREED_MIN_TILES, PROTOCOL_VERSION, specForGen, specCells,
 } from './net.js';
 import { computeFlock, breedChallenge } from './gens.js';
 import { handle, provenance } from './names.js';
@@ -41,13 +41,13 @@ const AUTO_CONTRIBUTE = !!(params.get('stress') || params.get('autocontribute'))
 // Frame every card shows. The flock is a still gallery of frame 0; the
 // fullscreen view (sheep.html) animates the whole loop.
 const CARD_FRAME = 0;              // the frame each flock card displays
-const N_FRAMES = BATCH_SPEC.nFrames;
+// A sheep's render spec is keyed to its birth generation (so specs can change
+// for new sheep without breaking old ones). Resolve it per record.
+const specOf = (record) => specForGen(record.gen);
 // Contribution targets frame 0 until it has at least this many tiles (so the
-// thumbnail still looks decent), then spreads tiles across RANDOM frames to
+// thumbnail still looks decent), then spreads tiles across other frames to
 // build the whole community animation — not just the first frame.
 const FRAME0_MIN = 8;
-// Cell count of one batch/frame histogram at BATCH_SPEC (BigUint64Array length).
-const HIST_CELLS = BATCH_SPEC.width * BATCH_SPEC.ss * BATCH_SPEC.height * BATCH_SPEC.ss * 4;
 // Quick low-sample placeholder so a card is never blank before batches land.
 const PREVIEW = { width: BATCH_SPEC.width, height: BATCH_SPEC.height, samples: 200_000, seed: 7 };
 
@@ -104,11 +104,14 @@ async function main() {
     sign,
     verify,
     // Re-render one batch (hash only) — net uses this to confirm a fraud claim.
-    checkBatchHash: (genomeJson, sheepId, frame, idx) =>
-      pool.submit({
+    // The spec is the sheep's (keyed to its birth gen), not a global constant.
+    checkBatchHash: async (genomeJson, sheepId, frame, idx) => {
+      const s = specForGen((await lookupSheep(sheepId))?.gen ?? gen());
+      return pool.submit({
         type: 'batch-hash', genomeJson, sheepId, frame, idx,
-        w: BATCH_SPEC.width, h: BATCH_SPEC.height, ss: BATCH_SPEC.ss, spp: BATCH_SPP,
-      }).done.then((m) => m.hash),
+        w: s.width, h: s.height, ss: s.ss, spp: s.spp,
+      }).done.then((m) => m.hash);
+    },
     checkSheepId: (genomeJson) =>
       pool.submit({ type: 'sheep-id', genomeJson }).done.then((m) => m.id),
     lookupSheep,
@@ -221,12 +224,13 @@ async function rebuildFlock() {
 function addCard(record) {
   if (cards.has(record.id)) return;
 
+  const spec = specOf(record);
   const card = document.createElement('div');
   card.className = 'card';
   card.dataset.id = record.id;
   const canvas = document.createElement('canvas');
-  canvas.width = BATCH_SPEC.width;
-  canvas.height = BATCH_SPEC.height;
+  canvas.width = spec.width;
+  canvas.height = spec.height;
   const meta = document.createElement('div');
   meta.className = 'meta';
   const prov = provenance(record);
@@ -259,6 +263,7 @@ function addCard(record) {
 
   const entry = {
     record, canvas, tallyEl, contribBtn, card, barFill, onScreen: true,
+    spec, histCells: specCells(spec),
     acc0: null, covered: new Set(),
     tonemapPending: false, repaintQueued: false, paintedPreview: false,
     pledged: false,
@@ -380,16 +385,17 @@ async function bootstrapCard(entry) {
 }
 
 function renderBatchMsg(record, frame, idx) {
+  const s = specOf(record);
   return {
     type: 'render-batch', genomeJson: record.genome, sheepId: record.id,
-    frame, idx, w: BATCH_SPEC.width, h: BATCH_SPEC.height, ss: BATCH_SPEC.ss, spp: BATCH_SPP,
+    frame, idx, w: s.width, h: s.height, ss: s.ss, spp: s.spp,
   };
 }
 
 // Merge a rendered frame-0 batch histogram into a card's accumulation.
 function mergeBatchInto(entry, idx, hist) {
   if (entry.covered.has(idx)) return false;
-  if (!entry.acc0) entry.acc0 = new BigUint64Array(HIST_CELLS);
+  if (!entry.acc0) entry.acc0 = new BigUint64Array(entry.histCells);
   mergeHist(entry.acc0, hist);
   entry.covered.add(idx);
   return true;
@@ -416,7 +422,7 @@ function repaint(entry) {
   const hist = entry.acc0.slice().buffer;
   pool.submit({
     type: 'tonemap-int', hist, genomeJson: entry.record.genome,
-    w: BATCH_SPEC.width, h: BATCH_SPEC.height, ss: BATCH_SPEC.ss,
+    w: entry.spec.width, h: entry.spec.height, ss: entry.spec.ss,
   }).done.then((m) => {
     entry.tonemapPending = false;
     if (m.type === 'done' && cards.has(entry.record.id)) {
@@ -486,7 +492,8 @@ async function onRender(sheepId, frame, hist) {
 async function verifyRender(lookupSheep, { sheepId, frame, hist, batchKeys }) {
   const sheep = await lookupSheep(sheepId);
   if (!sheep) return false;
-  if (!(hist instanceof BigUint64Array) || hist.length !== HIST_CELLS) return false;
+  const spec = specOf(sheep);
+  if (!(hist instanceof BigUint64Array) || hist.length !== specCells(spec)) return false;
   if (!Array.isArray(batchKeys) || !batchKeys.length) return false;
 
   // Map the claimed batchKeys to stored records (need their signed hashes + spp).
@@ -503,7 +510,7 @@ async function verifyRender(lookupSheep, { sheepId, frame, hist, batchKeys }) {
   // Count conservation: total plotted count must equal the sum of claimed spp.
   const totalReply = await pool.submit({
     type: 'total-count', hist: hist.slice().buffer,
-    w: BATCH_SPEC.width, h: BATCH_SPEC.height, ss: BATCH_SPEC.ss,
+    w: spec.width, h: spec.height, ss: spec.ss,
   }).done;
   if (totalReply.type !== 'done') return false;
   let expected = 0n;
@@ -528,7 +535,7 @@ async function verifyRender(lookupSheep, { sheepId, frame, hist, batchKeys }) {
     }
     const sub = await pool.submit({
       type: 'subtract-check', acc: hist.slice().buffer, batch: reply.hist,
-      w: BATCH_SPEC.width, h: BATCH_SPEC.height, ss: BATCH_SPEC.ss,
+      w: spec.width, h: spec.height, ss: spec.ss,
     }).done;
     if (sub.type !== 'done' || !sub.ok) return false; // batch not actually present
   }
@@ -604,7 +611,7 @@ function coveredFor(entry, frame) {
 function leastCoveredFrame(entry) {
   let best = CARD_FRAME;
   let bestN = Infinity;
-  for (let f = 0; f < N_FRAMES; f++) {
+  for (let f = 0; f < entry.spec.nFrames; f++) {
     const n = entry.frameCov.get(f)?.size ?? 0;
     if (n < bestN) { bestN = n; best = f; }
   }
@@ -641,7 +648,7 @@ async function contributeBatch(entry) {
   if (reply.type !== 'batch-done') { cov.delete(idx); return null; }
 
   if (frame === CARD_FRAME) {
-    if (!entry.acc0) entry.acc0 = new BigUint64Array(HIST_CELLS);
+    if (!entry.acc0) entry.acc0 = new BigUint64Array(entry.histCells);
     mergeHist(entry.acc0, new BigUint64Array(reply.hist));
     repaint(entry);
   }
@@ -650,7 +657,7 @@ async function contributeBatch(entry) {
   const record = {
     v: PROTOCOL_VERSION,
     sheepId: entry.record.id, frame, idx, hash: reply.hash,
-    spp: BATCH_SPP, contributor: me.pubHex, gen: g,
+    spp: entry.spec.spp, contributor: me.pubHex, gen: g,
   };
   record.sig = await sign(me.pair, batchSignBytes(record));
   await net.publishBatch(record);

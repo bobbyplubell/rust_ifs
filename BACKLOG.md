@@ -84,8 +84,11 @@ Concise, but the technical ones explain the architecture well:
 
 ## Renderer / scale (from ARCHITECTURE "Known limits")
 
-- **BATCH_SPEC resolution** is 384² for v1 — raise toward a crisp fullscreen
-  target (heavier histograms/sync; measure first).
+- **Raise render resolution.** The spec is now data-driven (SPEC_SCHEDULE +
+  specForGen, keyed to a sheep's birth gen), so add a schedule entry with a
+  higher `from` gen to give NEW sheep a crisper spec without breaking old
+  sheep's tiles. Constraint: keep nFrames constant across specs (sheep.html
+  rebinds only resolution). Measure histogram/sync cost first.
 - **Compressed-frame fidelity** for CPU-light viewers: serve tonemapped
   frames / short video (a few MB) so viewers can watch without re-rendering;
   verify by spot re-render. Currently viewers re-render from the ledger.

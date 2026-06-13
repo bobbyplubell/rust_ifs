@@ -9,7 +9,7 @@
 // net.js _ingestFraud). On a confirmed proof every contribution from the
 // discredited key is excluded from tallies everywhere it reaches.
 
-import { BATCH_SPEC, BATCH_SPP, batchKey, fraudSignBytes, PROTOCOL_VERSION } from './net.js';
+import { batchKey, fraudSignBytes, PROTOCOL_VERSION, specForGen } from './net.js';
 
 export class Auditor {
   /**
@@ -68,10 +68,11 @@ export class Auditor {
     const sheep = await this._lookup(b.sheepId);
     if (!sheep) return; // can't audit without the genome; anti-entropy re-offers it
 
+    const spec = specForGen(sheep.gen); // the sheep's render spec (by birth gen)
     const reply = await this.pool.submit({
       type: 'batch-hash', genomeJson: sheep.genome, sheepId: b.sheepId,
       frame: b.frame, idx: b.idx,
-      w: BATCH_SPEC.width, h: BATCH_SPEC.height, ss: BATCH_SPEC.ss, spp: BATCH_SPP,
+      w: spec.width, h: spec.height, ss: spec.ss, spp: spec.spp,
     }).done;
     if (reply.type !== 'done') return;
 

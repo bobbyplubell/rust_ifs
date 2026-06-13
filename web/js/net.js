@@ -52,10 +52,27 @@ export const AUTHOR_GEN_CAP = 3;
  *  not a client courtesy. */
 export const BREED_MIN_TILES = 4;
 
-/** Render spec a batch animates against. One tier, full quality (no quality
- *  tiers in the batch era). The contributed `spp` is BATCH_SPP. */
-export const BATCH_SPEC = { width: 384, height: 384, ss: 1, nFrames: 64 };
-export const BATCH_SPP = 640_000;
+/** Render-spec schedule. The spec a sheep is rendered at is a function of the
+ *  GENERATION it was born in — so a future entry can raise resolution (or frame
+ *  count) for NEW sheep without invalidating any existing sheep's tiles, no
+ *  global flag-day. Append entries with a higher `from`; NEVER edit an existing
+ *  one (it would change the tile hashes of sheep already rendered under it). */
+export const SPEC_SCHEDULE = [
+  { from: 0, spec: { width: 384, height: 384, ss: 1, nFrames: 64, spp: 640_000 } },
+];
+export function specForGen(g) {
+  let s = SPEC_SCHEDULE[0].spec;
+  for (const e of SPEC_SCHEDULE) if (g >= e.from) s = e.spec;
+  return s;
+}
+/** Cell count of one frame's integer histogram for a spec (BigUint64Array len). */
+export const specCells = (spec) => spec.width * spec.ss * spec.height * spec.ss * 4;
+
+/** Genesis-spec aliases (gen 0), for display-only / non-sheep-specific code.
+ *  Anything that RENDERS or HASHES a sheep's tiles must use
+ *  specForGen(sheep.gen) instead, so different sheep can use different specs. */
+export const BATCH_SPEC = specForGen(0);
+export const BATCH_SPP = BATCH_SPEC.spp;
 
 export const HEX64 = /^[0-9a-f]{64}$/;
 
@@ -303,7 +320,7 @@ export class Net {
   async _ingestBatch(b) {
     if (!b || !HEX64.test(b.sheepId) || !HEX64.test(b.hash)) return;
     if (!ACCEPTED_VERSIONS.has(b.v)) return; // unknown protocol version
-    if (!Number.isInteger(b.frame) || b.frame < 0 || b.frame >= BATCH_SPEC.nFrames) return;
+    if (!Number.isInteger(b.frame) || b.frame < 0) return;
     if (!Number.isInteger(b.idx) || b.idx < 0) return;
     if (!Number.isInteger(b.spp) || b.spp <= 0) return;
     if (!Number.isInteger(b.gen)) return;
@@ -313,6 +330,9 @@ export class Net {
     // The sheep must be known (so its coverage/genome are addressable).
     const sheep = await this.lookupSheep?.(b.sheepId);
     if (!sheep) return;
+    // Frame bound + spp come from THIS sheep's spec (keyed to its birth gen).
+    const spec = specForGen(sheep.gen);
+    if (b.frame >= spec.nFrames || b.spp !== spec.spp) return;
     b.key = batchKey(b);
     if (await this.store.addBatch(b)) { this.markDirty(); this.onBatch?.(b); }
   }
