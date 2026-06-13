@@ -21,6 +21,7 @@ import {
 import { computeFlock, breedChallenge } from './gens.js';
 import { handle, provenance } from './names.js';
 import { Auditor } from './audit.js';
+import { FrameLoop } from './loop.js';
 import { RELAYS } from '../config.js';
 
 const $ = (s) => document.querySelector(s);
@@ -188,6 +189,7 @@ async function rebuildFlock() {
   for (const [id, entry] of cards) {
     if (!living.has(id)) {
       stopReplay(entry);
+      disposeHover(entry);
       flockVisibility.unobserve(entry.card);
       const at = selected.indexOf(id);
       if (at !== -1) { selected.splice(at, 1); $('#nursery').hidden = true; }
@@ -257,6 +259,8 @@ function addCard(record) {
   flockVisibility.observe(card);
 
   canvas.addEventListener('click', () => toggleSelect(record.id));
+  card.addEventListener('mouseenter', () => startHover(entry));
+  card.addEventListener('mouseleave', () => stopHover(entry));
   contribBtn.addEventListener('click', () => {
     entry.pledged = !entry.pledged;
     contribBtn.textContent = entry.pledged ? 'pledged ✓' : 'contribute';
@@ -267,6 +271,64 @@ function addCard(record) {
   // frame 0, then paint a quick preview placeholder, then the tally.
   bootstrapCard(entry).catch(showError);
   updateTally(record.id);
+}
+
+// ---- hover-to-animate (flock, display-only) ---------------------------------
+//
+// Hovering a card plays a quick animated preview of the sheep's loop — cheap
+// render_frame previews cross-faded by a FrameLoop, NOT contributed work (no
+// batches, no votes). It shows the motion; the fullscreen view is where the
+// community's accumulated high-quality loop lives. Preview frames render lazily
+// and are cached, so a second hover is instant.
+const HOVER_FRAMES = 24;
+const HOVER_PREVIEW = { width: 256, height: 256, samples: 130_000, seed: 7 };
+
+async function ensureHoverFrames(entry) {
+  if (entry.hoverFrames) return;
+  entry.hoverFrames = new Array(HOVER_FRAMES).fill(null);
+  for (let f = 0; f < HOVER_FRAMES; f++) {
+    if (!entry.hovering) return; // left before it filled — keep what we have
+    const m = await pool.submit({
+      type: 'frame', genomeJson: entry.record.genome,
+      phase: f / HOVER_FRAMES, ...HOVER_PREVIEW,
+    }).done;
+    if (m.type === 'done') {
+      entry.hoverFrames[f] = await createImageBitmap(
+        new ImageData(new Uint8ClampedArray(m.rgba), m.width, m.height));
+    }
+  }
+}
+
+function startHover(entry) {
+  entry.hovering = true;
+  if (!entry.hoverLoop) {
+    entry.hoverLoop = new FrameLoop(entry.canvas, {
+      nFrames: HOVER_FRAMES,
+      getFrame: (i) => entry.hoverFrames?.[i] || null,
+    });
+  }
+  ensureHoverFrames(entry).catch(showError);
+  entry.hoverLoop.start();
+}
+
+function stopHover(entry) {
+  entry.hovering = false;
+  entry.hoverLoop?.stop();
+  // Restore the still: the accumulated frame-0 render, or its frame-0 preview.
+  if (entry.acc0 && entry.covered.size) repaint(entry);
+  else if (entry.hoverFrames?.[0]) {
+    const c = entry.canvas;
+    c.getContext('2d').drawImage(entry.hoverFrames[0], 0, 0, c.width, c.height);
+  }
+}
+
+function disposeHover(entry) {
+  entry.hoverLoop?.stop();
+  entry.hovering = false;
+  if (entry.hoverFrames) {
+    for (const b of entry.hoverFrames) b?.close?.();
+    entry.hoverFrames = null;
+  }
 }
 
 // Paint a worker tonemap/preview onto a canvas, resizing to match the image.

@@ -60,6 +60,7 @@
       Net, BroadcastTransport, CompositeTransport, gen,
       BATCH_SPEC, BATCH_SPP, batchKey, batchSignBytes, fraudSignBytes,
     } from './js/net.js';
+    import { FrameLoop } from './js/loop.js';
     import { RELAYS } from './config.js';
 
     const $ = (s) => document.querySelector(s);
@@ -165,19 +166,17 @@
       }
     }
 
-    // ---- playback ticker ------------------------------------------------------
-
-    function tick(now) {
-      const pos = ((now % LOOP_MS) / LOOP_MS) * N_FRAMES;
-      const i = Math.floor(pos) % N_FRAMES;
-      const img = frames[i].bitmap || frames[i].preview
-        || frames[(i + 1) % N_FRAMES].bitmap || frames[(i + 1) % N_FRAMES].preview;
-      if (img) {
-        if (cv.width !== W) { cv.width = W; cv.height = H; }
-        ctx.drawImage(img, 0, 0, cv.width, cv.height);
-      }
-      requestAnimationFrame(tick);
-    }
+    // ---- playback (decoupled from rendering) ----------------------------------
+    //
+    // The FrameLoop draws and cross-fades; it only ever reads the current
+    // bitmap for a slot (or frame 0 / its preview as a universal fallback), so
+    // the render side (tonemaps landing async, batches accumulating, community
+    // renders arriving) never stutters playback.
+    const loop = new FrameLoop(cv, {
+      nFrames: N_FRAMES, loopMs: LOOP_MS,
+      getFrame: (i) => frames[i].bitmap || frames[i].preview
+        || frames[0].bitmap || frames[0].preview || null,
+    });
 
     // ---- samples/pixel readout ------------------------------------------------
 
@@ -458,7 +457,7 @@
       };
 
       startContributeLoop();
-      requestAnimationFrame(tick);
+      loop.start();
     }
 
     main().catch((e) => { $('#info').textContent = 'error: ' + (e.message || e); console.error(e); });
