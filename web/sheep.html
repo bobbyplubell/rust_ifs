@@ -21,12 +21,26 @@
     #hud .id { color: #62627a; }
     #hud a { color: #8d8da4; margin-left: auto; }
     #hud button.on { color: #cfe; }
+    /* per-frame tile coverage: one square per animation frame, shaded by tile
+       count (darker = fuzzier / fewer tiles), the count shown inside. */
+    #tilemap {
+      position: fixed; top: 10px; right: 10px;
+      display: grid; grid-template-columns: repeat(8, 15px); gap: 2px;
+      padding: 7px; background: rgba(0,0,0,0.55); border-radius: 6px;
+    }
+    #tilemap .cell {
+      width: 15px; height: 15px; border-radius: 2px; background: #1c1c28;
+      font-size: 8px; line-height: 15px; text-align: center; color: #aab;
+    }
+    #tilemap .cell.cur { outline: 1px solid #c8b06a; }
+    #tilemap .cap { grid-column: 1 / -1; font-size: 9px; color: #7a7a93; }
   </style>
 </head>
 <body>
   <div id="stage">
     <canvas id="cv" width="384" height="384"></canvas>
   </div>
+  <div id="tilemap"><span class="cap">tiles / frame</span></div>
   <div id="hud">
     <span id="info">loading…</span>
     <span id="sheep-id" class="id"></span>
@@ -194,7 +208,37 @@
         : `${Math.round(n / 1e3)}k`;
       $('#samples').textContent = n
         ? `${s} samples · ${perPx.toFixed(1)}/px` : '';
+      updateTilemap();
     }
+
+    // ---- per-frame tile coverage map ------------------------------------------
+
+    const tilemap = $('#tilemap');
+    const tileCells = Array.from({ length: N_FRAMES }, () => {
+      const c = document.createElement('div');
+      c.className = 'cell';
+      tilemap.append(c);
+      return c;
+    });
+    function updateTilemap() {
+      for (let f = 0; f < N_FRAMES; f++) {
+        const k = frames[f].covered.size;
+        tileCells[f].textContent = k || '';
+        const t = Math.min(1, k / 24);          // saturate the shade around 24 tiles
+        tileCells[f].style.background = `hsl(265 45% ${Math.round(9 + t * 38)}%)`;
+        tileCells[f].title = `frame ${f}: ${k} tiles`;
+      }
+    }
+    // Outline the frame currently on screen.
+    let curCell = -1;
+    setInterval(() => {
+      const i = Math.floor(((performance.now() % LOOP_MS) / LOOP_MS) * N_FRAMES) % N_FRAMES;
+      if (i !== curCell) {
+        tileCells[curCell]?.classList.remove('cur');
+        tileCells[i]?.classList.add('cur');
+        curCell = i;
+      }
+    }, 120);
 
     // ---- idle contribution + community pull -----------------------------------
     //

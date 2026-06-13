@@ -596,11 +596,25 @@ function coveredFor(entry, frame) {
   return s;
 }
 
+// The fuzziest frame = the one with the fewest tiles (every tile is an equal
+// batch of samples, so fewest samples = most noise). Coverage is shared
+// knowledge, so every peer targets the same fuzzy frame and the swarm fills it
+// together — no per-frame histogram needed.
+function leastCoveredFrame(entry) {
+  let best = CARD_FRAME;
+  let bestN = Infinity;
+  for (let f = 0; f < N_FRAMES; f++) {
+    const n = entry.frameCov.get(f)?.size ?? 0;
+    if (n < bestN) { bestN = n; best = f; }
+  }
+  return best;
+}
+
 // Which frame to contribute to next: frame 0 until it has a baseline of tiles
-// (the thumbnail must look decent), then a uniformly random frame across the
-// whole loop so the full animation gets built.
+// (the thumbnail must look decent), then the fuzziest (least-rendered) frame,
+// so contribution flows where it's needed and the whole loop converges evenly.
 function pickFrame(entry) {
-  return entry.covered.size < FRAME0_MIN ? CARD_FRAME : Math.floor(Math.random() * N_FRAMES);
+  return entry.covered.size < FRAME0_MIN ? CARD_FRAME : leastCoveredFrame(entry);
 }
 
 function nextFreeIdx(entry, frame) {
