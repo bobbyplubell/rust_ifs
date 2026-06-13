@@ -67,9 +67,14 @@ otherwise. Votes cost compute, not identity.
 All IDs are SHA-256 over canonical bytes. All signed messages are immutable
 once published. Time divides into **generations** (5 minutes, wall-clock
 aligned; the schedule is public and needs no coordination). Population
-pressure is built in: survivors are a fixed top-K, automatic births are
-bounded by K, and submissions cost a render proof and are capped per
-(author, generation) — flock size cannot blow up with peer count. A
+pressure is built in: survivors are a fixed top-K (K=6) by **net** tally
+(votes carry a direction; a down-vote costs the same render proof and
+net-negative sheep are culled at the close), automatic births are bounded
+(cyclic pairs of survivors, plus 2 high-rate mutant clones of the top
+survivors and 1 random immigrant per active generation — all derived from
+public data, so every peer computes identical genomes), and submissions cost
+a render proof and are capped per (author, generation) — flock size cannot
+blow up with peer count. A
 work-threshold *early close* ("generation ends after V votes") is designed
 but deferred: it would make generation numbering chain-relative instead of
 clock-derived, which is a consensus step we don't take until needed.
@@ -209,6 +214,9 @@ At generation close, survivors breed deterministically:
 ```
 for each (a, b) in deterministic_pairing(survivors):
     child = mutate(crossover(a, b), rng = H("breed" ‖ gen ‖ a.id ‖ b.id))
+for each s in top-2 survivors:                     # variance injection
+    mutant = mutate(s, rate = 0.4, rng = H("mutant" ‖ gen ‖ s.id))
+immigrant = random_genome(seed = H("immigrant" ‖ gen))   # fresh blood, forever
 ```
 
 Because crossover/mutation use the deterministic `flame-core` RNG seeded only
@@ -261,8 +269,11 @@ implementations:
 - **Sync on connect:** gossip only reaches peers who are online when a message
   is published, so peers also run an anti-entropy exchange when they meet:
   compare chain-tip block hashes; on mismatch, walk back to the fork point,
-  then exchange per-generation vote/sheep inventories (sorted-hash digests or
-  bloom filters) and fetch what's missing. Every browser persists everything
+  then exchange per-generation vote/sheep inventories and fetch what's
+  missing. (Implemented today on the dev transport: each `inv` beacon carries
+  one sorted-key digest per (kind, generation) bucket; only mismatched
+  buckets exchange keys, then records — O(generations) beacon size instead of
+  O(records).) Every browser persists everything
   it has seen in IndexedDB and serves it onward — **every visitor is a
   store-and-forward node.**
 - **Ingest validation (before storing or re-gossiping):** signature valid,

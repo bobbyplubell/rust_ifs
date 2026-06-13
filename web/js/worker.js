@@ -35,6 +35,8 @@ import init, {
   audit_chunk,
   challenge_from_seed,
   breed,
+  mutate_genome,
+  random_genome_json,
   sheep_id,
   render_frame,
   proof_frame,
@@ -65,6 +67,8 @@ self.onmessage = async (event) => {
       case 'render':     await handleRender(msg); break;
       case 'audit':      handleAudit(msg); break;
       case 'breed':      handleBreed(msg); break;
+      case 'mutate':     handleMutate(msg); break;
+      case 'random-genome': handleRandomGenome(msg); break;
       case 'sheep-id':   handleSheepId(msg); break;
       case 'frame':      handleFrame(msg); break;
       case 'proof-frame': handleProofFrame(msg); break;
@@ -145,6 +149,22 @@ function handleSheepId(msg) {
 
 function handleBreed(msg) {
   const childJson = breed(msg.aJson, msg.bJson, msg.challengeHex);
+  const childId = sheep_id(childJson);
+  if (cancelled.has(msg.jobId)) return;
+  self.postMessage({ type: 'breed-done', jobId: msg.jobId, childJson, childId });
+}
+
+// Asexual variance for the generation engine: a high-rate mutant clone.
+function handleMutate(msg) {
+  const childJson = mutate_genome(msg.genomeJson, msg.challengeHex, msg.rate);
+  const childId = sheep_id(childJson);
+  if (cancelled.has(msg.jobId)) return;
+  self.postMessage({ type: 'breed-done', jobId: msg.jobId, childJson, childId });
+}
+
+// Deterministic immigrant: fresh random genome from a public seed.
+function handleRandomGenome(msg) {
+  const childJson = random_genome_json(msg.seed >>> 0, msg.transforms ?? 3);
   const childId = sheep_id(childJson);
   if (cancelled.has(msg.jobId)) return;
   self.postMessage({ type: 'breed-done', jobId: msg.jobId, childJson, childId });

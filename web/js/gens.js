@@ -8,7 +8,7 @@
 // and are capped per (author, generation) — so the flock cannot blow up with
 // peer count. Quiet generations (no votes) carry the flock forward unchanged.
 
-import { gen, SURVIVORS_K, AUTHOR_GEN_CAP, voteWeight } from './net.js';
+import { gen, SURVIVORS_K, AUTHOR_GEN_CAP, MUTANTS_PER_GEN, IMMIGRANTS_PER_GEN, voteValue } from './net.js';
 import { sha256Hex, utf8 } from './hash.js';
 
 // Canonical child challenge for a pair in generation g (ids sorted, so a pair
@@ -90,7 +90,9 @@ function nichedSurvivors(voted, k) {
  * @returns {living: Map(id -> record), genActive: number} — records carry
  *          .derived = true when they were born here rather than gossiped.
  */
-export async function computeFlock({ store, baked, breedFn, currentGen, banned = new Set() }) {
+export async function computeFlock({
+  store, baked, breedFn, mutateFn, randomFn, currentGen, banned = new Set(),
+}) {
   const current = currentGen ?? gen();
 
   // Submissions per generation, after the deterministic per-author cap
@@ -120,7 +122,7 @@ export async function computeFlock({ store, baked, breedFn, currentGen, banned =
     if (banned.has(v.voter)) continue;
     if (!tallyByGen.has(v.gen)) tallyByGen.set(v.gen, new Map());
     const t = tallyByGen.get(v.gen);
-    t.set(v.sheepId, (t.get(v.sheepId) || 0) + voteWeight(v));
+    t.set(v.sheepId, (t.get(v.sheepId) || 0) + voteValue(v));
   }
 
   let living = new Map(baked.map((r) => [r.id, r]));
@@ -138,7 +140,11 @@ export async function computeFlock({ store, baked, breedFn, currentGen, banned =
       .map((r) => [r, tally.get(r.id) || 0])
       .filter(([, c]) => c > 0)
       .sort((a, b) => b[1] - a[1] || (a[0].id < b[0].id ? -1 : 1));
-    if (!voted.length) continue; // quiet generation: carry over unchanged
+    // Down-voted to net-negative: culled outright. They cannot survive, fill,
+    // or breed this close — death is in the voters' hands too.
+    const condemned = new Set(
+      [...living.values()].filter((r) => (tally.get(r.id) || 0) < 0).map((r) => r.id));
+    if (!voted.length && !condemned.size) continue; // quiet gen: carry over unchanged
 
     // Voted sheep take survivor slots first — niched, so near-clones share
     // their votes' worth. Remaining slots (of K) fill from the unvoted living,
@@ -148,7 +154,7 @@ export async function computeFlock({ store, baked, breedFn, currentGen, banned =
     if (survivors.length < SURVIVORS_K) {
       const taken = new Set(survivors.map((r) => r.id));
       const fill = [...living.values()]
-        .filter((r) => !taken.has(r.id))
+        .filter((r) => !taken.has(r.id) && !condemned.has(r.id))
         .sort((a, b) => b.gen - a.gen || (a.id < b.id ? -1 : 1))
         .slice(0, SURVIVORS_K - survivors.length);
       survivors.push(...fill);
@@ -174,11 +180,49 @@ export async function computeFlock({ store, baked, breedFn, currentGen, banned =
       }
       children.push({
         id: child.id, genome: child.genome, parents: [a.id, b.id].sort(),
-        gen: g + 1, author: null, derived: true,
+        gen: g + 1, author: null, derived: true, origin: 'pair',
       });
     }
 
+    // Variance injection: high-rate mutant clones of the top survivors
+    // (asexual escape from the pair-breeding attractor) and a deterministic
+    // immigrant bred from nothing but the generation number — fresh blood
+    // arrives every active generation with no user action, and every peer
+    // derives the identical genomes.
+    if (mutateFn) {
+      for (const parent of survivors.slice(0, MUTANTS_PER_GEN)) {
+        const challengeHex = await sha256Hex(utf8(`mutant|${g}|${parent.id}`));
+        let child = childCache.get(challengeHex);
+        if (!child) {
+          const { childJson, childId } = await mutateFn(parent.genome, challengeHex, 0.4);
+          child = { id: childId, genome: childJson };
+          childCache.set(challengeHex, child);
+        }
+        children.push({
+          id: child.id, genome: child.genome, parents: [parent.id],
+          gen: g + 1, author: null, derived: true, origin: 'mutant',
+        });
+      }
+    }
+    if (randomFn) {
+      for (let i = 0; i < IMMIGRANTS_PER_GEN; i++) {
+        const challengeHex = await sha256Hex(utf8(`immigrant|${g}|${i}`));
+        let child = childCache.get(challengeHex);
+        if (!child) {
+          const seed = parseInt(challengeHex.slice(0, 8), 16);
+          const { childJson, childId } = await randomFn(seed);
+          child = { id: childId, genome: childJson };
+          childCache.set(challengeHex, child);
+        }
+        children.push({
+          id: child.id, genome: child.genome, parents: null,
+          gen: g + 1, author: null, derived: true, origin: 'immigrant',
+        });
+      }
+    }
+
     living = new Map([...survivors, ...children].map((r) => [r.id, r]));
+    for (const id of condemned) living.delete(id); // the swarm said no
   }
 
   // Submissions released in the current (still open) generation join the view.

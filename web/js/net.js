@@ -25,7 +25,11 @@ export const GENESIS_GEN = Math.floor(Date.parse('2026-06-12T00:00:00Z') / GEN_M
 /** Current generation (absolute number; clock-derived so peers agree without consensus). */
 export const gen = () => Math.floor(Date.now() / GEN_MS);
 /** Survivors per generation — fixes the automatic-breeding output regardless of peer count. */
-export const SURVIVORS_K = 4;
+export const SURVIVORS_K = 6;
+/** Mutant clones of top survivors per active generation (variance injection). */
+export const MUTANTS_PER_GEN = 2;
+/** Fresh random immigrants per active generation (fresh blood forever). */
+export const IMMIGRANTS_PER_GEN = 1;
 /** Deterministic per-author submissions counted per generation (lowest sheep ids win). */
 export const AUTHOR_GEN_CAP = 3;
 
@@ -40,6 +44,8 @@ export const PROOF_TIERS = {
 };
 export const PROOF_SPEC = PROOF_TIERS.std;
 export const voteWeight = (v) => PROOF_TIERS[v.tier]?.weight ?? 1;
+/** Signed tally contribution: +weight or -weight. */
+export const voteValue = (v) => (v.dir === -1 ? -1 : 1) * voteWeight(v);
 
 export const HEX64 = /^[0-9a-f]{64}$/;
 
@@ -49,8 +55,10 @@ export const HEX64 = /^[0-9a-f]{64}$/;
 // release a sheep you haven't rendered, which prices submission spam in CPU.
 export const sheepSignBytes = (r) =>
   utf8(`sheep|${r.id}|${(r.parents || []).join(',')}|${r.gen}|${r.author}|${r.chunkHashes.join(',')}`);
+// dir: +1 (keep alive) or -1 (cull). Both directions cost the full render
+// proof — you must watch a sheep to condemn it. Net-negative sheep die.
 export const voteSignBytes = (v) =>
-  utf8(`vote|${v.sheepId}|${v.gen}|${v.voter}|${v.tier}|${v.sumHash}|${v.chunkHashes.join(',')}`);
+  utf8(`vote|${v.sheepId}|${v.gen}|${v.voter}|${v.dir}|${v.tier}|${v.sumHash}|${v.chunkHashes.join(',')}`);
 
 export const voteKey = (v) => `${v.voter}:${v.sheepId}:${v.gen}`;
 
@@ -66,7 +74,7 @@ export const fraudSignBytes = (f) =>
   utf8(`fraud|${f.voteKey}|${f.frame}|${f.expected}|${f.reporter}`);
 
 /** BroadcastChannel bus name — bumped on wire-format breaks. */
-export const CHANNEL = 'sheep-net-v9';
+export const CHANNEL = 'sheep-net-v10';
 
 export class BroadcastTransport {
   constructor(channel = CHANNEL) {
@@ -128,8 +136,16 @@ export class Net {
       this.counts.recv[msg.kind] = (this.counts.recv[msg.kind] ?? 0) + 1;
       this._recv(msg).catch(console.error);
     });
+    this._dirty = true;
     await this._sendInv();
-    this._invTimer = setInterval(() => this._sendInv().catch(console.error), 5000);
+    // Jittered interval: hundreds of peers must not beacon in lockstep.
+    const tick = () => {
+      this._invTimer = setTimeout(() => {
+        this._sendInv().catch(console.error);
+        tick();
+      }, 4000 + Math.random() * 3000);
+    };
+    tick();
   }
 
   /** Peers heard from in the last 15s (not counting ourselves). */
@@ -144,6 +160,7 @@ export class Net {
 
   async publishSheep(record) {
     if (await this.store.addSheep(record)) {
+      this.markDirty();
       this._send({ kind: 'sheep', record });
       this.onSheep?.(record);
     }
@@ -152,6 +169,7 @@ export class Net {
   async publishVote(record) {
     record.key = voteKey(record);
     if (await this.store.addVote(record)) {
+      this.markDirty();
       this._send({ kind: 'vote', record });
       this.onVote?.(record);
     }
@@ -164,6 +182,7 @@ export class Net {
   async publishFraud(record) {
     record.key = fraudKey(record);
     if (await this.store.addFraud(record)) {
+      this.markDirty();
       this._send({ kind: 'fraud', record });
       this.onFraud?.(record);
     }
@@ -193,6 +212,8 @@ export class Net {
         return;
       }
       case 'inv': return this._onInv(msg);
+      case 'bucket': return this._onBucket(msg);
+      case 'want-items': return this._onWantItems(msg);
       case 'data': {
         if (msg.to !== this.pubHex) return;
         for (const r of msg.sheep || []) await this._ingestSheep(r);
@@ -216,19 +237,20 @@ export class Net {
     if (byAuthor >= AUTHOR_GEN_CAP * 3) return;
     if (!(await verify(r.author, r.sig, sheepSignBytes(r)))) return;
     if ((await this.checkSheepId(r.genome)) !== r.id) return; // forged id or non-canonical genome
-    if (await this.store.addSheep(r)) this.onSheep?.(r);
+    if (await this.store.addSheep(r)) { this.markDirty(); this.onSheep?.(r); }
   }
 
   async _ingestVote(v) {
     if (!v || !HEX64.test(v.sheepId) || !HEX64.test(v.voter) || !Number.isInteger(v.gen)) return;
     if (!HEX64.test(v.sumHash ?? '')) return; // commitment to the summed histogram
+    if (v.dir !== 1 && v.dir !== -1) return;
     const tier = PROOF_TIERS[v.tier];
     if (!tier) return;
     if (!Array.isArray(v.chunkHashes) || v.chunkHashes.length !== tier.nFrames) return;
     if (!v.chunkHashes.every((h) => HEX64.test(h))) return;
     if (!(await verify(v.voter, v.sig, voteSignBytes(v)))) return;
     v.key = voteKey(v);
-    if (await this.store.addVote(v)) this.onVote?.(v);
+    if (await this.store.addVote(v)) { this.markDirty(); this.onVote?.(v); }
   }
 
   /** A fraud claim is believed only after we verify it OURSELVES: check both
@@ -253,29 +275,121 @@ export class Net {
     const actual = await this.checkFrameHash(sheep.genome, challenge, f.frame, v.tier);
     if (actual !== f.expected || actual === v.chunkHashes[f.frame]) return; // false accusation
     f.key = fraudKey(f);
-    if (await this.store.addFraud(f)) this.onFraud?.(f);
+    if (await this.store.addFraud(f)) { this.markDirty(); this.onFraud?.(f); }
   }
 
   // -- anti-entropy ------------------------------------------------------------
 
+  // ---- digest-first anti-entropy --------------------------------------------
+  //
+  // Broadcasting full key lists is O(peers x records) and was projected to be
+  // the first thing to drown a large swarm. Instead, inv carries one short
+  // digest per (kind, generation) bucket; only mismatched buckets exchange
+  // keys, and only missing records move.
+
+  _genOf(kind, rec) {
+    if (kind === 'sheep') return rec.gen ?? 0;
+    if (kind === 'votes') return rec.gen ?? 0;
+    return Number(rec.key?.split(':')[2] ?? 0); // fraud key = voter:sheep:gen:frame
+  }
+
+  async _buckets() {
+    if (this._bucketCache && !this._dirty) return this._bucketCache;
+    const out = { sheep: new Map(), votes: new Map(), fraud: new Map() };
+    const add = (kind, gen, key) => {
+      if (!out[kind].has(gen)) out[kind].set(gen, []);
+      out[kind].get(gen).push(key);
+    };
+    for (const r of await this.store.allSheep()) {
+      if (!r.baked) add('sheep', this._genOf('sheep', r), r.id);
+    }
+    for (const v of await this.store.allVotes()) add('votes', this._genOf('votes', v), v.key);
+    for (const f of await this.store.allFraud()) add('fraud', this._genOf('fraud', f), f.key);
+    const digests = { sheep: {}, votes: {}, fraud: {} };
+    for (const kind of ['sheep', 'votes', 'fraud']) {
+      for (const [g, keys] of out[kind]) {
+        keys.sort();
+        digests[kind][g] = (await sha256Hex(utf8(keys.join(',')))).slice(0, 16);
+      }
+    }
+    this._bucketCache = { keys: out, digests };
+    this._dirty = false;
+    return this._bucketCache;
+  }
+
+  markDirty() {
+    this._dirty = true;
+  }
+
   async _sendInv() {
-    const sheep = (await this.store.allSheep()).filter((r) => !r.baked).map((r) => r.id);
-    const votes = (await this.store.allVotes()).map((v) => v.key);
-    const fraud = (await this.store.allFraud()).map((f) => f.key);
-    this._send({ kind: 'inv', from: this.pubHex, sheep, votes, fraud });
+    const { digests } = await this._buckets();
+    this._send({ kind: 'inv', from: this.pubHex, d: digests });
   }
 
   async _onInv(msg) {
-    if (!msg.from || msg.from === this.pubHex) return;
+    if (!msg.from || msg.from === this.pubHex || !msg.d) return;
     this.peers.set(msg.from, Date.now());
-    const theirSheep = new Set(msg.sheep || []);
-    const theirVotes = new Set(msg.votes || []);
-    const theirFraud = new Set(msg.fraud || []);
-    const sheep = (await this.store.allSheep()).filter((r) => !r.baked && !theirSheep.has(r.id));
-    const votes = (await this.store.allVotes()).filter((v) => !theirVotes.has(v.key));
-    const fraud = (await this.store.allFraud()).filter((f) => !theirFraud.has(f.key));
-    if (sheep.length || votes.length || fraud.length) {
-      this._send({ kind: 'data', to: msg.from, sheep, votes, fraud });
+    const { keys, digests } = await this._buckets();
+    // For every bucket where we differ (or they lack one we have), send our
+    // keys for that bucket; the peer diffs and ships/requests records.
+    let sent = 0;
+    for (const kind of ['sheep', 'votes', 'fraud']) {
+      const gens = new Set([
+        ...Object.keys(digests[kind]),
+        ...Object.keys(msg.d[kind] ?? {}),
+      ]);
+      for (const g of gens) {
+        if (sent >= 4) return; // bound per-inv repair work
+        if (digests[kind][g] !== (msg.d[kind] ?? {})[g]) {
+          this._send({
+            kind: 'bucket', to: msg.from, what: kind, gen: Number(g),
+            keys: keys[kind].get(Number(g)) ?? [],
+          });
+          sent++;
+        }
+      }
+    }
+  }
+
+  async _onBucket(msg) {
+    if (msg.to !== this.pubHex) return;
+    const { keys } = await this._buckets();
+    const mine = new Set(keys[msg.what]?.get(msg.gen) ?? []);
+    const theirs = new Set(msg.keys ?? []);
+    // Ship records they lack.
+    const lack = [...mine].filter((k) => !theirs.has(k));
+    if (lack.length) {
+      const lackSet = new Set(lack);
+      const payload = { kind: 'data', to: msg.from, sheep: [], votes: [], fraud: [] };
+      if (msg.what === 'sheep') {
+        payload.sheep = (await this.store.allSheep()).filter((r) => lackSet.has(r.id));
+      } else if (msg.what === 'votes') {
+        payload.votes = (await this.store.allVotes()).filter((v) => lackSet.has(v.key));
+      } else {
+        payload.fraud = (await this.store.allFraud()).filter((f) => lackSet.has(f.key));
+      }
+      this._send(payload);
+    }
+    // Request records we lack (they answer with 'data').
+    const want = [...theirs].filter((k) => !mine.has(k));
+    if (want.length) {
+      this._send({ kind: 'want-items', to: msg.from, what: msg.what, keys: want });
+    }
+  }
+
+  async _onWantItems(msg) {
+    if (msg.to !== this.pubHex) return;
+    const wanted = new Set(msg.keys ?? []);
+    const payload = { kind: 'data', to: msg.from, sheep: [], votes: [], fraud: [] };
+    if (msg.what === 'sheep') {
+      payload.sheep = (await this.store.allSheep()).filter((r) => wanted.has(r.id));
+    } else if (msg.what === 'votes') {
+      payload.votes = (await this.store.allVotes()).filter((v) => wanted.has(v.key));
+    } else {
+      payload.fraud = (await this.store.allFraud()).filter((f) => wanted.has(f.key));
+    }
+    if (payload.sheep.length || payload.votes.length || payload.fraud.length) {
+      this._send(payload);
     }
   }
 }

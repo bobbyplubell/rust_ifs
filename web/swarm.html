@@ -80,6 +80,10 @@
     }
     const breedFn = (aJson, bJson, challengeHex) =>
       pool.submit({ type: 'breed', aJson, bJson, challengeHex }).done;
+    const mutateFn = (genomeJson, challengeHex, rate) =>
+      pool.submit({ type: 'mutate', genomeJson, challengeHex, rate }).done;
+    const randomFn = (seed) =>
+      pool.submit({ type: 'random-genome', seed }).done;
 
     const fmtWork = (samples) =>
       samples >= 1e9 ? `${(samples / 1e9).toFixed(1)}B pts`
@@ -91,7 +95,9 @@
         store.allVotes(), store.allSheep(), store.allFraud(),
       ]);
       const banned = new Set(fraud.map((f) => f.vote.voter));
-      const { living } = await computeFlock({ store, baked, breedFn, banned });
+      const { living } = await computeFlock({
+        store, baked, breedFn, mutateFn, randomFn, banned,
+      });
 
       const peers = new Map(); // pubHex -> stats
       const peer = (k) => {

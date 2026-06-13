@@ -57,14 +57,20 @@
 
     <h2>generations</h2>
     <p>
-      Every 5 minutes a generation closes. The top sheep by votes survive; they
-      pair up and their children are born. Nobody computes this for you — every
-      browser derives the same survivors and the same children from the same
-      votes, because breeding is deterministic too. That's also why the
-      breeding preview is honest: pick any two living sheep and you see
-      <em>the exact child</em> they would have this generation, before it's
-      born. Releasing a sheep you bred costs a render proof, which doubles as
-      your vote for it.
+      Every 5 minutes a generation closes. The top sheep by net votes survive;
+      they pair up and their children are born. Death is in your hands too:
+      the ✕ button is a vote <em>against</em> — it costs the same render proof
+      as a vote for (you must watch a sheep to condemn it), and any sheep
+      voted net-negative is culled at the close. Each active generation also
+      births two high-rate <em>mutant</em> clones of the top survivors and one
+      <em>immigrant</em> — a fresh random genome derived from nothing but the
+      generation number — so the gene pool never stagnates. Nobody computes
+      any of this for you — every browser derives the same survivors,
+      mutants, immigrants and children from the same votes, because breeding
+      is deterministic too. That's also why the breeding preview is honest:
+      pick any two living sheep and you see <em>the exact child</em> they
+      would have this generation, before it's born. Releasing a sheep you
+      bred costs a render proof, which doubles as your vote for it.
     </p>
 
     <h2>the swarm</h2>

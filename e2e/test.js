@@ -174,7 +174,7 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
       const chunkHashes = Array.from({ length: PROOF_SPEC.nFrames }, (_, i) =>
         (i % 10).toString().repeat(64)); // garbage, but well-formed
       const record = {
-        sheepId, gen: gen(), voter, tier: 'std',
+        sheepId, gen: gen(), voter, dir: 1, tier: 'std',
         sumHash: 'ab'.repeat(32), // garbage commitment, well-formed
         chunkHashes,
       };
@@ -258,25 +258,44 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
     const store = {
       allSheep: async () => [],
       allVotes: async () => [{
-        sheepId: baked[0].id, gen: g, voter: 'f'.repeat(64),
+        sheepId: baked[0].id, gen: g, voter: 'f'.repeat(64), dir: 1,
         chunkHashes: [], key: `x:${baked[0].id}:${g}`,
+      }, {
+        sheepId: baked[1].id, gen: g, voter: 'e'.repeat(64), dir: -1,
+        chunkHashes: [], key: `y:${baked[1].id}:${g}`,
       }],
     };
     const breedFn = async (aJson, bJson, challengeHex) => {
       const childJson = wasm.breed(aJson, bJson, challengeHex);
       return { childJson, childId: wasm.sheep_id(childJson) };
     };
-    const { living } = await computeFlock({ store, baked, breedFn, currentGen: g + 1 });
+    const mutateFn = async (genomeJson, challengeHex, rate) => {
+      const childJson = wasm.mutate_genome(genomeJson, challengeHex, rate);
+      return { childJson, childId: wasm.sheep_id(childJson) };
+    };
+    const randomFn = async (seed) => {
+      const childJson = wasm.random_genome_json(seed, 3);
+      return { childJson, childId: wasm.sheep_id(childJson) };
+    };
+    const { living } = await computeFlock({
+      store, baked, breedFn, mutateFn, randomFn, currentGen: g + 1,
+    });
     const records = [...living.values()];
     return {
       size: records.length,
       born: records.filter((r) => r.derived).length,
+      mutants: records.filter((r) => r.origin === 'mutant').length,
+      immigrants: records.filter((r) => r.origin === 'immigrant').length,
       votedSurvives: living.has(baked[0].id),
+      condemnedDead: !living.has(baked[1].id),
     };
   });
   check('gen close with one vote breeds children',
     result.votedSurvives && result.born >= 3 && result.size >= 7,
     `living=${result.size}, born=${result.born}, voted-survives=${result.votedSurvives}`);
+  check('net-negative sheep is culled; mutants + immigrant are born',
+    result.condemnedDead && result.mutants === 2 && result.immigrants === 1,
+    `condemned-dead=${result.condemnedDead}, mutants=${result.mutants}, immigrants=${result.immigrants}`);
   await page.close();
 }
 

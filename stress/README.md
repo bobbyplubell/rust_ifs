@@ -23,7 +23,9 @@ animation loop, ~41M samples); peers audit each other by re-rendering random
 frames, and verified fraud bans a key everywhere. Voters' summed render
 histograms are fetchable and verifiable (content-addressed by the vote), so
 displayed quality accumulates across voters. Generations close every 5
-minutes; top-4 by (niched) tally breed deterministically on every client.
+minutes; top-6 by (niched) net tally breed deterministically on every client,
+down-votes cull net-negative sheep, and each active generation also derives
+2 mutant clones + 1 random immigrant (deterministic, no consensus needed).
 Transport today: BroadcastChannel (same-profile pages = a real swarm);
 js-libp2p transport exists behind the same interface for the internet phase.
 
@@ -55,11 +57,13 @@ actions under the render semaphore and emits JSONL to `stress/out.jsonl`.
 Numbers from the design review (the point of the test is to confirm and
 quantify these on real hardware):
 
-1. **Inventory flooding — expected first failure.** Every peer broadcasts its
-   full vote-key list every 5 s (`inv`). Watch `sentBytesMed` and `invSentMed`
-   grow O(peers × votes). The fix on deck: generation-block digest sync
-   (compare one hash per gen, drill down on mismatch) + pairwise instead of
-   broadcast anti-entropy. ARCHITECTURE.md "Generation block" section.
+1. **Inventory cost.** inv is now digest-based (one 16-hex digest per
+   (kind, generation) bucket, jittered 4–7 s; mismatched buckets exchange
+   keys via addressed `bucket`/`want-items`, then records). This replaced
+   full-key-list broadcasts, the projected first failure at scale — the test
+   should CONFIRM `sentBytesMed`/`invSentMed` now stay near-flat as votes
+   accumulate, and that repair still converges (bounded to 4 bucket repairs
+   per inv received).
 2. **Store growth.** `votes` per peer never shrinks (pruning designed, not
    implemented — finality via generation blocks lets vote bodies drop).
 3. **Sum-serving fan-out.** `want-sum`/`sum-data` ride the broadcast bus;
@@ -96,4 +100,4 @@ quantify these on real hardware):
 - `e2e/run.sh` full functional suite (Playwright-in-Docker) — run after ANY
   change; `relay/` the libp2p relay (Docker) for the internet phase
 - Wire format: bump `CHANNEL` + store names in web/js/{net,store}.js together
-  on breaking changes (currently v9)
+  on breaking changes (currently v10)

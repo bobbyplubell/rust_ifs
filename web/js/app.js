@@ -8,7 +8,7 @@ import { loadIdentity, sign, PEER_NS } from './identity.js';
 import { openStore } from './store.js';
 import {
   Net, BroadcastTransport, CompositeTransport, gen, GEN_MS, GENESIS_GEN,
-  PROOF_SPEC, PROOF_TIERS, voteWeight,
+  PROOF_SPEC, PROOF_TIERS, voteValue,
   sheepSignBytes, voteSignBytes, voteChallenge,
 } from './net.js';
 import { computeFlock, breedChallenge } from './gens.js';
@@ -39,7 +39,7 @@ const boostedSpec = (tier) => ({
 
 const cards = new Map();   // sheepId -> {record, canvas, tallyEl, voteBtn, card}
 const tallies = new Map(); // sheepId -> Set of vote keys
-const voteWeights = new Map(); // vote key -> tier weight
+const voteWeights = new Map(); // vote key -> signed tally value (+/- tier weight)
 const voteRecords = new Map(); // vote key -> full record (for sumHash verification)
 const sumRequested = new Set(); // vote keys we've asked the swarm for
 let sumsReceived = 0;
@@ -131,7 +131,7 @@ async function main() {
           (e) => !e.voteBtn.disabled && !e.votePending);
         if (!open.length) return null;
         const entry = open[Math.floor(Math.random() * open.length)];
-        await vote(entry);
+        await vote(entry, Math.random() < 0.2 ? -1 : 1);
         return entry.record.id;
       },
       // Breed two random living sheep and release the child (full proof).
@@ -160,7 +160,7 @@ async function main() {
         record.sig = await sign(me.pair, sheepSignBytes(record));
         await net.publishSheep(record);
         const voteRec = {
-          sheepId: bred.childId, gen: g, voter: me.pubHex, tier: 'std',
+          sheepId: bred.childId, gen: g, voter: me.pubHex, dir: 1, tier: 'std',
           sumHash: res.sumHash, chunkHashes: res.hashes,
         };
         voteRec.sig = await sign(me.pair, voteSignBytes(voteRec));
@@ -185,7 +185,7 @@ async function main() {
           }
           return [id, w];
         })
-        .filter(([, w]) => w > 0)
+        .filter(([, w]) => w !== 0)
         .sort();
       return {
         peer: PEER_NS, gen: g - GENESIS_GEN,
@@ -211,6 +211,10 @@ async function main() {
 
 // ---- generation engine glue --------------------------------------------------
 
+const mutateFn = (genomeJson, challengeHex, rate) =>
+  pool.submit({ type: 'mutate', genomeJson, challengeHex, rate }).done;
+const randomFn = (seed) =>
+  pool.submit({ type: 'random-genome', seed }).done;
 const breedFn = (aJson, bJson, challengeHex) =>
   pool.submit({ type: 'breed', aJson, bJson, challengeHex }).done;
 
@@ -224,7 +228,9 @@ function scheduleRebuild() {
 // changed cards re-render (renders are the expensive part).
 async function rebuildFlock() {
   bannedVoters = new Set((await store.allFraud()).map((f) => f.vote.voter));
-  const { living } = await computeFlock({ store, baked, breedFn, banned: bannedVoters });
+  const { living } = await computeFlock({
+    store, baked, breedFn, mutateFn, randomFn, banned: bannedVoters,
+  });
   for (const [id, entry] of cards) {
     if (!living.has(id)) {
       if (spinning?.entry === entry) { spinning.stop = true; spinning = null; }
@@ -277,7 +283,11 @@ function addCard(record) {
   spinBtn.textContent = 'spin';
   const voteBtn = document.createElement('button');
   voteBtn.textContent = 'vote';
-  meta.append(label, tallyEl, spinBtn, voteBtn);
+  const cullBtn = document.createElement('button');
+  cullBtn.textContent = '\u2715';
+  cullBtn.title = 'vote against \u2014 same render proof as a vote; ' +
+    'net-negative sheep are culled at the generation close';
+  meta.append(label, tallyEl, spinBtn, voteBtn, cullBtn);
   const bar = document.createElement('div');
   bar.className = 'bar';
   const barFill = document.createElement('div');
@@ -286,13 +296,14 @@ function addCard(record) {
   card.append(canvas, bar, meta);
   $('#flock').append(card);
 
-  const entry = { record, canvas, tallyEl, spinBtn, voteBtn, card, barFill };
+  const entry = { record, canvas, tallyEl, spinBtn, voteBtn, cullBtn, card, barFill };
   cards.set(record.id, entry);
   updateTally(record.id);
 
   canvas.addEventListener('click', () => toggleSelect(record.id));
   spinBtn.addEventListener('click', () => toggleSpin(entry).catch(showError));
-  voteBtn.addEventListener('click', () => vote(entry).catch(showError));
+  voteBtn.addEventListener('click', () => vote(entry, 1).catch(showError));
+  cullBtn.addEventListener('click', () => vote(entry, -1).catch(showError));
 
   entry.boostTier = 0;
   drawProgressively(canvas, record.genome, `view|${record.id}`).catch(showError);
@@ -501,14 +512,16 @@ function stopReplay(entry) {
 
 // ---- voting ----------------------------------------------------------------
 
-async function vote(entry) {
+async function vote(entry, dir = 1) {
   const tier = 'std';
+  const btn = dir === 1 ? entry.voteBtn : entry.cullBtn;
   if (spinning?.entry === entry) stopSpin();
   const g = gen();
   const myKey = `${me.pubHex}:${entry.record.id}:${g}`;
   if (tallies.get(entry.record.id)?.has(myKey)) return; // already voted this gen
 
   entry.voteBtn.disabled = true;
+  entry.cullBtn.disabled = true;
   entry.votePending = true;
   stopReplay(entry);
   // The proof render IS watching the sheep: your personal challenge, one full
@@ -518,7 +531,7 @@ async function vote(entry) {
   const res = await renderLoopProof(
     entry.canvas, entry.record.genome, challengeHex,
     (d, n) => {
-      entry.voteBtn.textContent = `${d}/${n}`;
+      btn.textContent = `${d}/${n}`;
       entry.barFill.style.width = `${(100 * d) / n}%`;
     },
     PROOF_TIERS[tier],
@@ -528,11 +541,13 @@ async function vote(entry) {
   if (!res) {
     entry.voteBtn.disabled = false;
     entry.voteBtn.textContent = 'vote';
+    entry.cullBtn.disabled = false;
+    entry.cullBtn.textContent = '\u2715';
     return;
   }
 
   const record = {
-    sheepId: entry.record.id, gen: g, voter: me.pubHex, tier,
+    sheepId: entry.record.id, gen: g, voter: me.pubHex, dir, tier,
     sumHash: res.sumHash, chunkHashes: res.hashes,
   };
   record.sig = await sign(me.pair, voteSignBytes(record));
@@ -545,7 +560,7 @@ async function vote(entry) {
   if (!entry.sumAccum) { entry.sumAccum = new Float64Array(cells); entry.sumCount = 0; }
   for (let k = 0; k < cells; k++) entry.sumAccum[k] += res.sum[k];
   entry.sumCount++;
-  entry.voteBtn.textContent = 'voted ✓';
+  btn.textContent = dir === 1 ? 'voted ✓' : 'culled ✗';
   startReplay(entry, res.frames);
   requestSums(entry.record.id);
 }
@@ -553,7 +568,7 @@ async function vote(entry) {
 function bumpTally(v, quiet) {
   if (!tallies.has(v.sheepId)) tallies.set(v.sheepId, new Set());
   tallies.get(v.sheepId).add(v.key);
-  voteWeights.set(v.key, voteWeight(v));
+  voteWeights.set(v.key, voteValue(v));
   voteRecords.set(v.key, v);
   if (!quiet) updateTally(v.sheepId);
 }
@@ -565,17 +580,18 @@ function updateTally(sheepId) {
   // Display this generation's weighted votes, excluding discredited voters.
   const g = gen();
   let now = 0;
-  let mine = false;
+  let mine = 0; // my vote's direction this gen, 0 if none
   if (set) {
     for (const k of set) {
       if (!k.endsWith(`:${g}`)) continue;
       const voter = k.split(':')[0];
       if (bannedVoters.has(voter)) continue;
       now += voteWeights.get(k) ?? 1;
-      if (voter === me.pubHex) mine = true;
+      if (voter === me.pubHex) mine = voteRecords.get(k)?.dir ?? 1;
     }
   }
-  entry.tallyEl.textContent = now ? `${now} ♥` : '';
+  entry.tallyEl.textContent =
+    now > 0 ? `${now} ♥` : now < 0 ? `${now} ☠` : '';
   // Re-render deeper when the tally crosses a boost step (skip while a proof
   // is rendering or the card is replaying the user's own proof loop).
   const tier = boostTier(now);
@@ -586,11 +602,17 @@ function updateTally(sheepId) {
       undefined, boostedSpec(tier)).catch(showError);
   }
   if (mine) {
-    if (!entry.votePending) entry.voteBtn.textContent = 'voted ✓';
+    if (!entry.votePending) {
+      (mine === 1 ? entry.voteBtn : entry.cullBtn).textContent =
+        mine === 1 ? 'voted ✓' : 'culled ✗';
+    }
     entry.voteBtn.disabled = true;
+    entry.cullBtn.disabled = true;
   } else if (!entry.votePending) {
     entry.voteBtn.textContent = 'vote';
     entry.voteBtn.disabled = false;
+    entry.cullBtn.textContent = '\u2715';
+    entry.cullBtn.disabled = false;
   }
 }
 
@@ -660,7 +682,7 @@ async function breedSelected() {
     await net.publishSheep(record);
 
     const voteRec = {
-      sheepId: childId, gen: rg, voter: me.pubHex, tier: 'std',
+      sheepId: childId, gen: rg, voter: me.pubHex, dir: 1, tier: 'std',
       sumHash: res.sumHash, chunkHashes,
     };
     voteRec.sig = await sign(me.pair, voteSignBytes(voteRec));

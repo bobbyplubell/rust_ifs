@@ -34,6 +34,20 @@ export function provenance(record) {
     return { who: record.name || 'seed flock', how: 'seed flock · generation 0' };
   }
   if (record.derived) {
+    if (record.origin === 'mutant') {
+      return {
+        who: `mutant g${g}`,
+        how: `born by mutation in generation ${g}: a high-rate mutant clone ` +
+          `of top survivor ${record.parents[0].slice(0, 8)}`,
+      };
+    }
+    if (record.origin === 'immigrant') {
+      return {
+        who: `immigrant g${g}`,
+        how: `arrived in generation ${g}: a fresh random genome derived ` +
+          'deterministically from the generation number — no parents, no author',
+      };
+    }
     return {
       who: `selection g${g}`,
       how: `born by natural selection in generation ${g}: survivor pairing ` +
