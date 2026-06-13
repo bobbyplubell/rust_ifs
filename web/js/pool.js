@@ -106,6 +106,7 @@ export class WorkerPool {
         break;
       case 'done':
       case 'breed-done':
+      case 'batch-done':
         this._finish(slot, msg, null);
         break;
       case 'error':

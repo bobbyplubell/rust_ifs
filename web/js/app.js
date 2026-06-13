@@ -76,8 +76,13 @@ async function main() {
     }
   }
 
+  // Resolve a sheep's genome from the live flock (cards hold every living
+  // sheep, incl. derived children that aren't store facts), then baked, then
+  // store — without the cards path peers drop batches for bred children.
   const lookupSheep = async (id) =>
-    baked.find((s) => s.id === id) ?? (await store.allSheep()).find((s) => s.id === id);
+    cards.get(id)?.record
+    ?? baked.find((s) => s.id === id)
+    ?? (await store.allSheep()).find((s) => s.id === id);
 
   net = new Net({
     transport: new CompositeTransport(transports),
@@ -108,6 +113,8 @@ async function main() {
     sign,
     isBanned: (pub) => net.isBanned(pub),
     onUpdate: () => updateStatus(),
+    intervalMs: Number(params.get('auditms')) || 8000, // tests can speed audits
+    lookupSheep, // resolve derived children too
   });
 
   // Seed the baked gen-0 flock from the static manifest (local only, not
@@ -122,15 +129,19 @@ async function main() {
     });
   }
 
+  // Install hooks before the (awaited) flock build so tests/harnesses that
+  // wait on a card don't race the hook assignment.
+  installDebugHooks();
+  if (params.get('stress')) installStressHooks();
+
   await rebuildFlock();
   await net.start();
   banned = net.banned;
   if (!params.get('noaudit')) auditor.start();
 
-  installDebugHooks();
-  if (params.get('stress')) installStressHooks();
-
-  startContributeLoop();
+  // ?nocontribute: a pure auditor/viewer peer (tests use this so an audit peer
+  // keeps its pool free instead of constantly contributing).
+  if (!params.get('nocontribute')) startContributeLoop();
 
   shownGen = gen();
   setInterval(() => {
@@ -708,7 +719,7 @@ function installStressHooks() {
     }
     const t = [...tally.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
     return {
-      peer: PEER_NS, gen: g - GENESIS_GEN,
+      peer: PEER_NS, pub: me.pubHex, gen: g - GENESIS_GEN,
       sheep: sheep.length, batches: batches.length, fraud: fraud.length,
       cards: cards.size, renders: renderKeys.length,
       audits: auditor.stats.audits, frauds: auditor.stats.frauds,
@@ -716,6 +727,17 @@ function installStressHooks() {
       tallyFingerprint: await sha256Hex(utf8(JSON.stringify(t))),
     };
   };
+
+  // Expose the verification gate so the e2e can prove directly that a forged
+  // render (bytes that don't match the claimed batches) is rejected.
+  // Resolve a sheep's genome from the live flock (cards hold every living
+  // sheep, incl. derived children that aren't store facts), then baked, then
+  // store — without the cards path peers drop batches for bred children.
+  const lookupSheep = async (id) =>
+    cards.get(id)?.record
+    ?? baked.find((s) => s.id === id)
+    ?? (await store.allSheep()).find((s) => s.id === id);
+  window.__sheepVerify = (arg) => verifyRender(lookupSheep, arg);
 }
 
 main().catch(showError);

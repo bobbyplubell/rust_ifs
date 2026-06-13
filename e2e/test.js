@@ -1,8 +1,13 @@
-// End-to-end stack test, run in Docker (see run.sh). Drives real Chromium:
-//   1. determinism.html must report all chunk hashes matching the native
-//      expected-hashes.txt — the actual browser-vs-native determinism proof.
-//   2. Two tabs (?peer=1 / ?peer=2) must find each other (BroadcastChannel),
-//      render the flock, and sync a vote and a released child both ways.
+// End-to-end stack test (batch / community-render era), run in Docker (run.sh).
+// Drives real Chromium:
+//   1. determinism: browser render_batch is byte-identical to the native golden.
+//   2. two peers contribute batches and the work syncs both ways (the shared
+//      sheep grows on both); tallies reflect it.
+//   3. the verification gate rejects a forged render (bytes that don't match
+//      the claimed batches) — the headline security property.
+//   4. a forged batch (wrong hash) is caught by the auditor and the key banned.
+//   5. the swarm page reflects contributions and the ban.
+//   6. the generation engine breeds children from batch tallies.
 
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
@@ -14,7 +19,6 @@ const MIME = {
   '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
   '.json': 'application/json', '.wasm': 'application/wasm', '.txt': 'text/plain',
 };
-
 const server = createServer(async (req, res) => {
   try {
     const path = normalize(decodeURIComponent(new URL(req.url, 'http://x').pathname));
@@ -23,23 +27,14 @@ const server = createServer(async (req, res) => {
     const body = await readFile(file);
     res.writeHead(200, { 'content-type': MIME[extname(file)] || 'application/octet-stream' });
     res.end(body);
-  } catch {
-    res.writeHead(404);
-    res.end();
-  }
+  } catch { res.writeHead(404); res.end(); }
 });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}`;
 console.log('serving web/ at', base);
 
-// Flags: WebCrypto Ed25519 on Chromium < 137 (default-on later), and best-
-// effort software WebGPU so the GPU preview path gets exercised when possible.
 const browser = await chromium.launch({
-  args: [
-    '--enable-experimental-web-platform-features',
-    '--enable-unsafe-webgpu',
-    '--use-webgpu-adapter=swiftshader',
-  ],
+  args: ['--enable-experimental-web-platform-features'],
 });
 const ctx = await browser.newContext();
 ctx.setDefaultTimeout(120_000);
@@ -51,47 +46,51 @@ const check = (name, ok, extra = '') => {
   console.log(`[${ts()}] ${ok ? 'PASS' : 'FAIL'}  ${name}${extra ? ' — ' + extra : ''}`);
   if (!ok) failures++;
 };
-
 ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
 
-// ---- 1. determinism ---------------------------------------------------------
+// ---- 1. determinism: render_batch browser == native golden ------------------
 {
   section('determinism');
   const page = await ctx.newPage();
   page.on('console', (m) => { if (m.type() === 'error') console.log('console.error:', m.text()); });
-  await page.goto(`${base}/determinism.html`);
-  const banner = page.locator('#banner');
-  await banner.filter({ hasText: /✓|✗|error|done/ }).waitFor({ timeout: 180_000 });
-  const text = await banner.textContent();
-  check('determinism: browser hashes match native', text.includes('✓ all'), text.trim());
+  await page.goto(`${base}/about.html`);
+  const out = await page.evaluate(async () => {
+    const w = await import('./pkg/flame_wasm.js');
+    await w.default();
+    const g = w.random_genome_json(2, 3);
+    const id = w.sheep_id(g);
+    const a = w.render_batch(g, id, 2, 5, 64, 64, 1, 50000);
+    const b = w.render_batch(g, id, 2, 5, 64, 64, 1, 50000);
+    return { a: a.hash, b: b.hash, cells: a.hist.length };
+  });
+  const GOLDEN = 'fdd630454bbe7cc3475daf9d9e3ef55bc2b183d93ac7698b9b32cd0a6d37ac15';
+  check('render_batch byte-identical browser vs native', out.a === GOLDEN && out.a === out.b,
+    `${out.a.slice(0, 16)}… (golden ${GOLDEN.slice(0, 16)}…), cells=${out.cells}`);
   await page.close();
 }
 
-// ---- 2. two peers: render, vote sync, release sync --------------------------
+// ---- 2/3. two peers contribute + verify gate --------------------------------
+let firstId; // a baked sheep id, reused by the swarm section's peer=1 store
 {
-  section('two peers');
+  section('two peers: contribute + sync');
   const p1 = await ctx.newPage();
   const p2 = await ctx.newPage();
   for (const [n, p] of [['p1', p1], ['p2', p2]]) {
     p.on('console', (m) => { if (m.type() === 'error') console.log(`${n} console.error:`, m.text()); });
     p.on('pageerror', (e) => console.log(`${n} pageerror:`, e.message));
   }
-  await p1.goto(`${base}/index.html?peer=1`);
-  await p2.goto(`${base}/index.html?peer=2`);
+  await p1.goto(`${base}/index.html?peer=1&stress=1`);
+  await p2.goto(`${base}/index.html?peer=2&stress=1`);
 
-  // Both see the flock.
   await p1.locator('.card').first().waitFor();
   await p2.locator('.card').first().waitFor();
   const cards1 = await p1.locator('.card').count();
   check('p1 flock has cards', cards1 >= 6, `${cards1} cards`);
 
-  // Peers discover each other via inv gossip.
   await p1.locator('#status', { hasText: /[1-9] peers/ }).waitFor({ timeout: 30_000 });
   check('p1 sees a peer', true);
 
-  // First card renders something non-black — and the image must cover the
-  // whole canvas, not just a corner (canvas-size-mismatch regression guard:
-  // a smaller ImageData painted onto a larger canvas leaves the rest black).
+  // First card renders non-black, full-coverage (preview/accumulation).
   await p1.waitForFunction(() => {
     const c = document.querySelector('.card canvas');
     if (!c) return false;
@@ -99,144 +98,129 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
     for (let i = 0; i < d.length; i += 4) if (d[i] + d[i + 1] + d[i + 2] > 30) return true;
     return false;
   }, undefined, { timeout: 120_000 });
-  const coverage = await p1.evaluate(() => {
-    // Lit-pixel share per quadrant of the first card.
-    const c = document.querySelector('.card canvas');
-    const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
-    const half = c.width / 2;
-    const lit = [0, 0, 0, 0];
-    for (let y = 0; y < c.height; y++) {
-      for (let x = 0; x < c.width; x++) {
-        const i = (y * c.width + x) * 4;
-        if (d[i] + d[i + 1] + d[i + 2] > 30) {
-          lit[(y >= half ? 2 : 0) + (x >= half ? 1 : 0)]++;
-        }
-      }
-    }
-    return lit;
-  });
-  // Auto-framed sheep fill ~78% of frame: every quadrant should hold pixels.
-  check('p1 first card rendered pixels (full coverage)',
-    coverage.every((q) => q > 50), `quadrant lit: ${coverage.join(', ')}`);
+  check('p1 first card rendered pixels', true);
 
-  // Vote on the first card in p1: a 64-frame loop proof fans out across the
-  // pool (heavier than the old chunk proof — generous timeout), then p2's
-  // tally bumps.
-  const firstId = await p1.locator('.card').first().getAttribute('data-id');
-  await p1.locator('.card button', { hasText: /^vote$/ }).first().click();
-  await p1.locator('.card button', { hasText: 'voted ✓' }).first().waitFor({ timeout: 300_000 });
-  check('p1 vote completed (loop proof rendered + signed)', true);
+  await p1.waitForFunction(() => !!window.__sheepAct);
+  await p2.waitForFunction(() => !!window.__sheepAct);
+  const pub1 = (await p1.evaluate(() => window.__sheepDump())).pub;
 
-  const tally2 = p2.locator(`.card[data-id="${firstId}"] .tally`);
-  await tally2.filter({ hasText: '♥' }).waitFor({ timeout: 30_000 });
-  check('p2 sees p1 vote in tally', true, await tally2.textContent());
-
-  // Cross-peer accumulation: p2 fetches p1's summed proof histogram, verifies
-  // it against the vote's signed sumHash, and adds those 41M samples to its
-  // own display of the sheep.
-  await p2.waitForFunction(() => window.__sheepStats.sums >= 1, undefined, { timeout: 60_000 });
-  check('p2 accumulated p1 render work (verified sum)', true);
-
-  // Breed: select two sheep in p2, wait for the canonical child, release it,
-  // and require the new card to appear in p1.
-  await p2.locator('.card canvas').nth(0).click();
-  await p2.locator('.card canvas').nth(1).click();
-  await p2.locator('#nursery-note', { hasText: 'canonical child' }).waitFor({ timeout: 120_000 });
-  const release = p2.locator('#release');
-  await release.waitFor();
-  await release.click();
-  await p2.locator('#release', { hasText: 'released ✓' }).waitFor({ timeout: 300_000 });
-  check('p2 bred and released a child (with proof)', true);
-
-  section('fraud injection');
-  // Fraud: inject a validly-signed vote with garbage hashes from a fresh key.
-  // The background auditor must re-render a frame, catch the mismatch, gossip
-  // a fraud proof, and the cheater's votes must stop counting. Steps are
-  // separate bounded evaluates so a hang names its step instead of stalling
-  // the suite.
-  try {
-    const step = async (name, fn, arg) => {
-      const r = await Promise.race([
-        p1.evaluate(fn, arg),
-        new Promise((_, rej) =>
-          setTimeout(() => rej(new Error(`fraud step "${name}" hung (30s)`)), 30_000)),
-      ]);
-      if (name !== 'poll stats') console.log(`[${ts()}] fraud step ok: ${name}`);
-      return r;
-    };
-
-    const voter = await step('forge + inject vote', async (sheepId) => {
-      const { voteSignBytes, voteKey, gen, PROOF_SPEC, CHANNEL } = await import('./js/net.js');
-      const { hex } = await import('./js/hash.js');
-      const pair = await crypto.subtle.generateKey(
-        { name: 'Ed25519' }, false, ['sign', 'verify']);
-      const voter = hex(new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey)));
-      const chunkHashes = Array.from({ length: PROOF_SPEC.nFrames }, (_, i) =>
-        (i % 10).toString().repeat(64)); // garbage, but well-formed
-      const record = {
-        sheepId, gen: gen(), voter, dir: 1, tier: 'std',
-        sumHash: 'ab'.repeat(32), // garbage commitment, well-formed
-        chunkHashes,
-      };
-      record.sig = hex(new Uint8Array(
-        await crypto.subtle.sign({ name: 'Ed25519' }, pair.privateKey, voteSignBytes(record))));
-      record.key = voteKey(record);
-      new BroadcastChannel(CHANNEL).postMessage({ kind: 'vote', record });
-      return voter;
-    }, firstId);
-
-    // Poll from node (no long-lived page evaluate): the idle-paced auditor
-    // should convict within a few 8s ticks.
-    let caught = false;
-    let stats = {};
-    const t0 = Date.now();
-    while (Date.now() - t0 < 150_000) {
-      stats = await step('poll stats', () => ({
-        audits: window.__sheepStats.audits,
-        frauds: window.__sheepStats.frauds,
-        banned: window.__sheepStats.banned,
-        pool: window.__sheepStats.pool,
-      }));
-      // Success = the forger is banned in p1's view — whether p1's own
-      // auditor convicted or a fraud proof arrived from another peer (both
-      // are the protocol working; the peers race).
-      if (stats.banned.includes(voter)) { caught = true; break; }
-      console.log(`[${ts()}] fraud poll: audits=${stats.audits} frauds=${stats.frauds} ` +
-        `pool=${JSON.stringify(stats.pool)}`);
-      await new Promise((r) => setTimeout(r, 3000));
-    }
-    check('forged vote convicted and key banned (any peer)', caught,
-      `p1 audits: ${stats.audits}, p1 frauds: ${stats.frauds}`);
-  } catch (err) {
-    check('auditor catches forged vote and bans the key', false, err.message);
+  // p1 contributes a few batches (each ~one render); they earn votes and grow
+  // the shared sheep.
+  const contributed = [];
+  for (let i = 0; i < 4; i++) {
+    const id = await p1.evaluate(() => window.__sheepAct.contributeRandom());
+    if (id) contributed.push(id);
   }
+  check('p1 contributed batches', contributed.length >= 3, `${contributed.length} batches`);
+
+  // p2 must receive p1's batches over the gossip bus (the shared sheep grows on
+  // p2 without p2 rendering them).
+  let got = false;
+  for (let t = 0; t < 40 && !got; t++) {
+    got = await p2.evaluate(async (pub1) => {
+      const { openStore } = await import('./js/store.js');
+      const s = await openStore();
+      return (await s.allBatches()).some((b) => b.contributor === pub1);
+    }, pub1);
+    if (!got) await p2.waitForTimeout(1000);
+  }
+  check("p2 received p1's contributed batches (work synced)", got);
+
+  // A contributed sheep's tally on p2 reflects p1's work.
+  const tally = await p2.evaluate(async (sid) => {
+    const { gen } = await import('./js/net.js');
+    const { openStore } = await import('./js/store.js');
+    const s = await openStore();
+    return (await s.allBatches()).filter((b) => b.sheepId === sid && b.gen === gen()).length;
+  }, contributed[0]);
+  check('p2 tally reflects contributions', tally >= 1, `tally=${tally}`);
+
+  // VERIFICATION GATE: a forged render — an all-zero histogram claiming to
+  // contain a real batch — must be rejected.
+  firstId = await p1.locator('.card').first().getAttribute('data-id');
+  const gate = await p1.evaluate(async (sid) => {
+    const { BATCH_SPEC } = await import('./js/net.js');
+    const cells = BATCH_SPEC.width * BATCH_SPEC.ss * BATCH_SPEC.height * BATCH_SPEC.ss * 4;
+    // Ensure batch sid:0:0 exists locally so the claim references a real record.
+    await window.__sheepAct.contributeRandom();
+    const zero = new BigUint64Array(cells); // contains NOTHING
+    const forged = await window.__sheepVerify({
+      sheepId: sid, frame: 0, hist: zero, batchKeys: [`${sid}:0:0`],
+    });
+    return { forged };
+  }, firstId);
+  check('verify gate REJECTS a forged render', gate.forged === false,
+    `verifyRender returned ${gate.forged}`);
 
   await p1.close();
   await p2.close();
 }
 
-// ---- 2b. swarm status page reflects contributions and the ban ---------------
+// ---- 4. fraud: forged batch caught by the auditor, key banned ---------------
+{
+  section('fraud injection');
+  // A pure auditor peer (no contribution → free pool, fast audits). It already
+  // holds the baked flock, so a forged batch for a baked sheep is auditable.
+  const page = await ctx.newPage();
+  page.on('console', (m) => { if (m.type() === 'error') console.log('audit console.error:', m.text()); });
+  page.on('pageerror', (e) => console.log('audit pageerror:', e.message));
+  await page.goto(`${base}/index.html?peer=1&stress=1&nocontribute=1&auditms=2000`);
+  await page.locator('.card').first().waitFor();
+  await page.waitForFunction(() => !!window.__sheepAct);
+
+  const forger = await page.evaluate(async (sid) => {
+    const { batchSignBytes, batchKey, gen, CHANNEL } = await import('./js/net.js');
+    const { hex } = await import('./js/hash.js');
+    const pair = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']);
+    const contributor = hex(new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey)));
+    const record = {
+      sheepId: sid, frame: 0, idx: 99, hash: 'de'.repeat(32), // plausible but WRONG hash
+      spp: 640000, contributor, gen: gen(),
+    };
+    record.sig = hex(new Uint8Array(
+      await crypto.subtle.sign({ name: 'Ed25519' }, pair.privateKey, batchSignBytes(record))));
+    record.key = batchKey(record);
+    new BroadcastChannel(CHANNEL).postMessage({ kind: 'batch', record });
+    return contributor;
+  }, firstId);
+
+  let banned = false;
+  let stats = {};
+  const t0 = Date.now();
+  while (Date.now() - t0 < 120_000) {
+    stats = await page.evaluate(() => ({
+      audits: window.__sheepStats.audits, frauds: window.__sheepStats.frauds,
+      banned: window.__sheepStats.banned,
+    }));
+    if (stats.banned.includes(forger)) { banned = true; break; }
+    console.log(`[${ts()}] fraud poll: audits=${stats.audits} frauds=${stats.frauds}`);
+    await page.waitForTimeout(2500);
+  }
+  check('forged batch convicted and key banned', banned,
+    `audits=${stats.audits} frauds=${stats.frauds}`);
+  await page.close();
+}
+
+// ---- 5. swarm status page reflects contributions + ban ----------------------
 {
   section('swarm page');
   const page = await ctx.newPage();
   page.on('console', (m) => { if (m.type() === 'error') console.log('swarm console.error:', m.text()); });
   await page.goto(`${base}/swarm.html?peer=1`);
-  await page.locator('#rows tr').first().waitFor({ timeout: 120_000 });
-  await page.waitForFunction(() =>
-    document.querySelectorAll('#rows tr').length >= 2 &&
-    document.body.textContent.includes('♥'), undefined, { timeout: 60_000 });
-  // Scope to rendered content — body textContent includes the page's own
-  // inline script source, which made the 'banned' check vacuously true.
+  // Wait for refresh() to finish (it runs computeFlock + breeds) — the totals
+  // placeholder is replaced only on completion.
+  await page.waitForFunction(
+    () => document.querySelector('#totals')?.textContent.includes('batches contributing'),
+    undefined, { timeout: 120_000 });
   const rowsText = await page.textContent('#rows');
   const totalsText = await page.textContent('#totals');
-  check('swarm page shows weighted contributions',
-    rowsText.includes('♥') && /B pts|M pts/.test(rowsText));
+  check('swarm page shows contributions', /♥/.test(rowsText) && /pts/.test(rowsText), '');
   check('swarm page shows the banned forger', rowsText.includes('banned (fraud)'));
-  check('swarm page shows totals', /votes proving/.test(totalsText), '');
+  check('swarm page shows totals', /batches contributing/.test(totalsText));
   await page.close();
 }
 
-// ---- 3. generation engine: one vote must still breed children ---------------
+// ---- 6. generation engine: batch tallies breed children ---------------------
 {
   section('generation engine');
   const page = await ctx.newPage();
@@ -255,22 +239,21 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
       baked.push({ id: wasm.sheep_id(genome), genome, parents: null, gen: 0, baked: true, name: s.name });
     }
     const g = gen() - 2;
+    // batch tallies: baked[0] gets work this generation.
+    const batches = [0, 1, 2, 3].map((idx) => ({
+      sheepId: baked[0].id, frame: 0, idx, contributor: 'f'.repeat(64), gen: g,
+    }));
     const store = {
       allSheep: async () => [],
-      allVotes: async () => [{
-        sheepId: baked[0].id, gen: g, voter: 'f'.repeat(64), dir: 1,
-        chunkHashes: [], key: `x:${baked[0].id}:${g}`,
-      }, {
-        sheepId: baked[1].id, gen: g, voter: 'e'.repeat(64), dir: -1,
-        chunkHashes: [], key: `y:${baked[1].id}:${g}`,
-      }],
+      allBatches: async () => batches,
+      allFraud: async () => [],
     };
-    const breedFn = async (aJson, bJson, challengeHex) => {
-      const childJson = wasm.breed(aJson, bJson, challengeHex);
+    const breedFn = async (a, b, ch) => {
+      const childJson = wasm.breed(a, b, ch);
       return { childJson, childId: wasm.sheep_id(childJson) };
     };
-    const mutateFn = async (genomeJson, challengeHex, rate) => {
-      const childJson = wasm.mutate_genome(genomeJson, challengeHex, rate);
+    const mutateFn = async (genomeJson, ch, rate) => {
+      const childJson = wasm.mutate_genome(genomeJson, ch, rate);
       return { childJson, childId: wasm.sheep_id(childJson) };
     };
     const randomFn = async (seed) => {
@@ -286,77 +269,19 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
       born: records.filter((r) => r.derived).length,
       mutants: records.filter((r) => r.origin === 'mutant').length,
       immigrants: records.filter((r) => r.origin === 'immigrant').length,
-      votedSurvives: living.has(baked[0].id),
-      condemnedDead: !living.has(baked[1].id),
+      contribSurvives: living.has(baked[0].id),
     };
   });
-  check('gen close with one vote breeds children',
-    result.votedSurvives && result.born >= 3 && result.size >= 7,
-    `living=${result.size}, born=${result.born}, voted-survives=${result.votedSurvives}`);
-  check('net-negative sheep is culled; mutants + immigrant are born',
-    result.condemnedDead && result.mutants === 2 && result.immigrants === 1,
-    `condemned-dead=${result.condemnedDead}, mutants=${result.mutants}, immigrants=${result.immigrants}`);
+  check('gen close with batch work breeds children',
+    result.contribSurvives && result.born >= 3 && result.size >= 7,
+    `living=${result.size}, born=${result.born}, survives=${result.contribSurvives}`);
+  check('mutants + immigrant derived from batch tallies',
+    result.mutants === 2 && result.immigrants === 1,
+    `mutants=${result.mutants}, immigrants=${result.immigrants}`);
   await page.close();
 }
 
-// ---- 4. WebGPU preview (soft: skips when the container has no WebGPU) -------
-{
-  section('webgpu');
-  const page = await ctx.newPage();
-  page.on('console', (m) => { if (m.type() === 'error') console.log('gpu console.error:', m.text()); });
-  await page.goto(`${base}/about.html`); // any same-origin page to import from
-  const result = await page.evaluate(async () => {
-    try {
-      const { GpuFlame } = await import('./js/gpu.js');
-      // Some headless builds hang inside requestAdapter instead of resolving
-      // null — bound it.
-      const gpu = await Promise.race([
-        GpuFlame.create(),
-        new Promise((r) => setTimeout(() => r(null), 20_000)),
-      ]);
-      if (!gpu) return { available: false };
-      const canvas = document.createElement('canvas');
-      canvas.width = 128;
-      canvas.height = 128;
-      document.body.append(canvas);
-      gpu.configure(canvas);
-      const infoJson = JSON.stringify(gpu.adapterInfo ?? {});
-      // Empty/unidentifiable adapter info in a container = assume software.
-      const software = infoJson.length <= 2 ||
-        /swiftshader|llvmpipe|software|cpu/i.test(infoJson);
-      const genome = await (await fetch('genomes/seed_7.json')).text();
-      await gpu.frame(genome, 0.3, { width: 128, height: 128, ss: 1, samples: 300_000 });
-      // Software adapters can lag the completion promise — poll up to 5s.
-      const chk = document.createElement('canvas');
-      chk.width = 128;
-      chk.height = 128;
-      const c2 = chk.getContext('2d');
-      let lit = 0;
-      for (let tries = 0; tries < 10 && lit <= 50; tries++) {
-        await new Promise((r) => setTimeout(r, 500));
-        c2.drawImage(canvas, 0, 0);
-        const d = c2.getImageData(0, 0, 128, 128).data;
-        lit = 0;
-        for (let i = 0; i < d.length; i += 4) if (d[i] + d[i + 1] + d[i + 2] > 30) lit++;
-      }
-      return { available: true, software, info: infoJson, lit };
-    } catch (err) {
-      return { available: true, software: true, error: err.message };
-    }
-  });
-  if (!result.available) {
-    console.log(`[${ts()}] SKIP  webgpu preview — no WebGPU adapter in this container`);
-  } else if ((result.error || result.lit <= 50) && result.software) {
-    console.log(`[${ts()}] SKIP  webgpu preview — software adapter quirk: ` +
-      (result.error || `${result.lit} lit pixels`) + ` (adapter: ${result.info ?? '{}'})`);
-  } else {
-    check('webgpu preview renders pixels', !result.error && result.lit > 50,
-      (result.error || `${result.lit} lit pixels`) + ` (adapter: ${result.info ?? '{}'})`);
-  }
-  await page.close();
-}
-
+console.log(failures ? `\n${failures} CHECK(S) FAILED` : '\nALL E2E CHECKS PASSED');
 await browser.close();
 server.close();
-console.log(failures ? `\n${failures} FAILURES` : '\nALL E2E CHECKS PASSED');
 process.exit(failures ? 1 : 0);

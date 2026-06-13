@@ -49,7 +49,10 @@ export class Auditor {
   }
 
   async tick() {
-    if (this.pool.queue.length > 0 || this.pool.running > 0) return; // stay out of the way
+    // Audit one batch per tick; yield to the user but don't let the idle
+    // contribution loop (which keeps the pool busy) starve fraud detection —
+    // only back off when the queue is genuinely backed up.
+    if (this.pool.queue.length > 3) return;
 
     const batches = await this.store.allBatches();
     const candidates = batches.filter((b) => {
