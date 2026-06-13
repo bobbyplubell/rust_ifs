@@ -10,3 +10,14 @@ scratch.md
 PLAN.md
 Caddyfile.lan
 .tools/
+
+# secrets / certs / keys — never commit (defensive)
+*.key
+*.pem
+*.csr
+*.crt
+*.ca-bundle
+*.pfx
+# local logs / swarm dumps
+*.jsonl
+*.log
