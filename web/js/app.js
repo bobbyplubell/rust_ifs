@@ -222,25 +222,29 @@ function addCard(record) {
 
 // Render a genome onto a canvas through the pool, painting as chunks land.
 // Returns the chunk hashes (= the render proof when challenge is a vote challenge).
+// Paint a worker result onto a canvas, resizing the canvas to match the
+// image (renders at different specs share card canvases — a size mismatch
+// leaves the image in the top-left corner).
+function paintTo(canvas, m) {
+  if (canvas.width !== m.width || canvas.height !== m.height) {
+    canvas.width = m.width;
+    canvas.height = m.height;
+  }
+  canvas.getContext('2d').putImageData(
+    new ImageData(new Uint8ClampedArray(m.rgba), m.width, m.height), 0, 0);
+}
+
 async function drawProgressively(canvas, genomeJson, challengeSource, challengeHex, spec = VIEW_SPEC) {
   challengeHex ??= await sha256Hex(utf8(challengeSource));
-  const ctx = canvas.getContext('2d');
   canvas.classList.add('rendering');
   const job = pool.submit(
     { type: 'render', genomeJson, challengeHex, ...spec, tonemapEvery: 8 },
-    {
-      onProgress: (p) => {
-        if (p.rgba) {
-          ctx.putImageData(
-            new ImageData(new Uint8ClampedArray(p.rgba), p.width, p.height), 0, 0);
-        }
-      },
-    },
+    { onProgress: (p) => { if (p.rgba) paintTo(canvas, p); } },
   );
   const done = await job.done;
   canvas.classList.remove('rendering');
   if (done.type === 'done') {
-    ctx.putImageData(new ImageData(new Uint8ClampedArray(done.rgba), done.width, done.height), 0, 0);
+    paintTo(canvas, done);
     return done.hashes;
   }
   return null;
@@ -262,8 +266,6 @@ async function toggleSpin(entry) {
   const s = { entry, stop: false };
   spinning = s;
   entry.spinBtn.textContent = 'stop';
-  const ctx = entry.canvas.getContext('2d');
-
   const frameJob = () => pool.submit({
     type: 'frame', genomeJson: entry.record.genome,
     phase: (performance.now() % LOOP_MS) / LOOP_MS, ...FRAME,
@@ -276,10 +278,7 @@ async function toggleSpin(entry) {
     const done = await pending;
     pending = next;
     if (s.stop) break;
-    if (done.type === 'done') {
-      ctx.putImageData(
-        new ImageData(new Uint8ClampedArray(done.rgba), done.width, done.height), 0, 0);
-    }
+    if (done.type === 'done') paintTo(entry.canvas, done);
   }
 }
 
@@ -300,7 +299,6 @@ function stopSpin() {
 // paint into `canvas` as they land (watching the loop assemble IS the work);
 // returns ordered hashes + the frames for replay, or null on cancellation.
 async function renderLoopProof(canvas, genomeJson, challengeHex, onProgress, spec = PROOF_TIERS.std) {
-  const ctx = canvas.getContext('2d');
   const { nFrames } = spec;
   const frames = new Array(nFrames);
   const hashes = new Array(nFrames);
@@ -324,7 +322,7 @@ async function renderLoopProof(canvas, genomeJson, challengeHex, onProgress, spe
       for (let k = 0; k < cells; k++) sum[k] += hist[k];
       frames[m.idx] = new ImageData(new Uint8ClampedArray(m.rgba), m.width, m.height);
       if (canvas.width !== m.width) { canvas.width = m.width; canvas.height = m.height; }
-      ctx.putImageData(frames[m.idx], 0, 0);
+      canvas.getContext('2d').putImageData(frames[m.idx], 0, 0);
       onProgress?.(++done, nFrames);
     }));
   }
@@ -395,12 +393,7 @@ async function paintAccum(entry, spec) {
     width: spec.width, height: spec.height, ss: spec.ss,
   }, {}).done;
   if (m.type !== 'done' || entry.votePending || entry.replay) return;
-  if (entry.canvas.width !== m.width) {
-    entry.canvas.width = m.width;
-    entry.canvas.height = m.height;
-  }
-  entry.canvas.getContext('2d').putImageData(
-    new ImageData(new Uint8ClampedArray(m.rgba), m.width, m.height), 0, 0);
+  paintTo(entry.canvas, m);
   entry.tallyEl.title = `${entry.sumCount} voters' render work accumulated`;
 }
 

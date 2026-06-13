@@ -89,7 +89,9 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
   await p1.locator('#status', { hasText: /[1-9] peers/ }).waitFor({ timeout: 30_000 });
   check('p1 sees a peer', true);
 
-  // First card renders something non-black.
+  // First card renders something non-black — and the image must cover the
+  // whole canvas, not just a corner (canvas-size-mismatch regression guard:
+  // a smaller ImageData painted onto a larger canvas leaves the rest black).
   await p1.waitForFunction(() => {
     const c = document.querySelector('.card canvas');
     if (!c) return false;
@@ -97,7 +99,25 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
     for (let i = 0; i < d.length; i += 4) if (d[i] + d[i + 1] + d[i + 2] > 30) return true;
     return false;
   }, undefined, { timeout: 120_000 });
-  check('p1 first card rendered pixels', true);
+  const coverage = await p1.evaluate(() => {
+    // Lit-pixel share per quadrant of the first card.
+    const c = document.querySelector('.card canvas');
+    const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+    const half = c.width / 2;
+    const lit = [0, 0, 0, 0];
+    for (let y = 0; y < c.height; y++) {
+      for (let x = 0; x < c.width; x++) {
+        const i = (y * c.width + x) * 4;
+        if (d[i] + d[i + 1] + d[i + 2] > 30) {
+          lit[(y >= half ? 2 : 0) + (x >= half ? 1 : 0)]++;
+        }
+      }
+    }
+    return lit;
+  });
+  // Auto-framed sheep fill ~78% of frame: every quadrant should hold pixels.
+  check('p1 first card rendered pixels (full coverage)',
+    coverage.every((q) => q > 50), `quadrant lit: ${coverage.join(', ')}`);
 
   // Vote on the first card in p1: a 64-frame loop proof fans out across the
   // pool (heavier than the old chunk proof — generous timeout), then p2's
