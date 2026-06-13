@@ -4,11 +4,11 @@
 // (also compute) produce the final image. No CPU point generation.
 //
 // Genome is uploaded as a flat f32 buffer; each transform occupies STRIDE
-// floats: [weight, color, affine(6), post(6), variations(29), pvals(16), color_speed] = 60.
+// floats: [weight, color, affine(6), post(6), variations(49), pvals(28), color_speed] = 92.
 // pvals layout mirrors flame-core variations::pval.
 
 const PI: f32 = 3.14159265358979;
-const STRIDE: u32 = 60u;
+const STRIDE: u32 = 92u;
 
 struct Params {
     dims: vec4<u32>,   // hw, hh, n_transforms, has_final
@@ -44,10 +44,13 @@ fn rnd(state: ptr<function, u32>) -> f32 {
 // ---- variations (mirror of flame-core variations.rs) -----------------------
 
 fn pv(t: u32, k: u32) -> f32 {
-    return genome[t * STRIDE + 43u + k];
+    return genome[t * STRIDE + 63u + k]; // pvals after 49 variation weights
+}
+fn aff(t: u32, k: u32) -> f32 {
+    return genome[t * STRIDE + 2u + k]; // pre-affine a..f for dependent variations
 }
 
-fn variation(idx: u32, t: u32, x: f32, y: f32, state: ptr<function, u32>) -> vec2<f32> {
+fn variation(idx: u32, t: u32, x: f32, y: f32, w: f32, state: ptr<function, u32>) -> vec2<f32> {
     let r2 = x * x + y * y;
     let r = sqrt(r2);
     let theta = atan2(x, y);
@@ -134,6 +137,120 @@ fn variation(idx: u32, t: u32, x: f32, y: f32, state: ptr<function, u32>) -> vec
                 sin(pv(t, 12u) * y) - cos(pv(t, 13u) * x),
                 sin(pv(t, 14u) * x) - cos(pv(t, 15u) * y));
         }
+        case 29u { // bent
+            var nx = x; var ny = y;
+            if (x < 0.0) { nx = 2.0 * x; }
+            if (y < 0.0) { ny = 0.5 * y; }
+            return vec2(nx, ny);
+        }
+        case 30u { // waves (dependent)
+            return vec2(
+                x + aff(t, 1u) * sin(y / (aff(t, 2u) * aff(t, 2u) + 1e-10)),
+                y + aff(t, 4u) * sin(x / (aff(t, 5u) * aff(t, 5u) + 1e-10)));
+        }
+        case 31u { // fisheye (reversed x/y)
+            let s = 2.0 / (r + 1.0);
+            return vec2(s * y, s * x);
+        }
+        case 32u { // popcorn (dependent)
+            return vec2(
+                x + aff(t, 2u) * sin(tan(3.0 * y)),
+                y + aff(t, 5u) * sin(tan(3.0 * x)));
+        }
+        case 33u { // rings (dependent)
+            let c2 = aff(t, 2u) * aff(t, 2u) + 1e-10;
+            let m = (r + c2) - 2.0 * c2 * floor((r + c2) / (2.0 * c2));
+            let tt = m - c2 + r * (1.0 - c2);
+            return vec2(tt * cos(theta), tt * sin(theta));
+        }
+        case 34u { // fan (dependent)
+            let tw = PI * (aff(t, 2u) * aff(t, 2u)) + 1e-10;
+            let half = tw * 0.5;
+            let q = theta + aff(t, 5u);
+            let m = q - tw * floor(q / tw);
+            var a = theta + half;
+            if (m > half) { a = theta - half; }
+            return vec2(r * cos(a), r * sin(a));
+        }
+        case 35u { // perspective
+            let p1 = pv(t, 16u); let p2 = pv(t, 17u);
+            let k = p2 / (p2 - y * sin(p1) + 1e-10);
+            return vec2(k * x, k * y * cos(p1));
+        }
+        case 36u { // noise
+            let p1 = rnd(state);
+            let a = 6.28318530717958648 * rnd(state);
+            return vec2(p1 * x * cos(a), p1 * y * sin(a));
+        }
+        case 37u { // blur
+            let p1 = rnd(state);
+            let a = 6.28318530717958648 * rnd(state);
+            return vec2(p1 * cos(a), p1 * sin(a));
+        }
+        case 38u { // gaussian
+            let s = rnd(state) + rnd(state) + rnd(state) + rnd(state) - 2.0;
+            let a = 6.28318530717958648 * rnd(state);
+            return vec2(s * cos(a), s * sin(a));
+        }
+        case 39u { // radial blur (weight-dependent)
+            let p1 = pv(t, 18u) * (PI / 2.0);
+            var v = w; if (abs(v) < 1e-9) { v = 1e-9; }
+            let t1 = v * (rnd(state) + rnd(state) + rnd(state) + rnd(state) - 2.0);
+            let phi = atan2(y, x);
+            let t2 = phi + t1 * sin(p1);
+            let t3 = t1 * cos(p1) - 1.0;
+            return vec2((r * cos(t2) + t3 * x) / v, (r * sin(t2) + t3 * y) / v);
+        }
+        case 40u { // pie
+            let p1 = max(pv(t, 19u), 1.0);
+            let t1 = trunc(rnd(state) * p1 + 0.5);
+            let t2 = pv(t, 20u) + (6.28318530717958648 / p1) * (t1 + rnd(state) * pv(t, 21u));
+            let p = rnd(state);
+            return vec2(p * cos(t2), p * sin(t2));
+        }
+        case 41u { // ngon
+            let p1 = pv(t, 22u);
+            let p2 = 6.28318530717958648 / max(pv(t, 23u), 1.0);
+            let phi = atan2(y, x);
+            let t3 = phi - p2 * floor(phi / p2);
+            var t4 = t3;
+            if (t3 <= p2 * 0.5) { t4 = t3 - p2; }
+            let denom = max(pow(r, p1), 1e-10);
+            let k = (pv(t, 24u) * (1.0 / (abs(cos(t4)) + 1e-10) - 1.0) + pv(t, 25u)) / denom;
+            return vec2(k * x, k * y);
+        }
+        case 42u { // rectangles
+            let p1 = pv(t, 26u); let p2 = pv(t, 27u);
+            var nx = x; var ny = y;
+            if (abs(p1) >= 1e-10) { nx = (2.0 * floor(x / p1) + 1.0) * p1 - x; }
+            if (abs(p2) >= 1e-10) { ny = (2.0 * floor(y / p2) + 1.0) * p2 - y; }
+            return vec2(nx, ny);
+        }
+        case 43u { // arch (weight-dependent)
+            let a = rnd(state) * PI * w;
+            let s = sin(a);
+            return vec2(s, s * s / (cos(a) + 1e-10));
+        }
+        case 44u { return vec2(rnd(state) - 0.5, rnd(state) - 0.5); } // square
+        case 45u { // rays (weight-dependent)
+            var v = w; if (abs(v) < 1e-9) { v = 1e-9; }
+            let k = v * tan(rnd(state) * PI * v) / (r2 + 1e-10);
+            return vec2(k * cos(x), k * sin(y));
+        }
+        case 46u { // blade (weight-dependent)
+            let a = rnd(state) * r * w;
+            return vec2(x * (cos(a) + sin(a)), x * (cos(a) - sin(a)));
+        }
+        case 47u { // secant (weight-dependent)
+            var v = w; if (abs(v) < 1e-9) { v = 1e-9; }
+            return vec2(x, 1.0 / (v * cos(v * r) + 1e-10));
+        }
+        case 48u { // twintrian (weight-dependent)
+            let a = rnd(state) * r * w;
+            let s = sin(a);
+            let tt = log(max(s * s, 1e-30)) / 2.30258509299404568 + cos(a);
+            return vec2(x * tt, x * (tt - PI * s));
+        }
         default { return vec2(x, y); }
     }
 }
@@ -146,10 +263,10 @@ fn apply_tx(t: u32, p: vec2<f32>, state: ptr<function, u32>) -> vec2<f32> {
     let px = field(t, 2u) * p.x + field(t, 3u) * p.y + field(t, 4u);
     let py = field(t, 5u) * p.x + field(t, 6u) * p.y + field(t, 7u);
     var b = vec2<f32>(0.0, 0.0);
-    for (var v = 0u; v < 29u; v = v + 1u) {
+    for (var v = 0u; v < 49u; v = v + 1u) {
         let w = field(t, 14u + v);
         if (w != 0.0) {
-            b = b + w * variation(v, t, px, py, state);
+            b = b + w * variation(v, t, px, py, w, state);
         }
     }
     // post affine
@@ -190,7 +307,7 @@ fn cs_chaos(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var i = 0u; i < total; i = i + 1u) {
         let t = pick(&state);
         let np = apply_tx(t, vec2(x, y), &state);
-        let cs = field(t, 59u);
+        let cs = field(t, 91u);
         color = color * (1.0 - cs) + field(t, 1u) * cs;
         x = np.x;
         y = np.y;
@@ -206,7 +323,7 @@ fn cs_chaos(@builtin(global_invocation_id) gid: vec3<u32>) {
         var px = x; var py = y; var pc = color;
         if (has_final == 1u) {
             let fp = apply_tx(n, vec2(px, py), &state);
-            let fcs = field(n, 59u);
+            let fcs = field(n, 91u);
             pc = pc * (1.0 - fcs) + field(n, 1u) * fcs;
             px = fp.x; py = fp.y;
         }
@@ -216,10 +333,13 @@ fn cs_chaos(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (ix >= 0.0 && iy >= 0.0 && ix < f32(hw) && iy < f32(hh)) {
             let pix = (u32(iy) * hw + u32(ix)) * 4u;
             let cidx = u32(clamp(pc, 0.0, 1.0) * 255.0) * 3u;
-            atomicAdd(&hist[pix], 1u);
-            atomicAdd(&hist[pix + 1u], u32(palette[cidx] * scale));
-            atomicAdd(&hist[pix + 2u], u32(palette[cidx + 1u] * scale));
-            atomicAdd(&hist[pix + 3u], u32(palette[cidx + 2u] * scale));
+            // Count channel is 256-fixed-point so directional motion blur can
+            // scale a step's contribution (tone.w = step intensity).
+            let inten = params.tone.w;
+            atomicAdd(&hist[pix], u32(256.0 * inten));
+            atomicAdd(&hist[pix + 1u], u32(palette[cidx] * scale * inten));
+            atomicAdd(&hist[pix + 2u], u32(palette[cidx + 1u] * scale * inten));
+            atomicAdd(&hist[pix + 3u], u32(palette[cidx + 2u] * scale * inten));
         }
     }
 }
@@ -311,7 +431,7 @@ fn cs_tonemap(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    let freq = me.x;
+    let freq = me.x / 256.0; // count channel is 256-fixed-point
     let bg = params.bg.rgb;
     if (freq <= 0.0) {
         textureStore(out_tex, vec2<i32>(i32(gid.x), i32(gid.y)), vec4(bg, 1.0));
@@ -323,9 +443,9 @@ fn cs_tonemap(@builtin(global_invocation_id) gid: vec3<u32>) {
     let brightness = params.tone.y;
     let vib = params.tone.z;
     let inv_gamma = 1.0 / gamma;
-    let log_max = max(log(1.0 + f32(atomicLoad(&maxbuf[0]))), 1e-12);
+    let log_max = max(log(1.0 + f32(atomicLoad(&maxbuf[0])) / 256.0), 1e-12);
 
-    let avg = me.yzw / scale / freq;
+    let avg = me.yzw / scale / freq / 256.0;
     let l = clamp(log(1.0 + freq) / log_max * brightness, 0.0, 1.0);
     let lg = pow(l, inv_gamma);
     let by_brightness = avg * lg;

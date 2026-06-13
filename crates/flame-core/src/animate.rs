@@ -40,15 +40,22 @@ pub fn render_motion(
     phase: f64,
     shutter: f64,
     steps: u32,
+    directional: f64,
     opts: &crate::render::RenderOpts,
 ) -> Vec<u8> {
     let steps = steps.max(1);
+    let d = directional.clamp(0.0, 1.0);
     let mut accum = crate::render::Accum::new(opts.width * opts.ss, opts.height * opts.ss);
     let per_step = (opts.samples / steps as u64).max(1);
     for k in 0..steps {
         let p = phase + shutter * (k as f64 / steps as f64);
+        // Directional blur (sec. 9.1): earlier steps dimmer, approaching 1.0
+        // as the steps progress — a sense of motion direction.
+        let intensity = (1.0 - d) + d * (k + 1) as f64 / steps as f64;
         let g = animated(genome, p);
-        crate::render::accumulate(&g, per_step, opts.burn_in, opts.seed ^ (k as u64), &mut accum);
+        crate::render::accumulate_scaled(
+            &g, per_step, opts.burn_in, opts.seed ^ (k as u64), &mut accum, intensity,
+        );
     }
     crate::render::tonemap(&accum, genome, opts.width, opts.height, opts.ss)
 }

@@ -190,6 +190,7 @@
             // Motion blur shutter = the actual frame interval, so blur length
             // always matches playback speed (flam3 temporal samples).
             shutter: Math.min(dt, 160) / LOOP_MS, temporal: cfg.temporal,
+            directional: 0.4,
           });
           first = false;
           dt = performance.now() - t0;
@@ -211,7 +212,7 @@
       const frameJob = () => pool.submit({
         type: 'frame', genomeJson: record.genome,
         phase: (performance.now() % LOOP_MS) / LOOP_MS, ...CPU_FRAME[quality],
-        shutter: 0.012, temporal: 4, // ~CPU frame interval of motion blur
+        shutter: 0.012, temporal: 4, directional: 0.4, // flam3 motion blur
       }).done;
       let pending = frameJob();
       while (!s.stop) {

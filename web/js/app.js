@@ -246,7 +246,7 @@ async function toggleSpin(entry) {
   const frameJob = () => pool.submit({
     type: 'frame', genomeJson: entry.record.genome,
     phase: (performance.now() % LOOP_MS) / LOOP_MS, ...FRAME,
-    shutter: 0.012, temporal: 4, // flam3 temporal samples (motion blur)
+    shutter: 0.012, temporal: 4, directional: 0.4, // flam3 motion blur (sec 9.1)
   }).done;
 
   let pending = frameJob();

@@ -183,7 +183,7 @@ function handleFrame(msg) {
   // shutter/temporal: flam3-style motion blur (budget split, cost-neutral).
   const rgba = render_frame(
     genomeJson, phase, width, height, 1, samples, seed ?? 7,
-    msg.shutter ?? 0, msg.temporal ?? 1,
+    msg.shutter ?? 0, msg.temporal ?? 1, msg.directional ?? 0,
   );
   if (cancelled.has(jobId)) return;
   const buf = rgba.buffer;

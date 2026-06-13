@@ -98,6 +98,13 @@ mod tests {
             let text = std::fs::read_to_string(&path).unwrap();
             for (lineno, line) in text.lines().enumerate() {
                 let code = line.split("//").next().unwrap_or(""); // ignore comments
+                // Ignore string-literal content (e.g. hex hashes containing "f32").
+                let code: String = code
+                    .split('"')
+                    .enumerate()
+                    .filter_map(|(i, s)| if i % 2 == 0 { Some(s) } else { None })
+                    .collect();
+                let code = code.as_str();
                 for pat in forbidden {
                     assert!(
                         !code.contains(pat),

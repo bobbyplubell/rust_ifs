@@ -68,11 +68,18 @@ impl Accum {
 
     #[inline]
     pub fn add(&mut self, x: usize, y: usize, rgb: [f64; 3]) {
+        self.add_scaled(x, y, rgb, 1.0);
+    }
+
+    /// Add with an intensity scale (directional motion blur: earlier temporal
+    /// steps contribute less; see Draves sec. 9.1).
+    #[inline]
+    pub fn add_scaled(&mut self, x: usize, y: usize, rgb: [f64; 3], s: f64) {
         let cell = &mut self.data[y * self.w + x];
-        cell[0] += rgb[0];
-        cell[1] += rgb[1];
-        cell[2] += rgb[2];
-        cell[3] += 1.0;
+        cell[0] += rgb[0] * s;
+        cell[1] += rgb[1] * s;
+        cell[2] += rgb[2] * s;
+        cell[3] += s;
     }
 
     /// Element-wise add `other` into `self`. Panics on dimension mismatch.
@@ -137,13 +144,26 @@ pub fn iterate(
 /// points into `accum` (which must be sized `width*ss x height*ss` for the
 /// camera framing implied by its dimensions).
 pub fn accumulate(genome: &Genome, samples: u64, burn_in: u64, seed: u64, accum: &mut Accum) {
+    accumulate_scaled(genome, samples, burn_in, seed, accum, 1.0);
+}
+
+/// `accumulate` with an intensity scale on every plotted point (directional
+/// motion blur, Draves sec. 9.1).
+pub fn accumulate_scaled(
+    genome: &Genome,
+    samples: u64,
+    burn_in: u64,
+    seed: u64,
+    accum: &mut Accum,
+    scale: f64,
+) {
     let (hw, hh) = (accum.w, accum.h);
     let to_img = genome.camera.world_to_image(hw, hh);
 
     iterate(genome, samples, burn_in, seed, |px, py, rgb| {
         let (ix, iy) = to_img.apply(px, py);
         if ix >= 0.0 && iy >= 0.0 && ix < hw as f64 && iy < hh as f64 {
-            accum.add(ix as usize, iy as usize, rgb);
+            accum.add_scaled(ix as usize, iy as usize, rgb, scale);
         }
     });
 }

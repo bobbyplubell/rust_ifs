@@ -60,6 +60,7 @@ pub fn render_frame(
     seed: u32,
     shutter: f64,
     temporal: u32,
+    directional: f64,
 ) -> Result<Vec<u8>, JsValue> {
     let genome: Genome = serde_json::from_str(genome_json)
         .map_err(|e| JsValue::from_str(&format!("bad genome json: {e}")))?;
@@ -72,7 +73,9 @@ pub fn render_frame(
         seed: seed as u64,
     };
     if temporal > 1 && shutter > 0.0 {
-        Ok(flame_core::animate::render_motion(&genome, phase, shutter, temporal, &opts))
+        Ok(flame_core::animate::render_motion(
+            &genome, phase, shutter, temporal, directional, &opts,
+        ))
     } else {
         let g = flame_core::animate::animated(&genome, phase);
         Ok(render(&g, &opts))

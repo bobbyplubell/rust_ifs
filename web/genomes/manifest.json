@@ -7,6 +7,11 @@
       "seed": 3
     },
     {
+      "name": "Sheep #5",
+      "file": "genomes/seed_5.json",
+      "seed": 5
+    },
+    {
       "name": "Sheep #9",
       "file": "genomes/seed_9.json",
       "seed": 9
@@ -17,19 +22,14 @@
       "seed": 11
     },
     {
-      "name": "Sheep #23",
-      "file": "genomes/seed_23.json",
-      "seed": 23
+      "name": "Sheep #31",
+      "file": "genomes/seed_31.json",
+      "seed": 31
     },
     {
       "name": "Sheep #79",
       "file": "genomes/seed_79.json",
       "seed": 79
-    },
-    {
-      "name": "Sheep #47",
-      "file": "genomes/seed_47.json",
-      "seed": 47
     }
   ]
 }

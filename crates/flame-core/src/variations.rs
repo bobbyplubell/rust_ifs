@@ -53,6 +53,27 @@ pub enum Variation {
     Fan2,
     Rings2,
     Pdj,
+    // -- remainder of the paper's 49-variation catalog --
+    Bent,
+    Waves,       // dependent: affine b, c, e, f
+    Fisheye,
+    Popcorn,     // dependent: affine c, f
+    Rings,       // dependent: affine c
+    Fan,         // dependent: affine c, f
+    Perspective, // parametric
+    Noise,       // random
+    Blur,        // random
+    Gaussian,    // random
+    RadialBlur,  // parametric + weight-dependent + random
+    Pie,         // parametric + random
+    Ngon,        // parametric
+    Rectangles,  // parametric
+    Arch,        // weight-dependent + random
+    Square,      // random
+    Rays,        // weight-dependent + random
+    Blade,       // weight-dependent + random
+    Secant,      // weight-dependent
+    Twintrian,   // weight-dependent + random
 }
 
 /// Layout of the per-transform parameter block (`Transform::pvals`).
@@ -73,14 +94,26 @@ pub mod pval {
     pub const PDJ_B: usize = 13;
     pub const PDJ_C: usize = 14;
     pub const PDJ_D: usize = 15;
+    pub const PERSP_ANGLE: usize = 16;
+    pub const PERSP_DIST: usize = 17;
+    pub const RADIAL_BLUR_ANGLE: usize = 18;
+    pub const PIE_SLICES: usize = 19;
+    pub const PIE_ROTATION: usize = 20;
+    pub const PIE_THICKNESS: usize = 21;
+    pub const NGON_POWER: usize = 22;
+    pub const NGON_SIDES: usize = 23;
+    pub const NGON_CORNERS: usize = 24;
+    pub const NGON_CIRCLE: usize = 25;
+    pub const RECT_X: usize = 26;
+    pub const RECT_Y: usize = 27;
 }
 
 /// Number of parameter slots per transform.
-pub const N_PVALS: usize = 16;
+pub const N_PVALS: usize = 28;
 
 impl Variation {
     /// Every variation, in declaration order.
-    pub const ALL: [Variation; 29] = [
+    pub const ALL: [Variation; 49] = [
         Variation::Linear,
         Variation::Sinusoidal,
         Variation::Spherical,
@@ -110,6 +143,26 @@ impl Variation {
         Variation::Fan2,
         Variation::Rings2,
         Variation::Pdj,
+        Variation::Bent,
+        Variation::Waves,
+        Variation::Fisheye,
+        Variation::Popcorn,
+        Variation::Rings,
+        Variation::Fan,
+        Variation::Perspective,
+        Variation::Noise,
+        Variation::Blur,
+        Variation::Gaussian,
+        Variation::RadialBlur,
+        Variation::Pie,
+        Variation::Ngon,
+        Variation::Rectangles,
+        Variation::Arch,
+        Variation::Square,
+        Variation::Rays,
+        Variation::Blade,
+        Variation::Secant,
+        Variation::Twintrian,
     ];
 
     #[inline]
@@ -117,10 +170,21 @@ impl Variation {
         Variation::ALL.iter().position(|&v| v == self).unwrap()
     }
 
-    /// Apply the (unweighted) variation to `(x, y)`. Parametric variations
-    /// read `pvals` (see `pval`); the rest ignore it.
+    /// Apply the (unweighted) variation to `(x, y)`.
+    ///
+    /// Parametric variations read `pvals` (see `pval`); *dependent* ones read
+    /// the transform's pre-affine coefficients; *weight-dependent* ones read
+    /// their own blend weight `w` (the paper's v_ij) — all per the catalog.
     #[inline]
-    pub fn apply(self, x: f64, y: f64, pvals: &[f64; N_PVALS], rng: &mut Rng) -> (f64, f64) {
+    pub fn apply(
+        self,
+        x: f64,
+        y: f64,
+        pvals: &[f64; N_PVALS],
+        affine: &crate::affine::Affine,
+        w: f64,
+        rng: &mut Rng,
+    ) -> (f64, f64) {
         // Precompute the common scalars.
         let r2 = x * x + y * y;
         let r = r2.sqrt();
@@ -207,12 +271,13 @@ impl Variation {
                 (m * c, m * s)
             }
             Variation::JuliaScope => {
+                // Paper V33: Lambda is an independent random sign.
                 let power = nonzero(pvals[pval::JULIASCOPE_POWER]);
                 let dist = pvals[pval::JULIASCOPE_DIST];
                 let k = (power.abs() * rng.f64()).trunc();
                 let phi = fmath::atan2(y, x);
-                let dir = if (k as i64) & 1 == 1 { -phi } else { phi };
-                let t = (2.0 * PI * k + dir) / power;
+                let lam = if rng.chance(0.5) { 1.0 } else { -1.0 };
+                let t = (lam * phi + 2.0 * PI * k) / power;
                 let m = fmath::pow(r, dist / power);
                 let (s, c) = fmath::sincos(t);
                 (m * c, m * s)
@@ -223,7 +288,7 @@ impl Variation {
                 let waves = pvals[pval::BLOB_WAVES];
                 let pr = r * (low + 0.5 * (high - low) * (fmath::sin(waves * theta) + 1.0));
                 let (s, c) = fmath::sincos(theta);
-                (pr * s, pr * c)
+                (pr * c, pr * s) // paper V23: (cos, sin)
             }
             Variation::Curl => {
                 let c1 = pvals[pval::CURL_C1];
@@ -234,12 +299,11 @@ impl Variation {
                 ((x * re + y * im) * s, (y * re - x * im) * s)
             }
             Variation::Fan2 => {
-                let fx = pvals[pval::FAN2_X];
-                let fy = pvals[pval::FAN2_Y];
-                let dx = PI * (fx * fx + 1e-10);
-                let dx2 = 0.5 * dx;
-                let t = theta + fy - dx * ((theta + fy) / dx).trunc();
-                let a = if t > dx2 { theta - dx2 } else { theta + dx2 };
+                // Paper V25: t = theta + p2 - p1*trunc(2*theta*p2 / p1).
+                let p1 = PI * (pvals[pval::FAN2_X] * pvals[pval::FAN2_X]) + 1e-10;
+                let p2 = pvals[pval::FAN2_Y];
+                let t = theta + p2 - p1 * (2.0 * theta * p2 / p1).trunc();
+                let a = if t > p1 * 0.5 { theta - p1 * 0.5 } else { theta + p1 * 0.5 };
                 let (s, c) = fmath::sincos(a);
                 (r * s, r * c)
             }
@@ -258,6 +322,130 @@ impl Variation {
                     fmath::sin(a * y) - fmath::cos(b * x),
                     fmath::sin(c * x) - fmath::cos(d * y),
                 )
+            }
+            Variation::Bent => {
+                let nx = if x < 0.0 { 2.0 * x } else { x };
+                let ny = if y < 0.0 { y * 0.5 } else { y };
+                (nx, ny)
+            }
+            Variation::Waves => (
+                x + affine.b * fmath::sin(y / (affine.c * affine.c + 1e-10)),
+                y + affine.e * fmath::sin(x / (affine.f * affine.f + 1e-10)),
+            ),
+            Variation::Fisheye => {
+                // Paper V16: note the reversed order of x and y.
+                let s = 2.0 / (r + 1.0);
+                (s * y, s * x)
+            }
+            Variation::Popcorn => (
+                x + affine.c * fmath::sin(fmath::tan(3.0 * y)),
+                y + affine.f * fmath::sin(fmath::tan(3.0 * x)),
+            ),
+            Variation::Rings => {
+                let c2 = affine.c * affine.c + 1e-10;
+                let t = (r + c2).rem_euclid(2.0 * c2) - c2 + r * (1.0 - c2);
+                let (s, c) = fmath::sincos(theta);
+                (t * c, t * s) // paper V21: (cos, sin)
+            }
+            Variation::Fan => {
+                let t = PI * (affine.c * affine.c) + 1e-10;
+                let half = t * 0.5;
+                let a = if (theta + affine.f).rem_euclid(t) > half {
+                    theta - half
+                } else {
+                    theta + half
+                };
+                let (s, c) = fmath::sincos(a);
+                (r * c, r * s) // paper V22: (cos, sin)
+            }
+            Variation::Perspective => {
+                let p1 = pvals[pval::PERSP_ANGLE];
+                let p2 = pvals[pval::PERSP_DIST];
+                let k = p2 / (p2 - y * fmath::sin(p1) + 1e-10);
+                (k * x, k * y * fmath::cos(p1))
+            }
+            Variation::Noise => {
+                let p1 = rng.f64();
+                let (s, c) = fmath::sincos(2.0 * PI * rng.f64());
+                (p1 * x * c, p1 * y * s)
+            }
+            Variation::Blur => {
+                let p1 = rng.f64();
+                let (s, c) = fmath::sincos(2.0 * PI * rng.f64());
+                (p1 * c, p1 * s)
+            }
+            Variation::Gaussian => {
+                let sum = rng.f64() + rng.f64() + rng.f64() + rng.f64() - 2.0;
+                let (s, c) = fmath::sincos(2.0 * PI * rng.f64());
+                (sum * c, sum * s)
+            }
+            Variation::RadialBlur => {
+                // Paper V36 — weight-dependent: t1 contains v36, and the
+                // result is divided by v36 (the blend multiplies it back).
+                let p1 = pvals[pval::RADIAL_BLUR_ANGLE] * (PI / 2.0);
+                let v = if w.abs() < 1e-9 { 1e-9 } else { w };
+                let t1 = v * (rng.f64() + rng.f64() + rng.f64() + rng.f64() - 2.0);
+                let phi = fmath::atan2(y, x);
+                let t2 = phi + t1 * fmath::sin(p1);
+                let t3 = t1 * fmath::cos(p1) - 1.0;
+                let (s2, c2) = fmath::sincos(t2);
+                ((r * c2 + t3 * x) / v, (r * s2 + t3 * y) / v)
+            }
+            Variation::Pie => {
+                let p1 = pvals[pval::PIE_SLICES].max(1.0);
+                let p2 = pvals[pval::PIE_ROTATION];
+                let p3 = pvals[pval::PIE_THICKNESS];
+                let t1 = (rng.f64() * p1 + 0.5).trunc();
+                let t2 = p2 + (2.0 * PI / p1) * (t1 + rng.f64() * p3);
+                let p = rng.f64();
+                let (s, c) = fmath::sincos(t2);
+                (p * c, p * s)
+            }
+            Variation::Ngon => {
+                let p1 = pvals[pval::NGON_POWER];
+                let sides = pvals[pval::NGON_SIDES].max(1.0);
+                let p2 = 2.0 * PI / sides;
+                let p3 = pvals[pval::NGON_CORNERS];
+                let p4 = pvals[pval::NGON_CIRCLE];
+                let phi = fmath::atan2(y, x);
+                let t3 = phi - p2 * (phi / p2).floor();
+                let t4 = if t3 > p2 * 0.5 { t3 } else { t3 - p2 };
+                let denom = fmath::pow(r, p1).max(1e-10);
+                let k = (p3 * (1.0 / (fmath::cos(t4).abs() + 1e-10) - 1.0) + p4) / denom;
+                (k * x, k * y)
+            }
+            Variation::Rectangles => {
+                let p1 = pvals[pval::RECT_X];
+                let p2 = pvals[pval::RECT_Y];
+                let nx = if p1.abs() < 1e-10 { x } else { (2.0 * (x / p1).floor() + 1.0) * p1 - x };
+                let ny = if p2.abs() < 1e-10 { y } else { (2.0 * (y / p2).floor() + 1.0) * p2 - y };
+                (nx, ny)
+            }
+            Variation::Arch => {
+                let a = rng.f64() * PI * w;
+                let (s, c) = fmath::sincos(a);
+                (fmath::sin(a), s * s / (c + 1e-10))
+            }
+            Variation::Square => (rng.f64() - 0.5, rng.f64() - 0.5),
+            Variation::Rays => {
+                let v = if w.abs() < 1e-9 { 1e-9 } else { w };
+                let k = v * fmath::tan(rng.f64() * PI * v) / (r2 + 1e-10);
+                (k * fmath::cos(x), k * fmath::sin(y))
+            }
+            Variation::Blade => {
+                let a = rng.f64() * r * w;
+                let (s, c) = fmath::sincos(a);
+                (x * (c + s), x * (c - s))
+            }
+            Variation::Secant => {
+                let v = if w.abs() < 1e-9 { 1e-9 } else { w };
+                (x, 1.0 / (v * fmath::cos(v * r) + 1e-10))
+            }
+            Variation::Twintrian => {
+                let a = rng.f64() * r * w;
+                let (s, c) = fmath::sincos(a);
+                let t = fmath::log((s * s).max(1e-300)) / core::f64::consts::LN_10 + c;
+                (x * t, x * (t - PI * s))
             }
         }
     }

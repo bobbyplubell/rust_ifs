@@ -10,6 +10,7 @@ use crate::fmath;
 use crate::palette::Palette;
 use crate::rng::Rng;
 use crate::variations::{pval, Variation, N_PVALS};
+use core::f64::consts::PI;
 
 /// One IFS map: pre-affine -> weighted blend of variations -> post-affine,
 /// carrying a color coordinate.
@@ -48,7 +49,7 @@ impl Transform {
             if w == 0.0 {
                 continue;
             }
-            let (vx, vy) = Variation::ALL[i].apply(px, py, &self.pvals, rng);
+            let (vx, vy) = Variation::ALL[i].apply(px, py, &self.pvals, &self.affine, w, rng);
             bx += w * vx;
             by += w * vy;
         }
@@ -84,12 +85,24 @@ impl Transform {
         p[pval::PDJ_B] = rng.range(-2.5, 2.5);
         p[pval::PDJ_C] = rng.range(-2.5, 2.5);
         p[pval::PDJ_D] = rng.range(-2.5, 2.5);
+        p[pval::PERSP_ANGLE] = rng.range(0.2, 1.3);
+        p[pval::PERSP_DIST] = rng.range(1.0, 3.0);
+        p[pval::RADIAL_BLUR_ANGLE] = rng.range(-1.0, 1.0);
+        p[pval::PIE_SLICES] = (3 + rng.below(6)) as f64;
+        p[pval::PIE_ROTATION] = rng.range(-PI, PI);
+        p[pval::PIE_THICKNESS] = rng.range(0.3, 0.9);
+        p[pval::NGON_POWER] = rng.range(1.5, 4.5);
+        p[pval::NGON_SIDES] = (3 + rng.below(6)) as f64;
+        p[pval::NGON_CORNERS] = rng.range(1.0, 3.0);
+        p[pval::NGON_CIRCLE] = rng.range(1.0, 3.0);
+        p[pval::RECT_X] = rng.range(0.2, 1.2);
+        p[pval::RECT_Y] = rng.range(0.2, 1.2);
         p
     }
 
     /// Variations that work as a transform's dominant "shape" — biased toward
     /// the ones that produce locally-2D (solid-looking) attractor regions.
-    const SHAPE_POOL: [Variation; 14] = [
+    const SHAPE_POOL: [Variation; 18] = [
         Variation::JuliaN,
         Variation::JuliaN, // double weight: the classic solid look
         Variation::JuliaScope,
@@ -104,6 +117,10 @@ impl Transform {
         Variation::Pdj,
         Variation::Swirl,
         Variation::Julia,
+        Variation::Ngon,
+        Variation::Fisheye,
+        Variation::Rings,
+        Variation::Fan,
     ];
 
     pub fn random(rng: &mut Rng) -> Transform {

@@ -70,7 +70,7 @@ export const fraudSignBytes = (f) =>
   utf8(`fraud|${f.voteKey}|${f.frame}|${f.expected}|${f.reporter}`);
 
 /** BroadcastChannel bus name — bumped on wire-format breaks. */
-export const CHANNEL = 'sheep-net-v5';
+export const CHANNEL = 'sheep-net-v6';
 
 export class BroadcastTransport {
   constructor(channel = CHANNEL) {

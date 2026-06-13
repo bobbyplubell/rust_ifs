@@ -7,7 +7,7 @@
 // tonemap is the older max-normalized one. What it buys is raw speed: full
 //-screen animation at frame rates the CPU path cannot approach.
 
-const STRIDE = 60; // floats per transform: [weight, color, affine6, post6, var29, pvals16, color_speed]
+const STRIDE = 92; // floats per transform: [weight, color, affine6, post6, var49, pvals28, color_speed]
 const COLOR_SCALE = 256.0;
 const BURN_IN = 20;
 const THREADS = 1 << 16; // parallel trajectories per frame (preview-sized)
@@ -42,9 +42,9 @@ function packTransform(out, base, t) {
   out[base + 1] = t.color;
   const A = t.affine, P = t.post;
   out.set([A.a, A.b, A.c, A.d, A.e, A.f, P.a, P.b, P.c, P.d, P.e, P.f], base + 2);
-  for (let v = 0; v < 29; v++) out[base + 14 + v] = t.variations[v] || 0;
-  for (let k = 0; k < 16; k++) out[base + 43 + k] = (t.pvals && t.pvals[k]) || 0;
-  out[base + 59] = t.color_speed ?? 0.5;
+  for (let v = 0; v < 49; v++) out[base + 14 + v] = t.variations[v] || 0;
+  for (let k = 0; k < 28; k++) out[base + 63 + k] = (t.pvals && t.pvals[k]) || 0;
+  out[base + 91] = t.color_speed ?? 0.5;
 }
 
 function packGenome(g) {
@@ -174,7 +174,7 @@ export class GpuFlame {
    *  the running max across a spin stabilizes exposure within one loop. */
   async frame(genomeJson, phase, {
     width, height, ss = 1, samples = 4_000_000, seed = 7, keepExposure = false,
-    shutter = 0, temporal = 1,
+    shutter = 0, temporal = 1, directional = 0,
   } = {}) {
     const base = typeof genomeJson === 'string' ? JSON.parse(genomeJson) : genomeJson;
     const steps = shutter > 0 ? Math.max(1, temporal) : 1;
@@ -208,10 +208,13 @@ export class GpuFlame {
         plotIters, BURN_IN, (seed + k * 0x9e3779b9) >>> 0, ss,
         width, height, 0, 0,
       ]);
+      // Directional motion blur (Draves 9.1): earlier steps dimmer.
+      const d = Math.min(Math.max(directional, 0), 1);
+      const intensity = steps > 1 ? (1 - d) + (d * (k + 1)) / steps : 1;
       new Float32Array(params, 48, 16).set([
         a, b, c, dd,
         e, f, COLOR_SCALE, totalWeight,
-        subs[0].gamma, subs[0].brightness, Math.min(Math.max(subs[0].vibrancy, 0), 1), 0,
+        subs[0].gamma, subs[0].brightness, Math.min(Math.max(subs[0].vibrancy, 0), 1), intensity,
         subs[0].background[0], subs[0].background[1], subs[0].background[2], 0,
       ]);
       d.queue.writeBuffer(this.buf.params[k], 0, params);
