@@ -43,6 +43,10 @@ button {
 }
 button:hover:not(:disabled) { border-color: #c8b06a; }
 button:disabled { color: #62627a; cursor: default; }
+/* back = spend a credit to vote; visually distinct from the render pledge. */
+button.back { border-color: #5a4a6a; color: #c8a0e0; }
+button.back:hover:not(:disabled) { border-color: #c8a0e0; }
+button.on { border-color: #c8b06a; color: #c8b06a; }
 
 #nursery {
   display: flex; gap: 16px; align-items: flex-start;

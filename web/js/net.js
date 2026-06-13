@@ -49,8 +49,9 @@ export const AUTHOR_GEN_CAP = 3;
 /** Tiles a user must have contributed to BOTH parents before a bred child they
  *  release is admitted to the flock. Enforced deterministically in gens.js (a
  *  release lacking the evidence is excluded by every peer), so it's protocol,
- *  not a client courtesy. */
-export const BREED_MIN_TILES = 4;
+ *  not a client courtesy. Breeding is meant to cost real work — 64 tiles on
+ *  EACH parent (128 total) — so a cross is a genuine investment, not a click. */
+export const BREED_MIN_TILES = 64;
 
 /** Render-spec schedule. The spec a sheep is rendered at is a function of the
  *  GENERATION it was born in — so a future entry can raise resolution (or frame
@@ -94,8 +95,51 @@ export const ACCEPTED_VERSIONS = new Set([1]);
 export const batchKey = (b) => `${b.sheepId}:${b.frame}:${b.idx}`;
 export const batchSignBytes = (b) =>
   utf8('batch|' + [b.v, b.sheepId, b.frame, b.idx, b.hash, b.spp, b.count, b.gen].join('|'));
-/** v1: one batch, one vote. Kept as a function so weighting can change later. */
+/** Render coverage weight: one batch = one unit of accumulated render quality
+ *  (a "how well-rendered is this sheep" metric — distinct from selection votes,
+ *  which are now spent credits; see the vote-credit economy below). */
 export const voteValue = (_b) => 1;
+
+// -- vote-credit economy ------------------------------------------------------
+//
+// Rendering and selection are DECOUPLED. Each audited batch you contribute in a
+// generation mints one fungible CREDIT for that generation (use-it-or-lose-it,
+// expires at gen close). You SPEND credits by publishing `vote` records that
+// back a sheep (back-only, flat: 1 credit = 1 vote). A sheep's selection score
+// is its total BACKING (sum of valid votes), NOT its render coverage — so you
+// render where it's useful but steer survival where you care.
+//
+// Enforcement is deterministic recomputation (gens.js + the helpers here): a
+// voter's spend is capped at the credits they earned that gen; over-budget
+// votes are dropped in canonical (seq) order so every peer agrees. Credits =
+// audited CPU work, so influence can't be faked or Sybil-farmed for free.
+export const voteKey = (v) => `vote:${v.gen}:${v.from}:${v.seq}`;
+export const voteSignBytes = (v) =>
+  utf8('vote|' + [v.v, v.from, v.gen, v.sheepId, v.n, v.seq].join('|'));
+
+/** Pure, deterministic: given a generation's vote records and each voter's
+ *  earned-credit count, return Map(sheepId -> backing). A voter's votes are
+ *  honored earliest-first (by seq) until their credit budget is spent; the
+ *  rest are dropped. Callers pre-filter banned voters out of both inputs. */
+export function computeBacking(votes, earned) {
+  const byVoter = new Map();
+  for (const v of votes) {
+    if (!byVoter.has(v.from)) byVoter.set(v.from, []);
+    byVoter.get(v.from).push(v);
+  }
+  const backing = new Map();
+  for (const [voter, vs] of byVoter) {
+    vs.sort((a, b) => (a.seq - b.seq) || (voteKey(a) < voteKey(b) ? -1 : 1));
+    let budget = earned.get(voter) || 0;
+    for (const v of vs) {
+      if (budget <= 0) break;
+      const take = Math.min(v.n, budget);
+      budget -= take;
+      backing.set(v.sheepId, (backing.get(v.sheepId) || 0) + take);
+    }
+  }
+  return backing;
+}
 
 // -- sheep --------------------------------------------------------------------
 //
@@ -114,8 +158,9 @@ export const sheepSignBytes = (r) =>
 export const fraudSignBytes = (f) =>
   utf8('fraud|' + [f.v, f.batchKey, f.expected, f.reporter].join('|'));
 
-/** BroadcastChannel bus name — bumped on wire-format breaks. */
-export const CHANNEL = 'sheep-net-v14';
+/** BroadcastChannel bus name — bumped on wire-format breaks. v15 adds the
+ *  vote-credit economy (a new `vote` record kind; selection = backing). */
+export const CHANNEL = 'sheep-net-v15';
 
 // Lossless gzip via the platform CompressionStream (no deps). Used to shrink
 // the heavy render-data histogram in transit; verification is unaffected.
@@ -178,7 +223,7 @@ export class Net {
    */
   constructor({ transport, store, identity, sign, verify: verifyFn,
                 checkBatchHash, checkSheepId, verifyRender, lookupSheep,
-                onSheep, onBatch, onFraud, onRender }) {
+                onSheep, onBatch, onFraud, onRender, onVote }) {
     this.transport = transport;
     this.store = store;
     this.identity = identity || {};
@@ -194,6 +239,7 @@ export class Net {
     this.onBatch = onBatch;
     this.onFraud = onFraud;
     this.onRender = onRender;
+    this.onVote = onVote;
     this.peers = new Map(); // pubHex -> last inv timestamp
     this.banned = new Set(); // contributors with a confirmed fraud proof
     // Wire telemetry (stress testing / swarm page): message counts + bytes.
@@ -261,6 +307,17 @@ export class Net {
     }
   }
 
+  /** Spend a credit: publish a signed vote backing a sheep this generation.
+   *  Caller has set record.{v,from,gen,sheepId,n,seq,sig}. */
+  async publishVote(record) {
+    record.key = voteKey(record);
+    if (await this.store.addVote(record)) {
+      this.markDirty();
+      this._send({ kind: 'vote', record });
+      this.onVote?.(record);
+    }
+  }
+
   async publishFraud(record) {
     record.key = record.batchKey;
     if (await this.store.addFraud(record)) {
@@ -284,6 +341,7 @@ export class Net {
       case 'sheep': return this._ingestSheep(msg.record);
       case 'batch': return this._ingestBatch(msg.record);
       case 'fraud': return this._ingestFraud(msg.record);
+      case 'vote': return this._ingestVote(msg.record);
       case 'inv': return this._onInv(msg);
       case 'cov': return this._onCov(msg);
       case 'bucket': return this._onBucket(msg);
@@ -295,6 +353,7 @@ export class Net {
         for (const r of msg.sheep || []) await this._ingestSheep(r);
         for (const r of msg.batches || []) await this._ingestBatch(r);
         for (const r of msg.fraud || []) await this._ingestFraud(r);
+        for (const r of msg.votes || []) await this._ingestVote(r);
         return;
       }
       case 'want-render': return this._onWantRender(msg);
@@ -374,6 +433,25 @@ export class Net {
     }
   }
 
+  /** A vote spends a credit backing a sheep. Ingest checks well-formedness +
+   *  signature only; the credit BUDGET (spend <= earned) is enforced later by
+   *  deterministic recompute (computeBacking), because earned credits depend on
+   *  batches that may not have synced yet — exactly like the batch tally. */
+  async _ingestVote(v) {
+    if (!v || !HEX64.test(v.sheepId ?? '') || !HEX64.test(v.from ?? '')) return;
+    if (!ACCEPTED_VERSIONS.has(v.v)) return;
+    if (!Number.isInteger(v.gen)) return;
+    if (!Number.isInteger(v.n) || v.n < 1 || v.n > 1_000_000) return;
+    if (!Number.isInteger(v.seq) || v.seq < 0) return;
+    if (this.banned.has(v.from)) return; // banned keys cast nothing
+    if (!(await this.verify(v.from, v.sig, voteSignBytes(v)))) return;
+    // Bound storage to votes for sheep we actually know (anti-entropy re-offers
+    // a vote that arrives before its sheep).
+    if (this.lookupSheep && !(await this.lookupSheep(v.sheepId))) return;
+    v.key = voteKey(v);
+    if (await this.store.addVote(v)) { this.markDirty(); this.onVote?.(v); }
+  }
+
   // -- helpers -----------------------------------------------------------------
 
   async _batchByKey(key) {
@@ -432,6 +510,7 @@ export class Net {
   _genOf(kind, rec) {
     if (kind === 'sheep') return rec.gen ?? 0;
     if (kind === 'batches') return rec.gen ?? 0;
+    if (kind === 'votes') return rec.gen ?? 0;
     // fraud has no own gen; bucket it by the offending batch's frame/idx-free
     // key is impossible, so bucket all fraud into gen 0 (small set).
     return 0;
@@ -439,7 +518,7 @@ export class Net {
 
   async _buckets() {
     if (this._bucketCache && !this._dirty) return this._bucketCache;
-    const out = { sheep: new Map(), batches: new Map(), fraud: new Map() };
+    const out = { sheep: new Map(), batches: new Map(), fraud: new Map(), votes: new Map() };
     const cov = new Map(); // sheepId -> [batchKey]
     const add = (kind, g, key) => {
       if (!out[kind].has(g)) out[kind].set(g, []);
@@ -457,8 +536,11 @@ export class Net {
     for (const f of await this.store.allFraud()) {
       add('fraud', this._genOf('fraud', f), f.key ?? f.batchKey);
     }
-    const digests = { sheep: {}, batches: {}, fraud: {} };
-    for (const kind of ['sheep', 'batches', 'fraud']) {
+    for (const v of await this.store.allVotes()) {
+      add('votes', this._genOf('votes', v), v.key ?? voteKey(v));
+    }
+    const digests = { sheep: {}, batches: {}, fraud: {}, votes: {} };
+    for (const kind of ['sheep', 'batches', 'fraud', 'votes']) {
       for (const [g, keys] of out[kind]) {
         keys.sort();
         digests[kind][g] = (await sha256Hex(utf8(keys.join(',')))).slice(0, 16);
@@ -489,7 +571,7 @@ export class Net {
     this.peers.set(msg.from, Date.now());
     const { keys, digests } = await this._buckets();
     let sent = 0;
-    for (const kind of ['sheep', 'batches', 'fraud']) {
+    for (const kind of ['sheep', 'batches', 'fraud', 'votes']) {
       const gens = new Set([
         ...Object.keys(digests[kind]),
         ...Object.keys(msg.d[kind] ?? {}),
@@ -560,28 +642,31 @@ export class Net {
     if (msg.to !== this.pubHex) return;
     const wanted = new Set(msg.keys ?? []);
     const payload = await this._fillFor(msg.from, msg.what, wanted);
-    if (payload.sheep.length || payload.batches.length || payload.fraud.length) {
+    if (payload.sheep.length || payload.batches.length || payload.fraud.length || payload.votes.length) {
       this._send(payload);
     }
   }
 
   async _fillFor(to, what, wantedSet) {
-    const payload = { kind: 'data', to, sheep: [], batches: [], fraud: [] };
+    const payload = { kind: 'data', to, sheep: [], batches: [], fraud: [], votes: [] };
     if (what === 'sheep') {
       payload.sheep = (await this.store.allSheep()).filter((r) => wantedSet.has(r.id));
     } else if (what === 'batches') {
       payload.batches = (await this.store.allBatches())
         .filter((b) => wantedSet.has(b.key ?? batchKey(b)));
+    } else if (what === 'votes') {
+      payload.votes = (await this.store.allVotes()).filter((v) => wantedSet.has(v.key ?? voteKey(v)));
     } else {
       payload.fraud = (await this.store.allFraud()).filter((f) => wantedSet.has(f.key ?? f.batchKey));
     }
     return payload;
   }
 
-  // -- selection tally ---------------------------------------------------------
+  // -- render coverage + selection backing -------------------------------------
 
-  /** Tally a sheep in a generation: distinct verified batches whose record
-   *  carries gen=g, from non-banned contributors. One batch, one vote. */
+  /** Render COVERAGE of a sheep in a generation: distinct verified batches with
+   *  gen=g from non-banned contributors. A "how well-rendered is it" metric —
+   *  NOT the selection score (that's backing, below). One batch, one credit. */
   async tally(sheepId, g) {
     const batches = await this.store.batchesForSheep(sheepId);
     let n = 0;
@@ -593,6 +678,49 @@ export class Net {
       if (seen.has(k)) continue;
       seen.add(k);
       n += voteValue(b);
+    }
+    return n;
+  }
+
+  /** Credits earned per voter in a generation = their distinct verified batches
+   *  that gen (non-banned). The currency that funds votes. */
+  async _earnedCredits(g) {
+    const earned = new Map();
+    const seen = new Set();
+    for (const b of await this.store.allBatches()) {
+      if (b.gen !== g || this.banned.has(b.contributor)) continue;
+      const k = b.key ?? batchKey(b);
+      if (seen.has(k)) continue;
+      seen.add(k);
+      earned.set(b.contributor, (earned.get(b.contributor) || 0) + voteValue(b));
+    }
+    return earned;
+  }
+
+  /** Selection BACKING for a whole generation: Map(sheepId -> credits backing).
+   *  This is the authoritative score gens.js uses to pick survivors. */
+  async tallies(g) {
+    const earned = await this._earnedCredits(g);
+    const votes = (await this.store.allVotes())
+      .filter((v) => v.gen === g && !this.banned.has(v.from));
+    return computeBacking(votes, earned);
+  }
+
+  /** The local user's credit position this generation. */
+  async credits(g) {
+    const earned = (await this._earnedCredits(g)).get(this.pubHex) || 0;
+    let spent = 0;
+    for (const v of await this.store.allVotes()) {
+      if (v.gen === g && v.from === this.pubHex) spent += v.n;
+    }
+    return { earned, spent, available: Math.max(0, earned - spent) };
+  }
+
+  /** How many votes a key has cast in a generation (the next seq for that key). */
+  async voteCount(g, pub) {
+    let n = 0;
+    for (const v of await this.store.allVotes()) {
+      if (v.gen === g && v.from === pub) n++;
     }
     return n;
   }

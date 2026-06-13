@@ -36,16 +36,19 @@
       <li><em>Watch.</em> The flock shows whatever the swarm has rendered so
         far. Hover a card to preview its animation; click it for the
         full-screen loop.</li>
-      <li><em>Contribute.</em> Press <em>contribute</em> on a sheep you like.
-        Your browser renders <em>tiles</em> into it — each tile sharpens the
-        sheep for everyone <em>and</em> is a vote for it. Work and taste are the
-        same act.</li>
+      <li><em>Contribute.</em> Press <em>contribute</em> on any sheep. Your
+        browser renders <em>tiles</em> into it — each tile sharpens the sheep for
+        everyone <em>and</em> earns you one <em>credit</em>.</li>
+      <li><em>Back.</em> Spend your credits with <em>back ▲</em> on the sheep you
+        want to keep. Credits are fungible — render where it helps, back what you
+        love — and they're use-it-or-lose-it: each generation you start fresh.</li>
       <li><em>Breed.</em> Pick two living sheep to see the exact child they'd
-        produce. To release it you must first have contributed tiles to
-        <em>both</em> parents — your stake in the cross.</li>
+        produce. To release it you must first have rendered 64 tiles to
+        <em>each</em> parent — a real stake in the cross, not a click.</li>
       <li><em>Selection.</em> Every 5 minutes a generation closes: the
-        most-rendered sheep survive and breed into the next, alongside mutant
-        clones and a fresh random immigrant so the gene pool never stagnates.</li>
+        <em>most-backed</em> sheep survive and breed into the next, alongside
+        mutant clones and a fresh random immigrant so the gene pool never
+        stagnates.</li>
     </ol>
 
     <h2>how does it work</h2>
@@ -62,8 +65,11 @@
       gets the identical result, and tiles <em>sum</em> — the histograms are
       integer, so merging everyone's tiles is exact and order-independent. The
       shared object isn't a ledger of votes; it's the <em>sheep itself</em>, a
-      growing pile of tiles that any peer can extend. Each tile a sheep holds is
-      one unit of both its quality and its vote count — they're the same number.
+      growing pile of tiles that any peer can extend. Rendering and <em>voting</em>
+      are decoupled: each tile you render earns a fungible credit, and you spend
+      credits to <em>back</em> the sheep you want to survive — so the best-rendered
+      sheep and the most-backed sheep can differ. Credits are audited render work,
+      so influence is bought only with real CPU spent improving the commons.
     </p>
     <p>
       Because the pixels are <em>derivable</em>, nothing has to be trusted.

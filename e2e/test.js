@@ -282,14 +282,21 @@ let firstId; // a baked sheep id, reused by the swarm section's peer=1 store
       baked.push({ id: wasm.sheep_id(genome), genome, parents: null, gen: 0, baked: true, name: s.name });
     }
     const g = gen() - 2;
-    // batch tallies: baked[0] gets work this generation.
+    const author = 'f'.repeat(64);
+    // baked[0] gets render work (earns credits) AND backing votes this gen.
+    // Selection keys off BACKING (spent credits), so it needs the votes to win.
     const batches = [0, 1, 2, 3].map((idx) => ({
-      sheepId: baked[0].id, frame: 0, idx, contributor: 'f'.repeat(64), gen: g,
+      sheepId: baked[0].id, frame: 0, idx, contributor: author, gen: g,
+    }));
+    const votes = [0, 1, 2, 3].map((seq) => ({
+      from: author, gen: g, sheepId: baked[0].id, n: 1, seq,
+      key: `vote:${g}:${author}:${seq}`,
     }));
     const store = {
       allSheep: async () => [],
       allBatches: async () => batches,
       allFraud: async () => [],
+      allVotes: async () => votes,
     };
     const breedFn = async (a, b, ch) => {
       const childJson = wasm.breed(a, b, ch);
@@ -349,7 +356,8 @@ let firstId; // a baked sheep id, reused by the swarm section's peer=1 store
       const j = wasm.breed(a, b, ch); return { childJson: j, childId: wasm.sheep_id(j) };
     };
     const mk = (batches) => ({
-      allSheep: async () => [release], allBatches: async () => batches, allFraud: async () => [],
+      allSheep: async () => [release], allBatches: async () => batches,
+      allFraud: async () => [], allVotes: async () => [],
     });
     const r1 = await computeFlock({ // too few on parent b
       store: mk([...tiles(BREED_MIN_TILES, baked[0].id), ...tiles(BREED_MIN_TILES - 1, baked[1].id)]),
@@ -364,6 +372,59 @@ let firstId; // a baked sheep id, reused by the swarm section's peer=1 store
   check('breeding gate: release blocked without tiles on both parents, admitted with',
     gate.blocked && gate.admitted, `blocked=${gate.blocked}, admitted=${gate.admitted}`);
   await page.close();
+}
+
+// ---- 7. vote-credit economy: earn credits, back a sheep, it syncs -----------
+{
+  section('vote-credit economy');
+  // nocontribute so credits change ONLY via our explicit actions (no background
+  // contribute loop racing the balance).
+  const a = await ctx.newPage();
+  const b = await ctx.newPage();
+  a.on('console', (m) => { if (m.type() === 'error') console.log('a console.error:', m.text()); });
+  await a.goto(`${base}/index.html?peer=30&stress=1&nocontribute=1`);
+  await b.goto(`${base}/index.html?peer=31&stress=1&nocontribute=1`);
+  await a.waitForFunction(() => window.__sheepAct && document.querySelectorAll('.card').length > 0);
+  await b.waitForFunction(() => window.__sheepAct && document.querySelectorAll('.card').length > 0);
+
+  // a: render 3 tiles to one sheep (earn 3 credits), then back it twice.
+  const r = await a.evaluate(async () => {
+    const id = document.querySelector('.card').dataset.id;
+    for (let i = 0; i < 3; i++) await window.__sheepAct.contributeTo(id);
+    const before = await window.__sheepAct.credits();
+    await window.__sheepAct.back(id);
+    await window.__sheepAct.back(id);
+    const after = await window.__sheepAct.credits();
+    return { id, before, after, backing: await window.__sheepAct.backing(id) };
+  });
+  check('a earned credits from rendering', r.before.earned === 3, `earned=${r.before.earned}`);
+  check('a spent credits, balance dropped',
+    r.after.spent === 2 && r.after.available === 1,
+    `spent=${r.after.spent}, available=${r.after.available}`);
+  check('a backing reflects its votes (<= credits)', r.backing === 2, `backing=${r.backing}`);
+
+  // b: receives a's batches + votes via anti-entropy and computes the same backing.
+  let bBacking = 0;
+  for (let i = 0; i < 40; i++) {
+    bBacking = await b.evaluate((id) => window.__sheepAct.backing(id), r.id);
+    if (bBacking >= 2) break;
+    await new Promise((res) => setTimeout(res, 500));
+  }
+  check('b received the votes (backing synced cross-peer)', bBacking === 2, `b backing=${bBacking}`);
+
+  // Overspend is impossible: spend the last credit, then back() is a no-op.
+  const over = await a.evaluate(async (id) => {
+    await window.__sheepAct.back(id);              // spend the 3rd/last credit
+    const c = await window.__sheepAct.credits();
+    const blocked = await window.__sheepAct.back(id); // no credits -> null
+    return { available: c.available, blocked, backing: await window.__sheepAct.backing(id) };
+  }, r.id);
+  check('overspend blocked; backing capped at earned credits',
+    over.available === 0 && over.blocked === null && over.backing === 3,
+    `available=${over.available}, blocked=${over.blocked}, backing=${over.backing}`);
+
+  await a.close();
+  await b.close();
 }
 
 console.log(failures ? `\n${failures} CHECK(S) FAILED` : '\nALL E2E CHECKS PASSED');

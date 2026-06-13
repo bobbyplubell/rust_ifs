@@ -3,10 +3,11 @@
 // if absent, never updated or removed. Namespaced per ?peer=N so dev tabs have
 // independent state.
 //
-// v11 (batch-contribution era). Object stores:
+// v15 (vote-credit-economy era). Object stores:
 //   sheep   keyPath 'id'   — content-addressed sheep records
 //   batches keyPath 'key'  — batch contributions, key = batchKey(sheepId:f:i)
 //   fraud   keyPath 'key'  — fraud proofs, key = batchKey of the offender
+//   votes   keyPath 'key'  — selection votes (spent credits), key = voteKey
 //   renders kv            — `${sheepId}:${frame}` -> verified histogram bytes
 //                            (ArrayBuffer), a cache/serving store for the gate.
 
@@ -14,11 +15,12 @@ import { PEER_NS } from './identity.js';
 
 export async function openStore() {
   const db = await new Promise((resolve, reject) => {
-    const req = indexedDB.open(`sheep-store-v14-${PEER_NS}`, 1);
+    const req = indexedDB.open(`sheep-store-v15-${PEER_NS}`, 1);
     req.onupgradeneeded = () => {
       req.result.createObjectStore('sheep', { keyPath: 'id' });
       req.result.createObjectStore('batches', { keyPath: 'key' });
       req.result.createObjectStore('fraud', { keyPath: 'key' });
+      req.result.createObjectStore('votes', { keyPath: 'key' });
       req.result.createObjectStore('renders'); // `${sheepId}:${frame}` -> ArrayBuffer
     };
     req.onsuccess = () => resolve(req.result);
@@ -83,6 +85,9 @@ export async function openStore() {
     // fraud
     addFraud: (rec) => addIfAbsent('fraud', rec),
     allFraud: () => getAll('fraud'),
+    // votes — keyPath is `key`, set by net to voteKey(v)
+    addVote: (rec) => addIfAbsent('votes', rec),
+    allVotes: () => getAll('votes'),
     // verified render cache: `${sheepId}:${frame}` -> { buf:ArrayBuffer, keys:[batchKey] }
     // keys are EXACTLY the tiles summed into buf, so a served render and its
     // claimed batchKeys stay consistent (the gate checks total_count == Σ counts).

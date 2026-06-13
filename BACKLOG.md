@@ -5,6 +5,13 @@ discussions. Ordered roughly by priority within each section. The committed
 design lives in ARCHITECTURE.md; this is the "next" list.
 
 ## Done (for reference)
+- Vote-credit economy: rendering earns fungible, use-it-or-lose-it **credits**;
+  spend them to **back** sheep; selection = backing, decoupled from render
+  coverage. Back-only, flat (no anti-whale curve — credits = audited CPU is the
+  real Sybil/whale defense), deterministic-recompute enforced (`computeBacking`
+  caps spend at earned, drops over-budget votes canonically). New `vote` record
+  kind + `votes` store, synced via the same anti-entropy buckets.
+- Breeding cost raised to 64 tiles **per parent** (128 total) — a real stake.
 - Breeding gate (protocol-enforced in gens.js + UI mirror).
 - "What is this" page rewrite (4 sections).
 - Future-proofing: protocol version field in every record; render spec is
@@ -26,22 +33,14 @@ what you display) with no shared consequence.
 
 ## Game mechanics
 
-### Vote-credit economy (the big open design)
-Decouple render-work from voting. Contributing earns a **vote credit**; you
-spend credits *manually* on selection (back / cull sheep for next gen). Open
-decisions:
-- **Credit lifecycle:** per-generation use-it-or-lose-it (recommended — no
-  stockpiling/whales) vs persistent balance.
-- **For/against:** spend +1 (back) or −1 (cull).
-- **Anti-whale shaping:** flat / cap-per-sheep / quadratic cost (recommended —
-  escalating cost to pile votes on one sheep; rewards spreading + conviction).
-- **What one "contribute" action does:** a toggle that renders tiles while you
-  watch, accruing credits ≈ tiles rendered.
-- Unify with the breeding gate so contribution is one currency: render work →
-  (a) prettier sheep, (b) selection votes, (c) breeding rights.
-- Must be protocol-enforced (credits earned only via audited rendering; spends
-  validated). Currently selection tally = raw batch count; this replaces it
-  with spent-credits.
+### Vote-credit economy — SHIPPED (see Done). Remaining options if wanted later:
+- **Cull (down-votes):** v1 is back-only. A spend-to-cull action is possible but
+  invites coordinated griefing; deferred.
+- **Persistent credits:** v1 is per-gen use-it-or-lose-it. A saved balance would
+  reward long-haul contributors but concentrates early-adopter power; deferred.
+- **Unify breeding with credits:** breeding is still gated by raw tiles on the
+  parents (64 each), not credit spend. Could fold breeding rights into the one
+  credit currency later.
 
 ### Hall of Fame
 Keep the best sheep of each generation. Largely **emergent**: the generation

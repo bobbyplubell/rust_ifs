@@ -17,7 +17,7 @@ import { openStore } from './store.js';
 import {
   Net, BroadcastTransport, CompositeTransport, gen, GEN_MS, GENESIS_GEN,
   BATCH_SPEC, BATCH_SPP, batchKey, batchSignBytes, sheepSignBytes, fraudSignBytes,
-  BREED_MIN_TILES, PROTOCOL_VERSION, specForGen, specCells,
+  voteSignBytes, BREED_MIN_TILES, PROTOCOL_VERSION, specForGen, specCells,
 } from './net.js';
 import { computeFlock, breedChallenge } from './gens.js';
 import { handle, provenance } from './names.js';
@@ -128,6 +128,11 @@ async function main() {
     onBatch: (rec) => onBatch(rec).catch(console.error),
     onFraud: () => scheduleRebuild(), // a discredited contributor changes tallies
     onRender: (sheepId, frame, hist, keys) => onRender(sheepId, frame, hist, keys).catch(console.error),
+    onVote: (rec) => {
+      markTally(rec.sheepId);                     // this sheep's backing changed
+      if (rec.from === me.pubHex) creditsDirty = true; // only my own spend moves my balance
+      if (rec.gen < gen()) scheduleRebuild();     // retroactive: a closed gen's outcome moved
+    },
   });
 
   auditor = new Auditor({
@@ -169,13 +174,16 @@ async function main() {
 
   shownGen = gen();
   setInterval(() => {
-    refreshTallies();   // apply batched tally changes in one pass
-    updateStatus();     // shows the activity pulse from batchActivity
-    batchActivity = 0;  // reset the per-tick pulse after showing it
     if (gen() !== shownGen) {
       shownGen = gen();
-      scheduleRebuild(); // generation closed: survivors chosen, children born
+      voteSeqByGen.clear(); // new gen: vote seq restarts
+      creditsDirty = true;  // new gen: credits reset (use-it-or-lose-it)
+      scheduleRebuild();    // generation closed: survivors chosen, children born
     }
+    refreshTallies().catch(console.error); // batched backing repaint
+    refreshCredits().catch(console.error); // refresh cached credit balance
+    updateStatus();     // shows the activity pulse + credit balance
+    batchActivity = 0;  // reset the per-tick pulse after showing it
   }, 1000);
   updateStatus();
 }
@@ -259,8 +267,13 @@ function addCard(record) {
   const contribBtn = document.createElement('button');
   contribBtn.textContent = 'contribute';
   contribBtn.title = 'pledge idle CPU to this sheep — every batch you render ' +
-    'sharpens it for everyone and earns it a vote';
-  meta.append(label, tallyEl, contribBtn);
+    'sharpens it for everyone AND earns you one credit to spend on selection';
+  const backBtn = document.createElement('button');
+  backBtn.className = 'back';
+  backBtn.textContent = 'back ▲';
+  backBtn.title = 'spend one earned credit to back this sheep — backing (not render ' +
+    'work) decides who survives the generation';
+  meta.append(label, tallyEl, contribBtn, backBtn);
   const bar = document.createElement('div');
   bar.className = 'bar';
   const barFill = document.createElement('div');
@@ -291,6 +304,7 @@ function addCard(record) {
     contribBtn.textContent = entry.pledged ? 'pledged ✓' : 'contribute';
     contribBtn.classList.toggle('on', entry.pledged);
   });
+  backBtn.addEventListener('click', () => backSheep(entry).catch(showError));
 
   // Bootstrap this card's accumulation from any batches we already hold for
   // frame 0, then paint a quick preview placeholder, then the tally.
@@ -704,6 +718,7 @@ async function contributeBatch(entry) {
   };
   record.sig = await sign(me.pair, batchSignBytes(record));
   await net.publishBatch(record);
+  creditsDirty = true; // earned a credit
   updateTally(entry.record.id);
   return entry.record.id;
 }
@@ -735,21 +750,70 @@ const tallyDirty = new Set();
 let batchActivity = 0; // batches seen since the last tick (the "live" pulse)
 const markTally = (sheepId) => tallyDirty.add(sheepId);
 
-function refreshTallies() {
+// A card's ♥ is its BACKING (credits spent on it this gen) — the selection
+// score, not render coverage. Backing is a gen-wide computation (a voter's
+// spend is capped across all the sheep they backed), so recompute the whole
+// open generation once per tick and repaint just the dirty cards.
+async function refreshTallies() {
   if (!tallyDirty.size) return;
   const ids = [...tallyDirty];
   tallyDirty.clear();
-  for (const id of ids) updateTally(id);
+  const backing = await net.tallies(gen());
+  for (const id of ids) {
+    const entry = cards.get(id);
+    if (!entry) continue;
+    const n = backing.get(id) || 0;
+    entry.tallyEl.textContent = n > 0 ? `${n} ♥` : '';
+    entry.tallyEl.title = `${n} credit${n === 1 ? '' : 's'} backing this sheep this generation`;
+  }
 }
 
-function updateTally(sheepId) {
-  const entry = cards.get(sheepId);
-  if (!entry) return;
-  net.tally(sheepId, gen()).then((n) => {
-    if (!cards.has(sheepId)) return;
-    entry.tallyEl.textContent = n > 0 ? `${n} ♥` : '';
-    entry.tallyEl.title = `${n} verified batches this generation`;
-  }).catch(console.error);
+// Defer a single card's repaint to the next tick's batched recompute.
+function updateTally(sheepId) { markTally(sheepId); }
+
+// ---- credits (the vote-credit economy) --------------------------------------
+//
+// Earn one credit per batch you render this gen; spend credits to BACK sheep.
+// Credits are use-it-or-lose-it (reset every generation). The balance is cached
+// and recomputed only when your own render/vote activity changes it.
+let creditsView = { earned: 0, spent: 0, available: 0 };
+let creditsDirty = true;
+const voteSeqByGen = new Map(); // gen -> next seq for my votes (collision-free)
+
+async function refreshCredits() {
+  if (!creditsDirty) return;
+  creditsDirty = false;
+  creditsView = await net.credits(gen());
+}
+
+// Spend one credit to back a sheep for survival this generation.
+async function backSheep(entry) {
+  const g = gen();
+  const c = await net.credits(g);
+  if (c.available <= 0) {
+    flashNoCredits();
+    return;
+  }
+  let seq = voteSeqByGen.get(g);
+  if (seq == null) seq = await net.voteCount(g, me.pubHex);
+  voteSeqByGen.set(g, seq + 1);
+  const record = {
+    v: PROTOCOL_VERSION, from: me.pubHex, gen: g,
+    sheepId: entry.record.id, n: 1, seq,
+  };
+  record.sig = await sign(me.pair, voteSignBytes(record));
+  await net.publishVote(record);
+  markTally(entry.record.id);
+  creditsDirty = true;
+  await refreshTallies();
+  await refreshCredits();
+  updateStatus();
+}
+
+let noCreditsUntil = 0;
+function flashNoCredits() {
+  noCreditsUntil = Date.now() + 2500; // updateStatus shows the hint for ~2.5s
+  updateStatus();
 }
 
 // ---- breeding lab -----------------------------------------------------------
@@ -856,10 +920,12 @@ function updateStatus() {
   const ss = String(Math.floor((msLeft % 60_000) / 1000)).padStart(2, '0');
   const a = auditor?.stats ?? { audits: 0, frauds: 0 };
   const pulse = batchActivity ? ` · ⟳ ${batchActivity} tiles/s` : '';
+  const credHint = Date.now() < noCreditsUntil ? ' · ⚠ render to earn credits' : '';
   $('#status').textContent =
     `gen ${gen() - GENESIS_GEN} closes in ${mm}:${ss} · ` +
     `you are ${handle(me.pubHex)} · ${net.peerCount()} peers · ` +
-    `${a.audits} audits${a.frauds ? `, ${a.frauds} frauds!` : ''}${pulse}`;
+    `${creditsView.available} credits · ` +
+    `${a.audits} audits${a.frauds ? `, ${a.frauds} frauds!` : ''}${pulse}${credHint}`;
 }
 
 function showError(err) {
@@ -929,6 +995,18 @@ function installStressHooks() {
       const entry = cards.get(sheepId);
       return entry ? contributeBatch(entry) : null;
     },
+    // Spend one credit backing a sheep; returns sheepId, or null if no card / no
+    // available credits. (The vote-credit economy's spend action.)
+    async back(sheepId) {
+      const entry = cards.get(sheepId);
+      if (!entry) return null;
+      if ((await net.credits(gen())).available <= 0) return null;
+      await backSheep(entry);
+      return sheepId;
+    },
+    // Read hooks for tests/harness.
+    backing: async (sheepId) => (await net.tallies(gen())).get(sheepId) || 0,
+    credits: () => net.credits(gen()),
   };
 
   window.__sheepDump = async () => {

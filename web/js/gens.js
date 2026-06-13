@@ -10,6 +10,7 @@
 
 import {
   gen, SURVIVORS_K, AUTHOR_GEN_CAP, MUTANTS_PER_GEN, IMMIGRANTS_PER_GEN, BREED_MIN_TILES,
+  computeBacking,
 } from './net.js';
 import { sha256Hex, utf8 } from './hash.js';
 
@@ -117,21 +118,39 @@ export async function computeFlock({
     }
   }
 
-  // Tallies per generation. A sheep's tally is the count of distinct verified
-  // batches contributed to it (dedup is inherent: one record per
-  // sheep:frame:idx). Each batch is one vote AND one increment of render
-  // quality, so "best-looking" and "most-voted" are the same number. Batches
-  // from discredited keys (verified fraud proofs) count for nothing.
-  const tallyByGen = new Map();
-  // Per-(contributor, sheep) tile counts: the evidence the breeding gate needs.
+  // Render work feeds two things, from the same batch records:
+  //  - contrib: per-(contributor, sheep) tile counts — the breeding-gate evidence.
+  //  - earnedByGen: per-gen credits a contributor earned (their distinct batches
+  //    that gen) — the currency that funds selection votes.
+  // (Batches are deduped at the store, so a plain count is a distinct count.
+  // Batches from discredited keys (verified fraud) count for nothing.)
   const contrib = new Map(); // `${contributor}:${sheepId}` -> count
+  const earnedByGen = new Map(); // gen -> Map(contributor -> credits)
   for (const b of await store.allBatches()) {
     if (banned.has(b.contributor)) continue;
-    if (!tallyByGen.has(b.gen)) tallyByGen.set(b.gen, new Map());
-    const t = tallyByGen.get(b.gen);
-    t.set(b.sheepId, (t.get(b.sheepId) || 0) + 1);
     const ck = `${b.contributor}:${b.sheepId}`;
     contrib.set(ck, (contrib.get(ck) || 0) + 1);
+    if (!earnedByGen.has(b.gen)) earnedByGen.set(b.gen, new Map());
+    const e = earnedByGen.get(b.gen);
+    e.set(b.contributor, (e.get(b.contributor) || 0) + 1);
+  }
+
+  // Selection BACKING per generation = spent credits (votes), each voter capped
+  // at the credits they earned that gen (computeBacking drops over-budget votes
+  // canonically, so every peer agrees). This REPLACES raw batch count as the
+  // survival score: rendering sharpens the image, but only spent credits decide
+  // who lives — render where it helps, vote where you care.
+  const tallyByGen = new Map(); // gen -> Map(sheepId -> backing)
+  {
+    const votesByGen = new Map();
+    for (const v of await store.allVotes()) {
+      if (banned.has(v.from)) continue;
+      if (!votesByGen.has(v.gen)) votesByGen.set(v.gen, []);
+      votesByGen.get(v.gen).push(v);
+    }
+    for (const [g, votes] of votesByGen) {
+      tallyByGen.set(g, computeBacking(votes, earnedByGen.get(g) || new Map()));
+    }
   }
 
   // Breeding gate (protocol-enforced, deterministic): a user RELEASE is only

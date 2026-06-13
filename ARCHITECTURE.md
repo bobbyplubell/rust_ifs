@@ -4,7 +4,8 @@
 Pages-deployable site serves a WASM fractal-flame renderer. Each sheep is a
 **community-rendered animated artifact**: visitors contribute deterministic
 render work into the sheep's shared accumulation, which improves the loop *for
-everyone*, and each verified contribution earns a vote that drives selection.
+everyone*, and each verified contribution earns a credit you spend to vote on
+selection.
 There is no application server — all state lives in the swarm — and because the
 renderer is deterministic, every pixel on screen is provably a render of a
 public genome, never attacker-supplied data.
@@ -51,11 +52,15 @@ public genome, never attacker-supplied data.
    are only ever an optimization to save CPU; the source of truth is always
    "render the genome", and any client can fall back to rendering locally with
    zero trust.
-4. **Work is quality is votes.** A contributed batch simultaneously (a) makes
-   the sheep look better for everyone and (b) earns its contributor a vote. So
-   a sheep's render quality, its popularity, and its selection weight are the
-   same number — the cumulative honest render work invested in it. Honest users
-   never do makework; only attackers experience the render cost as a cost.
+4. **Work earns credits; credits are votes.** A contributed batch (a) makes the
+   sheep look better for everyone and (b) earns its contributor one fungible
+   **credit**. Render quality and selection are *decoupled*: you render where it
+   helps, then spend credits to **back** the sheep you want to survive. A sheep's
+   selection weight is its total backing (spent credits), not its render coverage,
+   so the best-looking sheep and the most-backed sheep can differ. Credits are
+   audited render work, so influence is bought only with real CPU — it can't be
+   faked or Sybil-farmed for free. Honest users never do makework; only attackers
+   experience the render cost as a cost.
 
 ## Components
 
@@ -138,8 +143,8 @@ batch_key = sheep_id ‖ ":" ‖ f ‖ ":" ‖ i
 ```
 
 It is verifiable by re-rendering `(f, i)` and checking `hash` (the audit
-primitive). Each accepted, non-duplicate, verified batch is **one vote for that
-sheep in its generation**.
+primitive). Each accepted, non-duplicate, verified batch mints **one credit** for
+its contributor in that generation (spent on votes — see Credits/selection).
 
 ### Accumulated render (the sheep's pixels — the shared artifact)
 
@@ -255,30 +260,38 @@ sheep's coverage and tally. The heavy pixels move on demand:
   frames without a coordinator. Collisions render identical data and are
   deduped by `(f, i)`.
 
-## Votes, selection, generations
+## Credits, votes, selection, generations
 
-- **Tally** of a sheep in generation `g` = count of distinct verified batches
-  contributed to it whose record carries `gen = g`, from non-banned keys.
-  (Optionally weighted; v1 = one batch, one vote.) This is also its render
-  quality, so "best-looking" and "most-voted" coincide by construction.
-- **Selection** is unchanged in shape (`gens.js`): per generation, **niched**
-  top-`K` (K=6) by tally survive (fitness-sharing over genome distance so one
-  aesthetic can't monopolize), filling empty slots from unvoted living, newest
-  first. Survivors breed by cyclic pairing; each active generation also derives
-  2 high-rate mutant clones of the top survivors and 1 deterministic immigrant.
-  All children/mutants/immigrants are derived from public data — every peer
-  computes identical genomes, no consensus.
+The **vote-credit economy** decouples render work from selection:
+
+- **Credits** earned by a key in generation `g` = its count of distinct verified
+  batches with `gen = g` (non-banned). Fungible and **use-it-or-lose-it** — they
+  expire at gen close, no stockpiling.
+- **Votes** are signed `vote` records (`{from, gen, sheepId, n, seq}`, back-only,
+  flat) that spend credits to back a sheep. Ingest checks only well-formedness +
+  signature; the credit BUDGET is enforced by deterministic recompute, exactly
+  like batch tallies (earned credits depend on batches that may not have synced).
+- **Backing** of a sheep in `g` = sum of valid votes for it. `computeBacking`
+  caps each voter's spend at their earned credits, dropping over-budget votes in
+  canonical (`seq`) order — so every peer agrees. Backing, NOT render coverage,
+  is the selection score.
+- **Selection** (`gens.js`): per generation, **niched** top-`K` (K=6) by backing
+  survive (fitness-sharing over genome distance so one aesthetic can't
+  monopolize), filling empty slots from unbacked living, newest first. Survivors
+  breed by cyclic pairing; each active generation also derives 2 high-rate mutant
+  clones of the top survivors and 1 deterministic immigrant. All
+  children/mutants/immigrants derive from public data — identical on every peer.
 - **Releases:** a user can submit a bred sheep directly (signed, `origin:
-  "release"`), capped per (author, gen). It enters the flock immediately and
-  earns votes by being rendered like any other.
-- **Down-votes (open):** v1 ships the unified model (contributing to a sheep is
-  a vote *for* it; you starve sheep you dislike of work and they get out-bred).
-  An optional spendable token for explicit culling is a later addition; the
-  generation engine already supports signed-direction tallies.
+  "release"`), capped per (author, gen), admitted only after rendering 64 tiles
+  to EACH parent (the breeding gate). It then earns backing like any other sheep.
+- **Anti-whale, honestly:** there's no quadratic/cap shaping — in a permissionless
+  swarm, free identities defeat it. The real defense is that credits = audited CPU
+  work, so influence is meritocratic (most useful work → most say) and can't be
+  Sybil-farmed for free.
 
 The clock-derived generation schedule and content-addressed, recomputable
-children mean a late-arriving batch retroactively recomputes a tally and every
-peer self-heals to the same flock.
+children mean a late-arriving batch or vote retroactively recomputes backing and
+every peer self-heals to the same flock.
 
 ## Network
 
