@@ -290,31 +290,40 @@ pub fn tonemap(accum: &Accum, genome: &Genome, width: usize, height: usize, ss: 
     let (ow, oh) = (width, height);
     let (hw, hh) = (accum.w, accum.h);
 
-    // Exposure: normalize log-density by the 99.5th percentile of nonzero
-    // supersampled-cell counts (strict max lets one hot cell dim everything).
-    let (norm_count, mean_nz) = {
+    // Exposure normalized to the MEAN nonzero density, NOT raw counts. Cell
+    // counts grow with the number of accumulated samples, so a raw-count white
+    // point makes log(1+c)/log(1+white) drift toward 1 for every cell as
+    // samples land — an accumulating render washes out toward white instead of
+    // cleaning up. Working in units of the mean density (count / mean) is
+    // invariant to sample count, so the tone map converges in place as noise
+    // falls ~1/sqrt(samples) — the same effect as flam3's 1/sample_density
+    // scaling. White point = a high percentile measured in those same units.
+    let (norm_ratio, mean_nz) = {
         let mut counts: Vec<f64> = accum.data.iter().map(|c| c[3]).filter(|&c| c > 0.0).collect();
         if counts.is_empty() {
             (0.0, 0.0)
         } else {
             let mean = counts.iter().sum::<f64>() / counts.len() as f64;
             counts.sort_unstable_by(f64::total_cmp);
-            (counts[((counts.len() - 1) as f64 * 0.995) as usize], mean)
+            let p995 = counts[((counts.len() - 1) as f64 * 0.995) as usize];
+            (p995 / mean, mean)
         }
     };
-    let log_max = fmath::log(1.0 + norm_count).max(1e-12);
+    let log_max = fmath::log(1.0 + norm_ratio).max(1e-12);
+    let inv_mean = if mean_nz > 0.0 { 1.0 / mean_nz } else { 0.0 };
     let brightness = genome.brightness;
     let bg = genome.background;
 
     // 1. Resolve each supersampled cell: linear color scaled by log-density
-    // luminance l in [0,1]; alpha channel carries l for compositing.
+    // luminance l in [0,1] (density measured in mean units, sample-invariant);
+    // alpha channel carries l for compositing.
     let mut resolved = vec![[0.0f64; 4]; hw * hh];
     for (i, cell) in accum.data.iter().enumerate() {
         let c = cell[3];
         if c <= 0.0 {
             continue;
         }
-        let l = (fmath::log(1.0 + c) / log_max * brightness).clamp(0.0, 1.0);
+        let l = (fmath::log(1.0 + c * inv_mean) / log_max * brightness).clamp(0.0, 1.0);
         let s = l / c;
         resolved[i] = [cell[0] * s, cell[1] * s, cell[2] * s, l];
     }

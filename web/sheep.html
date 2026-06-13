@@ -72,15 +72,16 @@
     // tier; quality comes from accumulated samples, not a bigger single job.
     // CPU: small chunks + throttled paint keep the UI responsive. GPU (when
     // present): large batches converge in ~a second, then it idles.
-    // Resolution fixed per tier; quality comes from accumulated samples. ss=1
-    // keeps each tonemap cheap (the worker re-resolves the whole histogram on
-    // every paint) so refinement is visible quickly — density estimation in
-    // the tone map denoises in place of supersampling.
+    // Resolution fixed per tier; quality comes from accumulated samples (the
+    // tone map is sample-invariant now, so it converges in place instead of
+    // drifting). Supersampling (ss=2) + the Gaussian downsample give the
+    // smooth, anti-aliased Electric-Sheep look; the image sharpens as density
+    // fills in and the adaptive DE radius tightens. Low stays ss=1 for speed.
     const PROGRESSIVE = {
-      low:   { width: 512,  height: 512,  ss: 1, samplesPerChunk: 250_000, paintEvery: 2 },
-      med:   { width: 768,  height: 768,  ss: 1, samplesPerChunk: 400_000, paintEvery: 3 },
-      high:  { width: 1024, height: 1024, ss: 1, samplesPerChunk: 600_000, paintEvery: 3 },
-      ultra: { width: 1280, height: 1280, ss: 1, samplesPerChunk: 900_000, paintEvery: 4 },
+      low:   { width: 512, height: 512, ss: 1, samplesPerChunk: 250_000, paintEvery: 2 },
+      med:   { width: 640, height: 640, ss: 2, samplesPerChunk: 350_000, paintEvery: 3 },
+      high:  { width: 768, height: 768, ss: 2, samplesPerChunk: 500_000, paintEvery: 3 },
+      ultra: { width: 960, height: 960, ss: 2, samplesPerChunk: 650_000, paintEvery: 4 },
     };
     const SPIN = {
       low:   { budgetMs: 30,  maxS: 32_000_000,  startS: 6_000_000,  sizeCap: 640,  ss: 1, temporal: 4 },
