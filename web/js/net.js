@@ -46,6 +46,11 @@ export const MUTANTS_PER_GEN = 2;
 export const IMMIGRANTS_PER_GEN = 1;
 /** Deterministic per-author submissions counted per generation (lowest sheep ids win). */
 export const AUTHOR_GEN_CAP = 3;
+/** Tiles a user must have contributed to BOTH parents before a bred child they
+ *  release is admitted to the flock. Enforced deterministically in gens.js (a
+ *  release lacking the evidence is excluded by every peer), so it's protocol,
+ *  not a client courtesy. */
+export const BREED_MIN_TILES = 4;
 
 /** Render spec a batch animates against. One tier, full quality (no quality
  *  tiers in the batch era). The contributed `spp` is BATCH_SPP. */

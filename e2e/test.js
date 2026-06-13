@@ -278,6 +278,48 @@ let firstId; // a baked sheep id, reused by the swarm section's peer=1 store
   check('mutants + immigrant derived from batch tallies',
     result.mutants === 2 && result.immigrants === 1,
     `mutants=${result.mutants}, immigrants=${result.immigrants}`);
+
+  // Breeding gate: a released child is admitted only if its author contributed
+  // >= BREED_MIN_TILES tiles to BOTH parents (protocol-enforced in gens.js).
+  const gate = await page.evaluate(async () => {
+    const wasm = await import('./pkg/flame_wasm.js');
+    await wasm.default();
+    const { computeFlock } = await import('./js/gens.js');
+    const { gen, BREED_MIN_TILES } = await import('./js/net.js');
+    const manifest = await (await fetch('genomes/manifest.json')).json();
+    const baked = [];
+    for (const s of manifest.sheep) {
+      const genome = await (await fetch(s.file)).text();
+      baked.push({ id: wasm.sheep_id(genome), genome, parents: null, gen: 0, baked: true });
+    }
+    const g = gen();
+    const author = 'a'.repeat(64);
+    const childGenome = wasm.breed(baked[0].genome, baked[1].genome, 'ab'.repeat(32));
+    const childId = wasm.sheep_id(childGenome);
+    const release = {
+      id: childId, genome: childGenome, parents: [baked[0].id, baked[1].id],
+      gen: g, origin: 'release', author,
+    };
+    const tiles = (n, sid) => Array.from({ length: n }, (_, i) =>
+      ({ sheepId: sid, frame: 0, idx: i, contributor: author, gen: g }));
+    const breedFn = async (a, b, ch) => {
+      const j = wasm.breed(a, b, ch); return { childJson: j, childId: wasm.sheep_id(j) };
+    };
+    const mk = (batches) => ({
+      allSheep: async () => [release], allBatches: async () => batches, allFraud: async () => [],
+    });
+    const r1 = await computeFlock({ // too few on parent b
+      store: mk([...tiles(BREED_MIN_TILES, baked[0].id), ...tiles(BREED_MIN_TILES - 1, baked[1].id)]),
+      baked, breedFn, currentGen: g,
+    });
+    const r2 = await computeFlock({ // enough on both
+      store: mk([...tiles(BREED_MIN_TILES, baked[0].id), ...tiles(BREED_MIN_TILES, baked[1].id)]),
+      baked, breedFn, currentGen: g,
+    });
+    return { blocked: !r1.living.has(childId), admitted: r2.living.has(childId) };
+  });
+  check('breeding gate: release blocked without tiles on both parents, admitted with',
+    gate.blocked && gate.admitted, `blocked=${gate.blocked}, admitted=${gate.admitted}`);
   await page.close();
 }
 

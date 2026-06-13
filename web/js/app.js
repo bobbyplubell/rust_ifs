@@ -17,6 +17,7 @@ import { openStore } from './store.js';
 import {
   Net, BroadcastTransport, CompositeTransport, gen, GEN_MS, GENESIS_GEN,
   BATCH_SPEC, BATCH_SPP, batchKey, batchSignBytes, sheepSignBytes, fraudSignBytes,
+  BREED_MIN_TILES,
 } from './net.js';
 import { computeFlock, breedChallenge } from './gens.js';
 import { handle, provenance } from './names.js';
@@ -735,10 +736,29 @@ async function breedSelected() {
   }).done;
   if (preview.type === 'done') paintTo(canvas, preview);
 
+  // Breeding gate (UI mirror of the protocol rule in gens.js): you must have
+  // contributed >= BREED_MIN_TILES tiles to BOTH parents to release their child.
+  const myTiles = async (sid) =>
+    (await store.batchesForSheep(sid)).filter((b) => b.contributor === me.pubHex).length;
+  const [ta, tb] = await Promise.all([myTiles(aId), myTiles(bId)]);
+  const ready = ta >= BREED_MIN_TILES && tb >= BREED_MIN_TILES;
+
   const release = $('#release');
   release.hidden = false;
-  release.disabled = cards.has(childId);
-  release.textContent = cards.has(childId) ? 'already in flock' : 'release';
+  if (cards.has(childId)) {
+    release.disabled = true;
+    release.textContent = 'already in flock';
+  } else if (!ready) {
+    release.disabled = true;
+    release.title = 'render tiles for both parents first — that’s your stake in the cross';
+    release.textContent =
+      `contribute to breed · ${Math.min(ta, BREED_MIN_TILES)}/${BREED_MIN_TILES} & ` +
+      `${Math.min(tb, BREED_MIN_TILES)}/${BREED_MIN_TILES} tiles`;
+  } else {
+    release.disabled = false;
+    release.title = '';
+    release.textContent = 'release';
+  }
   release.onclick = async () => {
     release.disabled = true;
     // No render proof needed to release now — a release earns votes by being

@@ -8,7 +8,9 @@
 // and are capped per (author, generation) — so the flock cannot blow up with
 // peer count. Quiet generations (no votes) carry the flock forward unchanged.
 
-import { gen, SURVIVORS_K, AUTHOR_GEN_CAP, MUTANTS_PER_GEN, IMMIGRANTS_PER_GEN } from './net.js';
+import {
+  gen, SURVIVORS_K, AUTHOR_GEN_CAP, MUTANTS_PER_GEN, IMMIGRANTS_PER_GEN, BREED_MIN_TILES,
+} from './net.js';
 import { sha256Hex, utf8 } from './hash.js';
 
 // Canonical child challenge for a pair in generation g (ids sorted, so a pair
@@ -121,11 +123,28 @@ export async function computeFlock({
   // quality, so "best-looking" and "most-voted" are the same number. Batches
   // from discredited keys (verified fraud proofs) count for nothing.
   const tallyByGen = new Map();
+  // Per-(contributor, sheep) tile counts: the evidence the breeding gate needs.
+  const contrib = new Map(); // `${contributor}:${sheepId}` -> count
   for (const b of await store.allBatches()) {
     if (banned.has(b.contributor)) continue;
     if (!tallyByGen.has(b.gen)) tallyByGen.set(b.gen, new Map());
     const t = tallyByGen.get(b.gen);
     t.set(b.sheepId, (t.get(b.sheepId) || 0) + 1);
+    const ck = `${b.contributor}:${b.sheepId}`;
+    contrib.set(ck, (contrib.get(ck) || 0) + 1);
+  }
+
+  // Breeding gate (protocol-enforced, deterministic): a user RELEASE is only
+  // admitted to the flock if its author contributed >= BREED_MIN_TILES tiles to
+  // BOTH parents. A peer that lacks the evidence excludes the release until
+  // anti-entropy fills the batches in — every peer converges on the same answer.
+  // The automatic engine (pair/mutant/immigrant) is unaffected.
+  const tiles = (author, sheepId) => contrib.get(`${author}:${sheepId}`) || 0;
+  function releaseAdmitted(r) {
+    if (r.origin !== 'release') return true;
+    if (!Array.isArray(r.parents) || r.parents.length < 2) return false;
+    return tiles(r.author, r.parents[0]) >= BREED_MIN_TILES
+      && tiles(r.author, r.parents[1]) >= BREED_MIN_TILES;
   }
 
   let living = new Map(baked.map((r) => [r.id, r]));
@@ -136,7 +155,9 @@ export async function computeFlock({
     .sort((a, b) => a - b);
 
   for (const g of eventGens) {
-    for (const r of byGen.get(g) || []) living.set(r.id, r); // submissions join their gen
+    for (const r of byGen.get(g) || []) {
+      if (releaseAdmitted(r)) living.set(r.id, r); // submissions join their gen
+    }
     const tally = tallyByGen.get(g) || new Map();
 
     const voted = [...living.values()]
@@ -229,7 +250,9 @@ export async function computeFlock({
   }
 
   // Submissions released in the current (still open) generation join the view.
-  for (const r of byGen.get(current) || []) living.set(r.id, r);
+  for (const r of byGen.get(current) || []) {
+    if (releaseAdmitted(r)) living.set(r.id, r);
+  }
 
   return { living, genActive: current };
 }
