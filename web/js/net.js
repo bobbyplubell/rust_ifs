@@ -29,20 +29,16 @@ export const SURVIVORS_K = 4;
 /** Deterministic per-author submissions counted per generation (lowest sheep ids win). */
 export const AUTHOR_GEN_CAP = 3;
 
-/** Loop-proof tiers: the proof's 64 units are FRAMES of the sheep's animation
- *  loop (frame i = phase i/64, 2 temporal sub-steps of motion blur), so
- *  proving = watching one full loop, and the frames replay as a cached
- *  animation afterward.
- *
- *  std   (~15M samples, seconds of CPU)  = 1 vote — everyone can afford it.
- *  ultra (~41M samples at 384px, ~2.7x)  = 2 votes — spending more CPU is a
- *  choice with a reward (weight + a larger, denser replay loop), not a tax.
- *  The challenge is tier-independent; hashes differ because the spec does. */
+/** Loop proof: the proof's 64 units are FRAMES of the sheep's animation loop
+ *  (frame i = phase i/64, 2 temporal sub-steps of motion blur), so proving =
+ *  watching one full loop, and the frames replay as a cached animation
+ *  afterward. One tier, full quality (~41M samples at 384px): every vote is
+ *  worth 1 and rendered beautifully. The tier field stays in the wire format
+ *  for future flexibility; only 'std' is currently valid. */
 export const PROOF_TIERS = {
-  std: { width: 256, height: 256, ss: 1, nFrames: 64, samplesPerFrame: 240_000, temporal: 2, weight: 1 },
-  ultra: { width: 384, height: 384, ss: 1, nFrames: 64, samplesPerFrame: 640_000, temporal: 2, weight: 2 },
+  std: { width: 384, height: 384, ss: 1, nFrames: 64, samplesPerFrame: 640_000, temporal: 2, weight: 1 },
 };
-export const PROOF_SPEC = PROOF_TIERS.std; // default tier
+export const PROOF_SPEC = PROOF_TIERS.std;
 export const voteWeight = (v) => PROOF_TIERS[v.tier]?.weight ?? 1;
 
 export const HEX64 = /^[0-9a-f]{64}$/;
@@ -70,7 +66,7 @@ export const fraudSignBytes = (f) =>
   utf8(`fraud|${f.voteKey}|${f.frame}|${f.expected}|${f.reporter}`);
 
 /** BroadcastChannel bus name — bumped on wire-format breaks. */
-export const CHANNEL = 'sheep-net-v7';
+export const CHANNEL = 'sheep-net-v8';
 
 export class BroadcastTransport {
   constructor(channel = CHANNEL) {

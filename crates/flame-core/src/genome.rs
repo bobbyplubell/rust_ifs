@@ -45,15 +45,34 @@ impl Transform {
     /// Apply this transform to a working point + color, in place.
     #[inline]
     pub fn apply(&self, x: &mut f64, y: &mut f64, color: &mut f64, rng: &mut Rng) {
+        let active: Vec<(usize, f64)> = self
+            .variations
+            .iter()
+            .enumerate()
+            .filter(|(_, &w)| w != 0.0)
+            .map(|(i, &w)| (i, w))
+            .collect();
+        self.apply_cached(&active, x, y, color, rng);
+    }
+
+    /// `apply` with a precomputed nonzero-weight list (hot path; identical
+    /// arithmetic in identical order — the blend loop simply skips slots that
+    /// contributed nothing anyway).
+    #[inline]
+    pub fn apply_cached(
+        &self,
+        active: &[(usize, f64)],
+        x: &mut f64,
+        y: &mut f64,
+        color: &mut f64,
+        rng: &mut Rng,
+    ) {
         // Pre affine.
         let (px, py) = self.affine.apply(*x, *y);
         // Weighted blend of variations evaluated at the same pre-affine point.
         let mut bx = 0.0;
         let mut by = 0.0;
-        for (i, &w) in self.variations.iter().enumerate() {
-            if w == 0.0 {
-                continue;
-            }
+        for &(i, w) in active {
             let (vx, vy) = Variation::ALL[i].apply(px, py, &self.pvals, &self.affine, w, rng);
             bx += w * vx;
             by += w * vy;

@@ -122,15 +122,6 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
   await p2.locator('#release', { hasText: 'released ✓' }).waitFor({ timeout: 300_000 });
   check('p2 bred and released a child (with proof)', true);
 
-  // Ultra (2x weight) vote from p1 on the SECOND card; p2 must show '2'.
-  const secondId = await p1.locator('.card').nth(1).getAttribute('data-id');
-  await p1.locator('.card').nth(1).locator('button', { hasText: '2×' }).click();
-  await p1.locator('.card button', { hasText: /voted 2× ✓/ }).first().waitFor({ timeout: 300_000 });
-  check('p1 ultra vote completed', true);
-  const tally2u = p2.locator(`.card[data-id="${secondId}"] .tally`);
-  await tally2u.filter({ hasText: '2' }).waitFor({ timeout: 30_000 });
-  check('p2 sees double weight for ultra vote', true, await tally2u.textContent());
-
   section('fraud injection');
   // Fraud: inject a validly-signed vote with garbage hashes from a fresh key.
   // The background auditor must re-render a frame, catch the mismatch, gossip

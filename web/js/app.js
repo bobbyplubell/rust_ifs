@@ -174,11 +174,7 @@ function addCard(record) {
   spinBtn.textContent = 'spin';
   const voteBtn = document.createElement('button');
   voteBtn.textContent = 'vote';
-  const ultraBtn = document.createElement('button');
-  ultraBtn.textContent = '2×';
-  ultraBtn.title = 'ultra proof: ~2.7× the render work for a double-weight ' +
-    'vote and a larger, denser replay loop';
-  meta.append(label, tallyEl, spinBtn, voteBtn, ultraBtn);
+  meta.append(label, tallyEl, spinBtn, voteBtn);
   const bar = document.createElement('div');
   bar.className = 'bar';
   const barFill = document.createElement('div');
@@ -187,14 +183,13 @@ function addCard(record) {
   card.append(canvas, bar, meta);
   $('#flock').append(card);
 
-  const entry = { record, canvas, tallyEl, spinBtn, voteBtn, ultraBtn, card, barFill };
+  const entry = { record, canvas, tallyEl, spinBtn, voteBtn, card, barFill };
   cards.set(record.id, entry);
   updateTally(record.id);
 
   canvas.addEventListener('click', () => toggleSelect(record.id));
   spinBtn.addEventListener('click', () => toggleSpin(entry).catch(showError));
-  voteBtn.addEventListener('click', () => vote(entry, 'std').catch(showError));
-  ultraBtn.addEventListener('click', () => vote(entry, 'ultra').catch(showError));
+  voteBtn.addEventListener('click', () => vote(entry).catch(showError));
 
   drawProgressively(canvas, record.genome, `view|${record.id}`).catch(showError);
 }
@@ -334,14 +329,14 @@ function stopReplay(entry) {
 
 // ---- voting ----------------------------------------------------------------
 
-async function vote(entry, tier = 'std') {
+async function vote(entry) {
+  const tier = 'std';
   if (spinning?.entry === entry) stopSpin();
   const g = gen();
   const myKey = `${me.pubHex}:${entry.record.id}:${g}`;
   if (tallies.get(entry.record.id)?.has(myKey)) return; // already voted this gen
 
   entry.voteBtn.disabled = true;
-  entry.ultraBtn.disabled = true;
   entry.votePending = true;
   stopReplay(entry);
   // The proof render IS watching the sheep: your personal challenge, one full
@@ -360,7 +355,6 @@ async function vote(entry, tier = 'std') {
   entry.barFill.style.width = '0';
   if (!res) {
     entry.voteBtn.disabled = false;
-    entry.ultraBtn.disabled = false;
     entry.voteBtn.textContent = 'vote';
     return;
   }
@@ -370,7 +364,7 @@ async function vote(entry, tier = 'std') {
   };
   record.sig = await sign(me.pair, voteSignBytes(record));
   await net.publishVote(record);
-  entry.voteBtn.textContent = tier === 'ultra' ? 'voted 2× ✓' : 'voted ✓';
+  entry.voteBtn.textContent = 'voted ✓';
   startReplay(entry, res.frames);
 }
 
@@ -402,11 +396,9 @@ function updateTally(sheepId) {
   if (mine) {
     if (!entry.votePending) entry.voteBtn.textContent = 'voted ✓';
     entry.voteBtn.disabled = true;
-    entry.ultraBtn.disabled = true;
   } else if (!entry.votePending) {
     entry.voteBtn.textContent = 'vote';
     entry.voteBtn.disabled = false;
-    entry.ultraBtn.disabled = false;
   }
 }
 

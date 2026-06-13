@@ -114,11 +114,99 @@ pub fn iterate(
     let mut color = rng.f64();
     let mut prev: Option<usize> = None;
 
+    // Hot-loop precomputation (bitstream-identical to the naive path; the
+    // golden test is the referee):
+    // - active variation lists: the blend loop visits only nonzero weights,
+    //   in the same order, instead of scanning all 49 slots per iteration;
+    // - pick totals: the per-pick weight sums (plain and per-xaos-row) are
+    //   the same order-of-addition sums, computed once.
+    let n = genome.transforms.len();
+    let active: Vec<Vec<(usize, f64)>> = genome
+        .transforms
+        .iter()
+        .map(|t| {
+            t.variations
+                .iter()
+                .enumerate()
+                .filter(|(_, &w)| w != 0.0)
+                .map(|(i, &w)| (i, w))
+                .collect()
+        })
+        .collect();
+    let final_active: Option<Vec<(usize, f64)>> = genome.final_transform.as_ref().map(|t| {
+        t.variations
+            .iter()
+            .enumerate()
+            .filter(|(_, &w)| w != 0.0)
+            .map(|(i, &w)| (i, w))
+            .collect()
+    });
+    let plain_total: f64 = genome.transforms.iter().map(|t| t.weight).sum();
+    // Per-row xaos totals; None when every row is identity (the common case),
+    // which collapses pick to the plain path.
+    let row_totals: Option<Vec<Option<f64>>> = {
+        let any = genome.transforms.iter().any(|t| {
+            t.xaos.len() == n && t.xaos.iter().any(|&v| v != 1.0)
+        });
+        if any {
+            Some(
+                genome
+                    .transforms
+                    .iter()
+                    .map(|t| {
+                        if t.xaos.len() == n {
+                            Some(
+                                genome
+                                    .transforms
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, u)| u.weight * t.xaos[i])
+                                    .sum(),
+                            )
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    };
+
+    let pick = |prev: Option<usize>, rng: &mut Rng| -> usize {
+        let (total, row): (f64, Option<&[f64]>) = match (prev, &row_totals) {
+            (Some(p), Some(rt)) => match rt[p] {
+                Some(tw) => (tw, Some(&genome.transforms[p].xaos[..])),
+                None => (plain_total, None),
+            },
+            _ => (plain_total, None),
+        };
+        if !(total > 0.0) {
+            let mut r = rng.range(0.0, plain_total);
+            for (i, t) in genome.transforms.iter().enumerate() {
+                r -= t.weight;
+                if r <= 0.0 {
+                    return i;
+                }
+            }
+            return n - 1;
+        }
+        let mut r = rng.range(0.0, total);
+        for (i, t) in genome.transforms.iter().enumerate() {
+            r -= t.weight * row.map_or(1.0, |x| x[i]);
+            if r <= 0.0 {
+                return i;
+            }
+        }
+        n - 1
+    };
+
     let total = samples + burn_in;
     for i in 0..total {
-        let t = genome.pick(prev, &mut rng);
+        let t = pick(prev, &mut rng);
         prev = Some(t);
-        genome.transforms[t].apply(&mut x, &mut y, &mut color, &mut rng);
+        genome.transforms[t].apply_cached(&active[t], &mut x, &mut y, &mut color, &mut rng);
 
         // Reseed if the trajectory escaped to infinity / NaN.
         if !x.is_finite() || !y.is_finite() {
@@ -136,7 +224,7 @@ pub fn iterate(
         // ongoing trajectory.
         let (mut px, mut py, mut pc) = (x, y, color);
         if let Some(ft) = &genome.final_transform {
-            ft.apply(&mut px, &mut py, &mut pc, &mut rng);
+            ft.apply_cached(final_active.as_ref().unwrap(), &mut px, &mut py, &mut pc, &mut rng);
         }
         plot(px, py, genome.palette.color(pc));
     }
@@ -236,9 +324,48 @@ pub fn tonemap(accum: &Accum, genome: &Genome, width: usize, height: usize, ss: 
     // gather wide (glow), dense cells gather narrow (detail). Weights are
     // 1/(d2+1) — close enough to gaussian, exact and cheap.
     let de = if mean_nz > 0.0 {
+        // Occupancy mask dilated by the max gather radius: empty cells far
+        // from any density gather all-zeros anyway — skip them outright.
+        // (Two sliding-window passes; output is bit-identical, just faster.)
+        const MAXR: usize = 3;
+        let mut row_any = vec![false; hw * hh];
+        for y in 0..hh {
+            let base = y * hw;
+            let mut cnt = 0usize;
+            for x in 0..hw + MAXR {
+                if x < hw && accum.data[base + x][3] > 0.0 {
+                    cnt += 1;
+                }
+                if x >= 2 * MAXR + 1 && accum.data[base + x - 2 * MAXR - 1][3] > 0.0 {
+                    cnt -= 1;
+                }
+                if x >= MAXR {
+                    row_any[base + x - MAXR] = cnt > 0;
+                }
+            }
+        }
+        let mut near = vec![false; hw * hh];
+        for x in 0..hw {
+            let mut cnt = 0usize;
+            for y in 0..hh + MAXR {
+                if y < hh && row_any[y * hw + x] {
+                    cnt += 1;
+                }
+                if y >= 2 * MAXR + 1 && row_any[(y - 2 * MAXR - 1) * hw + x] {
+                    cnt -= 1;
+                }
+                if y >= MAXR {
+                    near[(y - MAXR) * hw + x] = cnt > 0;
+                }
+            }
+        }
+
         let mut out = resolved.clone();
         for y in 0..hh {
             for x in 0..hw {
+                if !near[y * hw + x] {
+                    continue; // provably zero result
+                }
                 let c = accum.data[y * hw + x][3];
                 let rel = c / mean_nz;
                 let rad: i64 = if rel >= 1.0 {

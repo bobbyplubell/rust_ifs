@@ -103,6 +103,64 @@ mod proof_frame_tests {
     use super::*;
     use crate::rng::Rng;
 
+    /// The optimized iterate() (active lists + precomputed pick totals) must
+    /// be bit-identical to the naive reference for genomes WITH active xaos
+    /// (the golden corpus only exercises identity rows).
+    #[test]
+    fn xaos_fast_path_matches_reference() {
+        let mut rng = Rng::new(11);
+        let mut genome = Genome::random(&mut rng, 4);
+        // Force a juicy xaos matrix.
+        let n = genome.transforms.len();
+        genome.fix_xaos();
+        genome.transforms[0].xaos[1 % n] = 0.0;
+        genome.transforms[1 % n].xaos[0] = 2.5;
+        if n > 2 {
+            genome.transforms[2].xaos[n - 1] = 0.3;
+        }
+
+        // Reference: the naive loop (genome.pick + Transform::apply).
+        let mut reference = crate::render::Accum::new(64, 64);
+        {
+            let to_img = genome.camera.world_to_image(64, 64);
+            let mut r = Rng::new(99);
+            let mut x = r.range(-1.0, 1.0);
+            let mut y = r.range(-1.0, 1.0);
+            let mut color = r.f64();
+            let mut prev: Option<usize> = None;
+            for i in 0..120_000u64 {
+                let t = genome.pick(prev, &mut r);
+                prev = Some(t);
+                genome.transforms[t].apply(&mut x, &mut y, &mut color, &mut r);
+                if !x.is_finite() || !y.is_finite() {
+                    x = r.range(-1.0, 1.0);
+                    y = r.range(-1.0, 1.0);
+                    color = r.f64();
+                    continue;
+                }
+                if i < 20 {
+                    continue;
+                }
+                let (mut px, mut py, mut pc) = (x, y, color);
+                if let Some(ft) = &genome.final_transform {
+                    ft.apply(&mut px, &mut py, &mut pc, &mut r);
+                }
+                let rgb = genome.palette.color(pc);
+                let (ix, iy) = to_img.apply(px, py);
+                if ix >= 0.0 && iy >= 0.0 && ix < 64.0 && iy < 64.0 {
+                    reference.add(ix as usize, iy as usize, rgb);
+                }
+            }
+        }
+        let mut fast = crate::render::Accum::new(64, 64);
+        crate::render::accumulate(&genome, 119_980, 20, 99, &mut fast);
+        assert_eq!(
+            chunk_hash_hex(&reference),
+            chunk_hash_hex(&fast),
+            "optimized iterate diverges from reference under xaos"
+        );
+    }
+
     #[test]
     fn proof_frames_are_deterministic_and_distinct() {
         let mut rng = Rng::new(7);
