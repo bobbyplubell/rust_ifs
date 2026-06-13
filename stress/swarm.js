@@ -92,7 +92,7 @@ function act(kind) {
   const page = pages[Math.floor(Math.random() * pages.length)];
   const t0 = Date.now();
   page.evaluate(
-    (k) => (k === 'vote' ? window.__sheepAct.voteRandom() : window.__sheepAct.breedRandom()),
+    (k) => (k === 'vote' ? window.__sheepAct.contributeRandom() : window.__sheepAct.breedRandom()),
     kind,
   )
     .then((id) => {
@@ -127,12 +127,12 @@ async function sampleMetrics() {
 
   const nums = (f) => dumps.map(f).sort((a, b) => a - b);
   const med = (a) => a[Math.floor(a.length / 2)];
-  const votes = nums((d) => d.votes);
+  const batches = nums((d) => d.batches);
   const fingerprints = new Set(dumps.map((d) => d.tallyFingerprint));
   const sentBytes = nums((d) => d.net.sentBytes);
   const row = {
     t: Date.now(), kind: 'sample', peers: PEERS, sampled: dumps.length,
-    votesMin: votes[0], votesMed: med(votes), votesMax: votes.at(-1),
+    batchesMin: batches[0], batchesMed: med(batches), batchesMax: batches.at(-1),
     distinctTallyViews: fingerprints.size,
     sumsMed: med(nums((d) => d.sums)),
     auditsMed: med(nums((d) => d.audits)),
@@ -143,7 +143,7 @@ async function sampleMetrics() {
     crashes, votesDone, breedsDone, actionsFailed,
   };
   emit(row);
-  log(`votes ${row.votesMin}/${row.votesMed}/${row.votesMax} ` +
+  log(`batches ${row.batchesMin}/${row.batchesMed}/${row.batchesMax} ` +
     `views=${row.distinctTallyViews} sums=${row.sumsMed} audits=${row.auditsMed} ` +
     `sentB=${(row.sentBytesMed / 1024).toFixed(0)}k rss=${row.rssMB}MB ` +
     `done v${votesDone}/b${breedsDone} fail=${actionsFailed} crash=${crashes}`);
@@ -166,7 +166,7 @@ const finals = (await Promise.all(pages.map((p) =>
     new Promise((r) => setTimeout(() => r(null), 15_000)),
   ]).catch(() => null),
 ))).filter(Boolean);
-const voteCounts = new Set(finals.map((d) => d.votes));
+const voteCounts = new Set(finals.map((d) => d.batches));
 const views = new Set(finals.map((d) => d.tallyFingerprint));
 const verdict = {
   t: Date.now(), kind: 'final', peers: PEERS, responsive: finals.length,
