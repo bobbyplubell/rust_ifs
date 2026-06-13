@@ -40,7 +40,7 @@
   <div id="stage">
     <canvas id="cv" width="384" height="384"></canvas>
   </div>
-  <div id="tilemap"><span class="cap">tiles / frame</span></div>
+  <div id="tilemap"><span class="cap">tiles · you / swarm</span></div>
   <div id="hud">
     <span id="info">loading…</span>
     <span id="sheep-id" class="id"></span>
@@ -238,15 +238,32 @@
       tilemap.append(c);
       return c;
     });
+    // Per-frame swarm coverage: { mine, total } from the gossiped batch RECORDS
+    // (which propagate independent of the heavy renders), so the map reflects
+    // the whole swarm's work, not just what this peer has merged locally.
+    let swarmCov = Array.from({ length: N_FRAMES }, () => ({ mine: 0, total: 0 }));
+    async function refreshSwarmCov() {
+      if (!store || !id) return;
+      const recs = await store.batchesForSheep(id);
+      const cov = Array.from({ length: N_FRAMES }, () => ({ mine: 0, total: 0 }));
+      for (const b of recs) {
+        if (b.frame < 0 || b.frame >= N_FRAMES || banned.has(b.contributor)) continue;
+        cov[b.frame].total++;
+        if (me && b.contributor === me.pubHex) cov[b.frame].mine++;
+      }
+      swarmCov = cov;
+      updateTilemap();
+    }
     function updateTilemap() {
       for (let f = 0; f < N_FRAMES; f++) {
-        const k = frames[f].covered.size;
-        tileCells[f].textContent = k || '';
-        const t = Math.min(1, k / 24);          // saturate the shade around 24 tiles
+        const { mine, total } = swarmCov[f];
+        tileCells[f].textContent = total ? (mine ? `${mine}/${total}` : `${total}`) : '';
+        const t = Math.min(1, total / 24);     // shade by swarm total (darker = fuzzier)
         tileCells[f].style.background = `hsl(265 45% ${Math.round(9 + t * 38)}%)`;
-        tileCells[f].title = `frame ${f}: ${k} tiles`;
+        tileCells[f].title = `frame ${f}: you ${mine} / swarm ${total} tiles`;
       }
     }
+    setInterval(() => refreshSwarmCov().catch(console.error), 2000);
     // Outline the frame currently on screen.
     let curCell = -1;
     setInterval(() => {
