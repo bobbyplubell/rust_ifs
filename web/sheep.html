@@ -20,113 +20,344 @@
     }
     #hud .id { color: #62627a; }
     #hud a { color: #8d8da4; margin-left: auto; }
+    #hud button.on { color: #cfe; }
   </style>
 </head>
 <body>
   <div id="stage">
-    <canvas id="cv" width="512" height="512"></canvas>
-    <canvas id="cvgpu" width="768" height="768" hidden></canvas>
+    <canvas id="cv" width="384" height="384"></canvas>
   </div>
   <div id="hud">
     <span id="info">loading…</span>
     <span id="sheep-id" class="id"></span>
     <span id="samples" class="id"></span>
-    <span id="quality">
-      <button data-q="low">low</button>
-      <button data-q="med">med</button>
-      <button data-q="high">high</button>
-      <button data-q="ultra">ultra</button>
-    </span>
-    <button id="spin">spin</button>
+    <button id="contribute" class="on">contributing ✓</button>
     <button id="dl">genome ↓</button>
     <a id="back" href="index.html">← flock</a>
   </div>
 
   <script type="module">
+    // sheep.html — the community-sourced HIGH-RES ANIMATED loop (batch era).
+    //
+    // We accumulate ALL N_FRAMES of the sheep at BATCH_SPEC, one integer
+    // histogram per frame, and play them as a requestAnimationFrame loop. Each
+    // frame keeps a tonemapped ImageBitmap for cheap playback; only a small LRU
+    // working set holds the raw BigUint64Array histograms (the frames currently
+    // being improved). When a frame is evicted it keeps its last image and is
+    // re-rendered from its batches if it's improved again.
+    //
+    // This page is self-contained: it spins up its own WorkerPool and its own
+    // Net instance (same wiring as app.js) so it participates in the swarm —
+    // contributing batches (earning votes), gossiping records, and pulling
+    // verified accumulated frames — for as long as it's open.
+
     import { WorkerPool } from './js/pool.js';
     import { openStore } from './js/store.js';
-    import { PEER_NS } from './js/identity.js';
-    import { GENESIS_GEN } from './js/net.js';
+    import { loadIdentity, sign, verify, PEER_NS } from './js/identity.js';
     import { sha256Hex, utf8 } from './js/hash.js';
-    import { GpuFlame } from './js/gpu.js';
     import { provenance } from './js/names.js';
-    import { PROOF_TIERS } from './js/net.js';
+    import {
+      Net, BroadcastTransport, CompositeTransport, gen,
+      BATCH_SPEC, BATCH_SPP, batchKey, batchSignBytes, fraudSignBytes,
+    } from './js/net.js';
+    import { RELAYS } from './config.js';
 
     const $ = (s) => document.querySelector(s);
     const params = new URLSearchParams(location.search);
     const id = params.get('id');
     if (PEER_NS !== '0') $('#back').href = `index.html?peer=${PEER_NS}`;
 
-    const pool = new WorkerPool();
+    const N_FRAMES = BATCH_SPEC.nFrames;
+    const W = BATCH_SPEC.width, H = BATCH_SPEC.height, SS = BATCH_SPEC.ss;
+    const HIST_CELLS = W * SS * H * SS * 4;
+    const LOOP_MS = 14_000;
+    const HIST_LRU_CAP = 8;     // frames holding raw histograms (the working set)
+    const PREVIEW = { width: W, height: H, samples: 200_000, seed: 7 };
+
+    const pool = new WorkerPool(Number(params.get('workers')) || undefined);
     const cv = $('#cv');
     const ctx = cv.getContext('2d');
 
-    // Display-quality presets (display-only — proofs always use PROOF_SPEC).
-    // One knob governs both the still and the spin. Spin budgets trade frame
-    // rate for density: ultra runs ~9 fps but the motion-blur shutter spans
-    // the real frame interval, so slower playback means longer blur, not jank.
-    // The still is a *progressive accumulation*, not a one-shot render: one
-    // persistent histogram that keeps taking fresh sample batches, so the image
-    // appears fast (first batch) and keeps cleaning up the longer you watch
-    // (noise ~1/sqrt(samples)) — flam3's own model. Resolution is fixed per
-    // tier; quality comes from accumulated samples, not a bigger single job.
-    // CPU: small chunks + throttled paint keep the UI responsive. GPU (when
-    // present): large batches converge in ~a second, then it idles.
-    // Resolution fixed per tier; quality comes from accumulated samples (the
-    // tone map is sample-invariant now, so it converges in place instead of
-    // drifting). Supersampling (ss=2) + the Gaussian downsample give the
-    // smooth, anti-aliased Electric-Sheep look; the image sharpens as density
-    // fills in and the adaptive DE radius tightens. Low stays ss=1 for speed.
-    const PROGRESSIVE = {
-      low:   { width: 512, height: 512, ss: 1, samplesPerChunk: 250_000, paintEvery: 2 },
-      med:   { width: 640, height: 640, ss: 2, samplesPerChunk: 350_000, paintEvery: 3 },
-      high:  { width: 768, height: 768, ss: 2, samplesPerChunk: 500_000, paintEvery: 3 },
-      ultra: { width: 960, height: 960, ss: 2, samplesPerChunk: 650_000, paintEvery: 4 },
-    };
-    const SPIN = {
-      low:   { budgetMs: 30,  maxS: 32_000_000,  startS: 6_000_000,  sizeCap: 640,  ss: 1, temporal: 4 },
-      med:   { budgetMs: 38,  maxS: 64_000_000,  startS: 12_000_000, sizeCap: 768,  ss: 2, temporal: 4 },
-      high:  { budgetMs: 60,  maxS: 128_000_000, startS: 24_000_000, sizeCap: 896,  ss: 2, temporal: 5 },
-      ultra: { budgetMs: 110, maxS: 256_000_000, startS: 48_000_000, sizeCap: 1024, ss: 2, temporal: 6 },
-    };
-    const CPU_FRAME = {
-      low:   { width: 256, height: 256, samples: 300_000, seed: 7 },
-      med:   { width: 320, height: 320, samples: 450_000, seed: 7 },
-      high:  { width: 384, height: 384, samples: 700_000, seed: 7 },
-      ultra: { width: 448, height: 448, samples: 1_000_000, seed: 7 },
-    };
-    let quality = localStorage.getItem('sheep-quality');
-    if (!PROGRESSIVE[quality]) quality = null; // null -> auto-benched in main()
-    const LOOP_MS = 14_000;
+    let me, store, net, record = null, banned = new Set();
 
-    // WebGPU preview (display-only — proofs are CPU-deterministic, the GPU's
-    // per-thread RNG stream is a different sample of the same attractor).
-    let gpu = null;
-    const gpuReady = GpuFlame.create().then((g) => {
-      gpu = g;
-      if (g) {
-        $('#spin').textContent = 'spin (gpu)';
-        $('#spin').title = 'animating on WebGPU';
-      } else {
-        $('#spin').title =
-          'WebGPU unavailable in this browser — spin uses the slower CPU fallback';
+    // Per-frame state. acc: raw histogram (only for the LRU working set);
+    // covered: idx values merged into acc; bitmap: last tonemapped ImageBitmap
+    // (cheap, always kept); preview: placeholder ImageBitmap before any batches.
+    const frames = Array.from({ length: N_FRAMES }, () => ({
+      acc: null, covered: new Set(), bitmap: null, preview: null,
+      tonemapPending: false, repaintQueued: false,
+    }));
+    const histLru = []; // frame indices, most-recently-touched last
+
+    let contributing = $('#contribute').classList.contains('on');
+
+    // ---- helpers --------------------------------------------------------------
+
+    function mergeHist(acc, add) {
+      for (let i = 0; i < acc.length; i++) acc[i] += add[i];
+    }
+
+    function renderBatchMsg(frame, idx) {
+      return {
+        type: 'render-batch', genomeJson: record.genome, sheepId: id,
+        frame, idx, w: W, h: H, ss: SS, spp: BATCH_SPP,
+      };
+    }
+
+    function touchHistLru(f) {
+      const at = histLru.indexOf(f);
+      if (at !== -1) histLru.splice(at, 1);
+      histLru.push(f);
+      while (histLru.length > HIST_LRU_CAP) {
+        const evict = histLru.shift();
+        // Drop the raw histogram; the frame keeps its last tonemapped bitmap.
+        frames[evict].acc = null;
       }
-      return g;
-    });
+    }
+
+    // Ensure frame f's raw histogram is present: if it was evicted but we hold
+    // its batches, re-render and re-sum them. Returns the acc (or null if no
+    // batches yet).
+    async function ensureAcc(f) {
+      const fr = frames[f];
+      if (fr.acc) { touchHistLru(f); return fr.acc; }
+      if (!fr.covered.size) return null;
+      const acc = new BigUint64Array(HIST_CELLS);
+      for (const idx of fr.covered) {
+        const reply = await pool.submit(renderBatchMsg(f, idx)).done;
+        if (reply.type === 'batch-done') mergeHist(acc, new BigUint64Array(reply.hist));
+      }
+      fr.acc = acc;
+      touchHistLru(f);
+      return acc;
+    }
+
+    // Tonemap frame f's accumulation into its ImageBitmap (throttled per frame).
+    async function repaint(f) {
+      const fr = frames[f];
+      if (!fr.acc || !fr.covered.size) return;
+      if (fr.tonemapPending) { fr.repaintQueued = true; return; }
+      fr.tonemapPending = true;
+      const m = await pool.submit({
+        type: 'tonemap-int', hist: fr.acc.slice().buffer, genomeJson: record.genome,
+        w: W, h: H, ss: SS,
+      }).done;
+      fr.tonemapPending = false;
+      if (m.type === 'done') {
+        const bmp = await createImageBitmap(
+          new ImageData(new Uint8ClampedArray(m.rgba), m.width, m.height));
+        fr.bitmap?.close?.();
+        fr.bitmap = bmp;
+      }
+      if (fr.repaintQueued) { fr.repaintQueued = false; repaint(f); }
+    }
+
+    // Quick placeholder so the loop is never blank before a frame has batches.
+    async function makePreview(f) {
+      const fr = frames[f];
+      if (fr.preview || fr.bitmap || fr.covered.size) return;
+      const m = await pool.submit({
+        type: 'frame', genomeJson: record.genome, phase: f / N_FRAMES, ...PREVIEW,
+      }).done;
+      if (m.type === 'done' && !fr.bitmap) {
+        fr.preview = await createImageBitmap(
+          new ImageData(new Uint8ClampedArray(m.rgba), m.width, m.height));
+      }
+    }
+
+    // ---- playback ticker ------------------------------------------------------
+
+    function tick(now) {
+      const pos = ((now % LOOP_MS) / LOOP_MS) * N_FRAMES;
+      const i = Math.floor(pos) % N_FRAMES;
+      const img = frames[i].bitmap || frames[i].preview
+        || frames[(i + 1) % N_FRAMES].bitmap || frames[(i + 1) % N_FRAMES].preview;
+      if (img) {
+        if (cv.width !== W) { cv.width = W; cv.height = H; }
+        ctx.drawImage(img, 0, 0, cv.width, cv.height);
+      }
+      requestAnimationFrame(tick);
+    }
+
+    // ---- samples/pixel readout ------------------------------------------------
+
+    function totalSamples() {
+      let n = 0;
+      for (const fr of frames) n += fr.covered.size * BATCH_SPP;
+      return n;
+    }
+
+    function showSamples() {
+      const n = totalSamples();
+      const perPx = n / (W * H * N_FRAMES); // flam3's "quality" number
+      const s = n >= 1e9 ? `${(n / 1e9).toFixed(1)}B`
+        : n >= 1e6 ? `${Math.round(n / 1e6)}M`
+        : `${Math.round(n / 1e3)}k`;
+      $('#samples').textContent = n
+        ? `${s} samples · ${perPx.toFixed(1)}/px` : '';
+    }
+
+    // ---- idle contribution + community pull -----------------------------------
+    //
+    // Round-robin across frames: render the next free batch idx for the
+    // least-covered frame, merge, re-tonemap, publish the batch record (earns a
+    // vote). Also requestRender(id, frame) to pull community-accumulated frames
+    // (verified through the gate) and merge them.
+
+    function leastCoveredFrame() {
+      let best = 0, bestN = Infinity;
+      for (let f = 0; f < N_FRAMES; f++) {
+        if (frames[f].covered.size < bestN) { bestN = frames[f].covered.size; best = f; }
+      }
+      return best;
+    }
+
+    function nextFreeIdx(f) {
+      let i = 0;
+      while (frames[f].covered.has(i)) i++;
+      return i;
+    }
+
+    async function contributeBatch(f, idx) {
+      const fr = frames[f];
+      if (fr.covered.has(idx)) return null;
+      fr.covered.add(idx); // reserve up-front
+      let reply;
+      try {
+        reply = await pool.submit(renderBatchMsg(f, idx)).done;
+      } catch (e) { fr.covered.delete(idx); throw e; }
+      if (reply.type !== 'batch-done') { fr.covered.delete(idx); return null; }
+
+      const acc = await ensureAcc(f) ?? new BigUint64Array(HIST_CELLS);
+      mergeHist(acc, new BigUint64Array(reply.hist));
+      fr.acc = acc;
+      touchHistLru(f);
+      repaint(f);
+
+      const g = gen();
+      const rec = {
+        sheepId: id, frame: f, idx, hash: reply.hash, spp: BATCH_SPP,
+        contributor: me.pubHex, gen: g,
+      };
+      rec.sig = await sign(me.pair, batchSignBytes(rec));
+      await net.publishBatch(rec);
+      showSamples();
+      return f;
+    }
+
+    let pullCursor = 0;
+    function startContributeLoop() {
+      const step = async () => {
+        if (contributing && pool.running < pool.size) {
+          const f = leastCoveredFrame();
+          await contributeBatch(f, nextFreeIdx(f)).catch(console.error);
+          // Periodically pull a community-accumulated frame too (verified).
+          if ((pullCursor = (pullCursor + 1) % 8) === 0) {
+            net.requestRender(id, leastCoveredFrame());
+          }
+        }
+        setTimeout(step, 200);
+      };
+      setTimeout(step, 1200);
+    }
+
+    // ---- the Verification gate (same property as app.js) ----------------------
+
+    async function verifyRender({ sheepId, frame, hist, batchKeys }) {
+      if (sheepId !== id || !record) return false;
+      if (!(hist instanceof BigUint64Array) || hist.length !== HIST_CELLS) return false;
+      if (!Array.isArray(batchKeys) || !batchKeys.length) return false;
+
+      const records = await store.batchesForSheep(sheepId);
+      const byKey = new Map(records.map((b) => [b.key ?? batchKey(b), b]));
+      const claimed = [];
+      for (const k of batchKeys) {
+        const b = byKey.get(k);
+        if (!b || b.frame !== frame) return false;
+        if (banned.has(b.contributor)) return false;
+        claimed.push(b);
+      }
+
+      const totalReply = await pool.submit({
+        type: 'total-count', hist: hist.slice().buffer, w: W, h: H, ss: SS,
+      }).done;
+      if (totalReply.type !== 'done') return false;
+      let expected = 0n;
+      for (const b of claimed) expected += BigInt(b.spp);
+      if (BigInt(totalReply.count) !== expected) return false;
+
+      const sample = claimed.slice();
+      for (let i = sample.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [sample[i], sample[j]] = [sample[j], sample[i]];
+      }
+      for (const b of sample.slice(0, Math.min(4, sample.length))) {
+        const reply = await pool.submit(renderBatchMsg(frame, b.idx)).done;
+        if (reply.type !== 'batch-done') return false;
+        if (reply.hash !== b.hash) {
+          const f = {
+            batchKey: b.key ?? batchKey(b), expected: reply.hash, reporter: me.pubHex,
+          };
+          f.sig = await sign(me.pair, fraudSignBytes(f));
+          await net.publishFraud(f);
+          return false;
+        }
+        const sub = await pool.submit({
+          type: 'subtract-check', acc: hist.slice().buffer, batch: reply.hist,
+          w: W, h: H, ss: SS,
+        }).done;
+        if (sub.type !== 'done' || !sub.ok) return false;
+      }
+      return true;
+    }
+
+    // A verified merged histogram for one frame arrived: adopt it if it covers
+    // strictly more than we hold.
+    async function onRender(sheepId, frame, hist) {
+      if (sheepId !== id || frame < 0 || frame >= N_FRAMES) return;
+      const fr = frames[frame];
+      const merged = (await store.batchesForSheep(sheepId))
+        .filter((b) => b.frame === frame).length;
+      if (merged <= fr.covered.size) return;
+      fr.acc = hist instanceof BigUint64Array ? hist.slice() : new BigUint64Array(hist);
+      fr.covered = new Set((await store.batchesForSheep(sheepId))
+        .filter((b) => b.frame === frame).map((b) => b.idx));
+      touchHistLru(frame);
+      repaint(frame);
+      showSamples();
+    }
+
+    // A gossiped batch for this sheep: merge it into the right frame.
+    async function onBatch(rec) {
+      if (rec.sheepId !== id || banned.has(rec.contributor)) return;
+      const fr = frames[rec.frame];
+      if (!fr || fr.covered.has(rec.idx)) return;
+      const reply = await pool.submit(renderBatchMsg(rec.frame, rec.idx)).done;
+      if (reply.type !== 'batch-done') return;
+      if (fr.covered.has(rec.idx)) return;
+      const acc = await ensureAcc(rec.frame) ?? new BigUint64Array(HIST_CELLS);
+      mergeHist(acc, new BigUint64Array(reply.hist));
+      fr.acc = acc;
+      fr.covered.add(rec.idx);
+      touchHistLru(rec.frame);
+      repaint(rec.frame);
+      showSamples();
+    }
+
+    // ---- record lookup --------------------------------------------------------
 
     async function findRecord() {
-      // The store has everything we've seen (gossiped or our own); baked
-      // gen-0 sheep come from the manifest.
-      const store = await openStore();
       for (const r of await store.allSheep()) if (r.id === id) return r;
       const manifest = await (await fetch('genomes/manifest.json')).json();
       for (const s of manifest.sheep) {
         const genome = await (await fetch(s.file)).text();
         const sid = (await pool.submit({ type: 'sheep-id', genomeJson: genome }).done).id;
-        if (sid === id) return { id, genome, gen: 0, parents: null, name: s.name, baked: true };
+        if (sid === id) {
+          return { id, genome, gen: 0, parents: null, origin: 'seed', name: s.name, baked: true };
+        }
       }
-      // Derived (born) children aren't store facts — the flock page stashes
-      // the current generation's in localStorage for us.
+      // Derived (born) children aren't store facts — the flock page stashes the
+      // current generation's in localStorage for us.
       try {
         const derived = JSON.parse(localStorage.getItem(`sheep-derived-${PEER_NS}`) || '[]');
         for (const r of derived) if (r.id === id) return r;
@@ -134,173 +365,12 @@
       return null;
     }
 
-    let record = null;
-    let rendered = false; // a real still has painted (gate the placeholders)
-
-    function markQuality() {
-      for (const b of document.querySelectorAll('#quality button')) {
-        b.disabled = b.dataset.q === quality;
-      }
-    }
-
-    function showSamples(n, spp) {
-      if (!n) { $('#samples').textContent = ''; return; }
-      const s = n >= 1e9 ? `${(n / 1e9).toFixed(1)}B`
-        : n >= 1e6 ? `${Math.round(n / 1e6)}M`
-        : `${Math.round(n / 1e3)}k`;
-      // samples/pixel is the real quality figure — a solid render wants
-      // hundreds. (flam3's "quality" parameter is exactly this number.)
-      $('#samples').textContent = spp ? `${s} samples · ${Math.round(spp)}/px` : `${s} samples`;
-    }
-
-    function useCanvas(which) { // 'cpu' (#cv) | 'gpu' (#cvgpu)
-      $('#cv').hidden = which !== 'cpu';
-      $('#cvgpu').hidden = which !== 'gpu';
-    }
-
-    function paint(m) {
-      if (cv.width !== m.width) { cv.width = m.width; cv.height = m.height; }
-      ctx.putImageData(new ImageData(new Uint8ClampedArray(m.rgba), m.width, m.height), 0, 0);
-    }
-
-    // ---- progressive still ---------------------------------------------------
-
-    let stillCtl = null; // { stop, job } for the running accumulation
-
-    function stopStill() {
-      if (!stillCtl) return;
-      stillCtl.stop = true;
-      stillCtl.job?.cancel();
-      stillCtl = null;
-    }
-
-    // The still always runs on the CPU accumulator (in a worker), so it can
-    // never lag the main thread or fight the browser's compositor for the GPU.
-    // The GPU is reserved for spin, where a continuous render is the point.
-    function renderStill() {
-      stopStill();
-      showSamples(0);
-      const spec = PROGRESSIVE[quality];
-      const ctl = { stop: false, job: null };
-      stillCtl = ctl;
-      stillCpu(ctl, spec);
-    }
-
-    // Small fresh-seeded chunks accumulate into one histogram in the worker;
-    // it paints a throttled tonemap every few chunks and keeps refining until
-    // cancelled. Responsive (chunks yield) and unbounded in quality.
-    function stillCpu(ctl, spec) {
-      useCanvas('cpu');
-      sha256Hex(utf8(`view|${id}`)).then((challengeHex) => {
-        if (ctl.stop) return;
-        ctl.job = pool.submit(
-          {
-            type: 'accumulate', genomeJson: record.genome, challengeHex,
-            width: spec.width, height: spec.height, ss: spec.ss,
-            samplesPerChunk: spec.samplesPerChunk, paintEvery: spec.paintEvery,
-          },
-          { onProgress: (p) => {
-            if (ctl.stop || !p.rgba) return;
-            paint(p); rendered = true;
-            showSamples(p.samples, p.samples / (spec.width * spec.height));
-          } },
-        );
-      });
-    }
-
-    let spinning = null;
-    async function toggleSpin() {
-      if (spinning) {
-        spinning.stop = true; spinning = null;
-        $('#spin').textContent = gpu ? 'spin (gpu)' : 'spin';
-        renderStill(); // resume progressive refinement of the still
-        return;
-      }
-      stopStill();
-      showSamples(0);
-      const s = { stop: false };
-      spinning = s;
-      $('#spin').textContent = 'stop';
-      if (gpu) await spinGpu(s); else await spinCpu(s);
-    }
-
-    async function spinGpu(s) {
-      const cvgpu = $('#cvgpu');
-      try {
-        // Render near the canvas's on-screen resolution (quality-capped),
-        // supersampled like the still.
-        const cfg = SPIN[quality];
-        const px = Math.min(window.innerWidth, window.innerHeight) * (window.devicePixelRatio || 1);
-        const size = Math.min(cfg.sizeCap, Math.max(384, Math.round(px / 8) * 8));
-        cvgpu.width = size;
-        cvgpu.height = size;
-        gpu.configure(cvgpu);
-        useCanvas('gpu');
-
-        // Adaptive quality: float the sample count toward a frame-time budget
-        // so weak GPUs stay smooth and strong ones get dense, clean frames.
-        let samples = cfg.startS;
-        const MIN_S = 3_000_000;
-        let first = true;
-        let dt = cfg.budgetMs;
-        while (!s.stop) {
-          const phase = (performance.now() % LOOP_MS) / LOOP_MS;
-          const t0 = performance.now();
-          await gpu.frame(record.genome, phase, {
-            width: size, height: size, ss: cfg.ss, samples, keepExposure: !first,
-            // Motion blur shutter = the actual frame interval, so blur length
-            // always matches playback speed (flam3 temporal samples).
-            shutter: Math.min(dt, 160) / LOOP_MS, temporal: cfg.temporal,
-            directional: 0.4,
-          });
-          first = false;
-          dt = performance.now() - t0;
-          if (dt > cfg.budgetMs * 1.5) samples = Math.max(MIN_S, samples * 0.7);
-          else if (dt < cfg.budgetMs * 0.6) samples = Math.min(cfg.maxS, samples * 1.3);
-          await new Promise(requestAnimationFrame);
-        }
-      } catch (err) {
-        // GPU died (device loss, validation): fall back to CPU for the session.
-        console.warn('gpu spin failed, falling back to cpu:', err);
-        gpu = null;
-        useCanvas('cpu');
-        if (!s.stop) await spinCpu(s);
-      }
-    }
-
-    async function spinCpu(s) {
-      useCanvas('cpu');
-      const frameJob = () => pool.submit({
-        type: 'frame', genomeJson: record.genome,
-        phase: (performance.now() % LOOP_MS) / LOOP_MS, ...CPU_FRAME[quality],
-        shutter: 0.012, temporal: 4, directional: 0.4, // flam3 motion blur
-      }).done;
-      let pending = frameJob();
-      while (!s.stop) {
-        const next = frameJob();
-        const done = await pending;
-        pending = next;
-        if (s.stop) break;
-        if (done.type === 'done') paint(done);
-      }
-    }
-
-    // First visit: pick a default quality from measured wasm throughput
-    // (one 200k-sample frame). Thresholds are rough CPU tiers.
-    async function benchQuality() {
-      const t0 = performance.now();
-      await pool.submit({
-        type: 'frame', genomeJson: record.genome, phase: 0,
-        width: 192, height: 192, samples: 200_000, seed: 7,
-      }).done;
-      const ms = performance.now() - t0;
-      const q = ms < 60 ? 'ultra' : ms < 120 ? 'high' : ms < 300 ? 'med' : 'low';
-      console.log(`auto quality: ${q} (bench frame ${Math.round(ms)}ms)`);
-      return q;
-    }
+    // ---- boot -----------------------------------------------------------------
 
     async function main() {
       if (!id) { $('#info').textContent = 'no ?id= given'; return; }
+      me = await loadIdentity();
+      store = await openStore();
       record = await findRecord();
       if (!record) {
         $('#info').textContent =
@@ -310,64 +380,75 @@
       $('#sheep-id').textContent = id;
       $('#info').textContent = provenance(record).how;
 
-      // Instant first paint: the flock card's already-rendered pixels.
+      // Instant first paint of frame 0: the flock card's already-rendered pixels.
       try {
         const pv = localStorage.getItem(`sheep-preview-${id}`);
         if (pv) {
           localStorage.removeItem(`sheep-preview-${id}`);
           const img = new Image();
-          img.onload = () => {
-            if (!rendered) {
-              cv.width = img.width;
-              cv.height = img.height;
-              ctx.drawImage(img, 0, 0);
+          img.onload = async () => {
+            if (!frames[0].bitmap && !frames[0].covered.size) {
+              frames[0].preview = await createImageBitmap(img);
             }
           };
           img.src = pv;
         }
-      } catch { /* no preview: black until first chunks land */ }
+      } catch { /* no preview: previews fill in shortly */ }
 
-      // Next-fastest result: any verified summed proof histograms this peer
-      // already holds (its own votes) — accumulated render at proof res.
-      (async () => {
-        const store = await openStore();
-        const spec = PROOF_TIERS.std;
-        const cells = spec.width * spec.ss * spec.height * spec.ss * 4;
-        let acc = null;
-        for (const v of await store.allVotes()) {
-          if (v.sheepId !== id) continue;
-          const buf = await store.getSum(v.key);
-          if (!buf || buf.byteLength !== cells * 8) continue;
-          if (!acc) acc = new Float64Array(cells);
-          const inc = new Float64Array(buf);
-          for (let k = 0; k < cells; k++) acc[k] += inc[k];
-        }
-        if (acc && !rendered) {
-          const m = await pool.submit({
-            type: 'tonemap-hist', hist: acc.buffer, genomeJson: record.genome,
-            width: spec.width, height: spec.height, ss: spec.ss,
-          }).done;
-          if (m.type === 'done' && !rendered) paint(m);
-        }
-      })().catch(console.error);
+      const lookupSheep = async (sid) =>
+        sid === id ? record : (await store.allSheep()).find((s) => s.id === sid);
 
-      if (!quality) quality = await benchQuality();
-      markQuality();
-      for (const b of document.querySelectorAll('#quality button')) {
-        b.onclick = () => {
-          quality = b.dataset.q;
-          localStorage.setItem('sheep-quality', quality);
-          markQuality();
-          if (spinning) {
-            // Restart the spin with the new budgets/resolution.
-            toggleSpin().catch(console.error); // stop -> resumes still
-            toggleSpin().catch(console.error); // start fresh spin
-          } else {
-            renderStill();
-          }
-        };
+      // Self-contained Net: same wiring as app.js so this page is a full peer.
+      const relayOverride = [
+        ...(params.get('relay') ? [params.get('relay')] : []),
+        ...((localStorage.getItem('relays') || '').split(',').map((s) => s.trim()).filter(Boolean)),
+      ];
+      const relays = relayOverride.length ? relayOverride : RELAYS;
+      const transports = [new BroadcastTransport()];
+      if (relays.length) {
+        try {
+          const { createLibp2pTransport } = await import('./js/vendor/libp2p.js');
+          transports.push(await createLibp2pTransport({ relays }));
+        } catch (err) { console.error('libp2p transport unavailable:', err); }
       }
-      $('#spin').onclick = () => toggleSpin().catch(console.error);
+
+      net = new Net({
+        transport: new CompositeTransport(transports),
+        store,
+        identity: { pubHex: me.pubHex, pair: me.pair },
+        sign, verify,
+        checkBatchHash: (genomeJson, sheepId, frame, idx) =>
+          pool.submit({
+            type: 'batch-hash', genomeJson, sheepId, frame, idx,
+            w: W, h: H, ss: SS, spp: BATCH_SPP,
+          }).done.then((m) => m.hash),
+        checkSheepId: (genomeJson) =>
+          pool.submit({ type: 'sheep-id', genomeJson }).done.then((m) => m.id),
+        lookupSheep,
+        verifyRender,
+        onBatch: (rec) => onBatch(rec).catch(console.error),
+        onRender: (sid, frame, hist) => onRender(sid, frame, hist).catch(console.error),
+      });
+      await net.start();
+      banned = net.banned;
+
+      // Seed each frame from batches we already hold, then make previews.
+      for (let f = 0; f < N_FRAMES; f++) {
+        const have = (await store.batchesForSheep(id)).filter((b) => b.frame === f);
+        for (const b of have) frames[f].covered.add(b.idx);
+      }
+      // Eagerly tonemap any frames that already have coverage; preview the rest.
+      for (let f = 0; f < N_FRAMES; f++) {
+        if (frames[f].covered.size) { await ensureAcc(f); repaint(f); }
+        else makePreview(f).catch(console.error);
+      }
+      showSamples();
+
+      $('#contribute').onclick = () => {
+        contributing = !contributing;
+        $('#contribute').classList.toggle('on', contributing);
+        $('#contribute').textContent = contributing ? 'contributing ✓' : 'contribute';
+      };
       $('#dl').onclick = () => {
         const a = document.createElement('a');
         a.href = URL.createObjectURL(new Blob([record.genome], { type: 'application/json' }));
@@ -375,7 +456,9 @@
         a.click();
         URL.revokeObjectURL(a.href);
       };
-      renderStill();
+
+      startContributeLoop();
+      requestAnimationFrame(tick);
     }
 
     main().catch((e) => { $('#info').textContent = 'error: ' + (e.message || e); console.error(e); });

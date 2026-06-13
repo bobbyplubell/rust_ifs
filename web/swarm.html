@@ -52,7 +52,7 @@
     import { WorkerPool } from './js/pool.js';
     import { openStore } from './js/store.js';
     import { loadIdentity, PEER_NS } from './js/identity.js';
-    import { CHANNEL, PROOF_TIERS, voteWeight, gen, GENESIS_GEN, GEN_MS } from './js/net.js';
+    import { CHANNEL, BATCH_SPP, batchKey, gen, GENESIS_GEN, GEN_MS } from './js/net.js';
     import { computeFlock } from './js/gens.js';
     import { handle } from './js/names.js';
 
@@ -91,10 +91,14 @@
       : `${Math.round(samples / 1e3)}k pts`;
 
     async function refresh() {
-      const [votes, sheep, fraud] = await Promise.all([
-        store.allVotes(), store.allSheep(), store.allFraud(),
+      const [batches, sheep, fraud] = await Promise.all([
+        store.allBatches(), store.allSheep(), store.allFraud(),
       ]);
-      const banned = new Set(fraud.map((f) => f.vote.voter));
+      // A fraud proof names a batchKey; the banned party is that batch's
+      // contributor.
+      const fraudKeys = new Set(fraud.map((f) => f.batchKey));
+      const banned = new Set(
+        batches.filter((b) => fraudKeys.has(batchKey(b))).map((b) => b.contributor));
       const { living } = await computeFlock({
         store, baked, breedFn, mutateFn, randomFn, banned,
       });
@@ -107,12 +111,13 @@
         return peers.get(k);
       };
 
-      for (const v of votes) {
-        const p = peer(v.voter);
-        const spec = PROOF_TIERS[v.tier] ?? PROOF_TIERS.std;
+      // Each verified batch a peer contributed is one vote AND BATCH_SPP of
+      // shared rendering work.
+      for (const b of batches) {
+        const p = peer(b.contributor);
         p.votes++;
-        p.work += spec.nFrames * spec.samplesPerFrame;
-        if (!banned.has(v.voter)) p.weight += voteWeight(v);
+        p.work += BATCH_SPP;
+        if (!banned.has(b.contributor)) p.weight += 1;
       }
       for (const s of sheep) {
         if (!s.author) continue;
@@ -150,13 +155,10 @@
         $('#rows').append(tr);
       }
 
-      const totalWork = votes.reduce((a, v) => {
-        const s = PROOF_TIERS[v.tier] ?? PROOF_TIERS.std;
-        return a + s.nFrames * s.samplesPerFrame;
-      }, 0);
+      const totalWork = batches.length * BATCH_SPP;
       $('#totals').textContent =
         `generation ${gen() - GENESIS_GEN} · flock of ${living.size} · ` +
-        `${votes.length} votes proving ${fmtWork(totalWork)} of rendering · ` +
+        `${batches.length} batches contributing ${fmtWork(totalWork)} of rendering · ` +
         `${sheep.filter((s) => !s.baked).length} sheep released · ` +
         `${fraud.length} frauds convicted`;
       const msLeft = GEN_MS - (Date.now() % GEN_MS);

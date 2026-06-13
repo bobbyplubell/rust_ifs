@@ -1,20 +1,36 @@
-// audit.js — the background skeptic. Every few seconds (only when the worker
-// pool is idle, so it never competes with the user's renders) it picks one
-// vote it hasn't checked, re-renders ONE random frame of that vote's loop
-// proof (1/64 of the proof's cost), and compares against the signed hash.
+// audit.js — the background skeptic (batch era). Every few seconds (only when
+// the worker pool is idle, so it never competes with the user's renders or the
+// idle contribution loop) it picks one stored batch contribution it hasn't
+// checked, re-renders that ONE batch's hash (the audit primitive — 1 batch of
+// work), and compares it against the hash the contributor signed.
 //
 // A mismatch yields a fraud proof: a self-contained, signed, objectively
-// verifiable accusation (any peer re-renders the same frame to confirm —
-// see net.js _ingestFraud). All votes from a discredited key are excluded
-// from tallies everywhere a verified fraud proof reaches.
+// verifiable accusation (any peer re-renders the same batch to confirm — see
+// net.js _ingestFraud). On a confirmed proof every contribution from the
+// discredited key is excluded from tallies everywhere it reaches.
 
-import { PROOF_TIERS, voteChallenge, fraudSignBytes } from './net.js';
-import { sign } from './identity.js';
+import { BATCH_SPEC, BATCH_SPP, batchKey, fraudSignBytes } from './net.js';
 
 export class Auditor {
-  constructor({ pool, store, net, me, baked = [], onUpdate, intervalMs = 8000 }) {
-    Object.assign(this, { pool, store, net, me, baked, onUpdate, intervalMs });
-    this.audited = new Set(); // vote keys checked this session
+  /**
+   * @param pool          WorkerPool
+   * @param store         store.js instance
+   * @param baked         baked gen-0 sheep records (for genome lookup)
+   * @param publishFraud  async (record) => void  (net.publishFraud)
+   * @param identity      { pubHex, pair }
+   * @param sign          async (pair, bytes) => sigHex
+   * @param isBanned      (pubHex) => bool — skip already-discredited keys
+   * @param onUpdate      () => void — fired after each audit (stats changed)
+   * @param intervalMs    audit cadence (default 8000)
+   * @param lookupSheep   optional async (id) => record (overrides baked+store)
+   */
+  constructor({ pool, store, baked = [], publishFraud, identity, sign,
+                isBanned, onUpdate, intervalMs = 8000, lookupSheep }) {
+    Object.assign(this, {
+      pool, store, baked, publishFraud, identity, sign,
+      isBanned, onUpdate, intervalMs, lookupSheep,
+    });
+    this.audited = new Set(); // batch keys checked this session
     this.stats = { audits: 0, frauds: 0 };
   }
 
@@ -22,43 +38,49 @@ export class Auditor {
     this.timer = setInterval(() => this.tick().catch(console.error), this.intervalMs);
   }
 
+  stop() {
+    clearInterval(this.timer);
+  }
+
+  async _lookup(id) {
+    if (this.lookupSheep) return this.lookupSheep(id);
+    return this.baked.find((s) => s.id === id)
+      ?? (await this.store.allSheep()).find((s) => s.id === id);
+  }
+
   async tick() {
     if (this.pool.queue.length > 0 || this.pool.running > 0) return; // stay out of the way
 
-    const sheep = new Map(
-      [...this.baked, ...(await this.store.allSheep())].map((s) => [s.id, s]));
-    const banned = new Set((await this.store.allFraud()).map((f) => f.vote.voter));
-    const candidates = (await this.store.allVotes()).filter((v) =>
-      v.voter !== this.me.pubHex &&    // own work is honest by construction
-      !banned.has(v.voter) &&          // already discredited
-      !this.audited.has(v.key) &&
-      sheep.has(v.sheepId));
+    const batches = await this.store.allBatches();
+    const candidates = batches.filter((b) => {
+      const key = b.key ?? batchKey(b);
+      return b.contributor !== this.identity.pubHex   // own work is honest by construction
+        && !this.isBanned?.(b.contributor)            // already discredited
+        && !this.audited.has(key);
+    });
     if (!candidates.length) return;
 
-    const v = candidates[Math.floor(Math.random() * candidates.length)];
-    const spec = PROOF_TIERS[v.tier];
-    if (!spec) return;
-    const idx = Math.floor(Math.random() * spec.nFrames);
-    console.log('[audit] checking', v.key.slice(0, 16), 'tier', v.tier, 'frame', idx);
-    const challengeHex = await voteChallenge(v.sheepId, v.voter, v.gen);
-    const m = await this.pool.submit({
-      type: 'audit-frame', genomeJson: sheep.get(v.sheepId).genome, challengeHex, idx,
-      width: spec.width, height: spec.height, ss: spec.ss,
-      samplesPerFrame: spec.samplesPerFrame,
-      nFrames: spec.nFrames, temporal: spec.temporal,
-    }).done;
-    if (m.type !== 'done') return;
+    const b = candidates[Math.floor(Math.random() * candidates.length)];
+    const key = b.key ?? batchKey(b);
+    const sheep = await this._lookup(b.sheepId);
+    if (!sheep) return; // can't audit without the genome; anti-entropy re-offers it
 
-    console.log('[audit] result for', v.key.slice(0, 16), m.hash === v.chunkHashes[idx] ? 'ok' : 'MISMATCH');
+    const reply = await this.pool.submit({
+      type: 'batch-hash', genomeJson: sheep.genome, sheepId: b.sheepId,
+      frame: b.frame, idx: b.idx,
+      w: BATCH_SPEC.width, h: BATCH_SPEC.height, ss: BATCH_SPEC.ss, spp: BATCH_SPP,
+    }).done;
+    if (reply.type !== 'done') return;
+
     this.stats.audits++;
-    this.audited.add(v.key);
-    if (m.hash !== v.chunkHashes[idx]) {
+    this.audited.add(key);
+    if (reply.hash !== b.hash) {
       this.stats.frauds++;
-      const f = { voteKey: v.key, vote: v, frame: idx, expected: m.hash, reporter: this.me.pubHex };
-      f.sig = await sign(this.me.pair, fraudSignBytes(f));
-      console.log('[audit] publishing fraud proof');
-      await this.net.publishFraud(f);
-      console.log('[audit] fraud proof published');
+      const fraud = {
+        batchKey: key, expected: reply.hash, reporter: this.identity.pubHex,
+      };
+      fraud.sig = await this.sign(this.identity.pair, fraudSignBytes(fraud));
+      await this.publishFraud(fraud);
     }
     this.onUpdate?.(this.stats);
   }
