@@ -1,9 +1,11 @@
 # Deploying the relay (public cross-machine swarm)
 
 A browser swarm needs one tiny always-on relay: it can't render or vote, it
-only introduces peers (and gossips so messages flow before any direct link).
-Browsers on an https page can only open `wss://`, so the relay runs behind
-Caddy (TLS termination).
+only introduces peers — it relays discovery beacons and WebRTC signaling so
+browsers can find each other and form DIRECT links, but sheep data then flows
+browser-to-browser over WebRTC and never through the relay (so the relay isn't
+a bandwidth bottleneck as the swarm grows). Browsers on an https page can only
+open `wss://`, so the relay runs behind Caddy (TLS termination).
 
 ## 1. Host + DNS
 - Any small VPS with Docker. Open ports 80 and 443 (TCP+UDP).

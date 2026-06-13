@@ -87,7 +87,9 @@ async function main() {
   if (relays.length) {
     try {
       const { createLibp2pTransport } = await import('./vendor/libp2p.js');
-      transports.push(await createLibp2pTransport({ relays }));
+      const lp = await createLibp2pTransport({ relays });
+      transports.push(lp);
+      window.__libp2p = lp.node; // diagnostics: connection/discovery inspection
       console.log('libp2p transport up; relays:', relays);
     } catch (err) {
       console.error('libp2p transport unavailable:', err);
@@ -599,9 +601,15 @@ function shuffle(a) {
 const CONTRIB_CADENCE_MS = 250; // small breather between contributions
 let contribCursor = 0;
 
+// When true, the background loop skips contributing. Used by the stress harness
+// to quiesce the swarm during its settle window so convergence can be measured
+// against a fixed batch set (a never-quiescent swarm always has an in-flight
+// tail). No effect on normal use.
+let contributePaused = false;
+
 function startContributeLoop() {
   const tick = () => {
-    contributeStep()
+    (contributePaused ? Promise.resolve() : contributeStep())
       .catch(console.error)
       .finally(() => setTimeout(tick, CONTRIB_CADENCE_MS));
   };
@@ -875,6 +883,9 @@ function installDebugHooks() {
 
 function installStressHooks() {
   window.__sheepAct = {
+    // Quiesce/resume the background contribute loop — lets the harness freeze
+    // the batch set during its settle window to measure true convergence.
+    pauseContribute(p = true) { contributePaused = !!p; return contributePaused; },
     // Render+publish ONE tile (frame-0-first, then random frame) for a random
     // living card; resolves with the sheepId or null.
     async contributeRandom() {
@@ -923,6 +934,14 @@ function installStressHooks() {
     const [sheep, batches, fraud, renderKeys] = await Promise.all([
       store.allSheep(), store.allBatches(), store.allFraud(), store.allRenderKeys(),
     ]);
+    // True P2P-convergence signal: a hash of the WHOLE replicated batch set
+    // (every batch key, sorted). Two peers that have exchanged all data agree on
+    // this regardless of wall-clock. (Unlike tallyFingerprint below, which only
+    // covers the current generation — the freshest, least-propagated slice — and
+    // so is sensitive to gen-boundary timing; keep it only as a live-view check.)
+    const batchSetHash = await sha256Hex(
+      utf8(batches.map((b) => b.key).filter(Boolean).sort().join(',')),
+    );
     // Convergence fingerprint: current-gen [sheepId, batchCount] for non-banned
     // contributors, sorted, hashed. Two converged peers agree on this.
     const g = gen();
@@ -938,6 +957,7 @@ function installStressHooks() {
       cards: cards.size, renders: renderKeys.length,
       audits: auditor.stats.audits, frauds: auditor.stats.frauds,
       net: JSON.parse(JSON.stringify(net.counts)),
+      batchSetHash,
       tallyFingerprint: await sha256Hex(utf8(JSON.stringify(t))),
     };
   };

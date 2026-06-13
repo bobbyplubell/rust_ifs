@@ -11,7 +11,8 @@ import { yamux } from '@chainsafe/libp2p-yamux';
 import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { identify } from '@libp2p/identify';
 import { bootstrap } from '@libp2p/bootstrap';
-import { TOPIC, enc, dec } from './common.js';
+import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
+import { TOPIC, DISCOVERY_TOPIC, enc, dec } from './common.js';
 
 /**
  * @param relays  array of relay multiaddrs incl. /p2p/<peer-id>, e.g.
@@ -22,7 +23,13 @@ export async function createLibp2pTransport({ relays }) {
   const node = await createLibp2p({
     // Listen via WebRTC, signaled through a relay reservation: this is what
     // lets two browsers talk directly after the relay introduces them.
-    addresses: { listen: ['/webrtc'] },
+    // Explicitly listen on each known relay's /p2p-circuit so we actively
+    // RESERVE a slot (circuit-relay-v2 v3 won't auto-reserve on a merely
+    // connected peer) — the reservation is what gives us a dialable
+    // <relay>/p2p-circuit/webrtc address to advertise on the discovery topic.
+    addresses: {
+      listen: ['/webrtc', ...relays.map((r) => `${r}/p2p-circuit`)],
+    },
     transports: [
       webSockets(),
       webRTC(),
@@ -30,7 +37,12 @@ export async function createLibp2pTransport({ relays }) {
     ],
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
-    peerDiscovery: relays.length ? [bootstrap({ list: relays })] : [],
+    peerDiscovery: [
+      ...(relays.length ? [bootstrap({ list: relays })] : []),
+      // Broadcast our own circuit address on the discovery topic and dial peers
+      // we hear about — this is what forms the direct browser-to-browser mesh.
+      pubsubPeerDiscovery({ interval: 5_000, topics: [DISCOVERY_TOPIC] }),
+    ],
     services: {
       identify: identify(),
       pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }),
@@ -38,6 +50,42 @@ export async function createLibp2pTransport({ relays }) {
   });
 
   node.services.pubsub.subscribe(TOPIC);
+
+  // Dial discovered peers to form the direct browser-to-browser mesh. The relay
+  // forwards discovery beacons but NOT data, and libp2p's autodial won't dial
+  // discovered peers on its own — so we dial them here. Capped at DIRECT_TARGET
+  // direct links: gossipsub only needs a handful of mesh neighbours, and a
+  // ~k-regular random graph stays connected, so data still reaches everyone
+  // without every node connecting to every other (which wouldn't scale).
+  const DIRECT_TARGET = 8;
+  const relayIds = new Set(relays.map((r) => r.split('/p2p/').pop()).filter(Boolean));
+  const directConns = () =>
+    node.getConnections().filter((c) => !relayIds.has(c.remotePeer.toString()));
+  const dialPeer = (id) => {
+    if (relayIds.has(id.toString())) return;
+    if (directConns().length >= DIRECT_TARGET) return;
+    if (node.getConnections(id).length > 0) return; // already linked
+    node.dial(id).catch(() => { /* unreachable peer: fine, others will relay gossip */ });
+  };
+  // Dial on first sight for a fast initial mesh...
+  node.addEventListener('peer:discovery', (evt) => dialPeer(evt.detail.id));
+  // ...and heal periodically: a dropped link or a missed/failed initial dial
+  // would otherwise leave a peer stranded (the discovery event won't repeat for
+  // an already-known peer). This re-dials known, reachable, unconnected peers
+  // until we're back up to DIRECT_TARGET.
+  setInterval(async () => {
+    if (directConns().length >= DIRECT_TARGET) return;
+    let peers = [];
+    try { peers = await node.peerStore.all(); } catch { return; }
+    for (const p of peers) {
+      if (directConns().length >= DIRECT_TARGET) break;
+      if (relayIds.has(p.id.toString())) continue;
+      if (node.getConnections(p.id).length > 0) continue;
+      // Only peers that have advertised a dialable webrtc address.
+      if (!p.addresses.some((a) => a.multiaddr.toString().includes('webrtc'))) continue;
+      dialPeer(p.id);
+    }
+  }, 6000 + Math.floor(Math.random() * 2000));
 
   let handler = null;
   node.services.pubsub.addEventListener('message', (evt) => {

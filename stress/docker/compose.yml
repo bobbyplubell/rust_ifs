@@ -1,0 +1,31 @@
+# Container-per-peer swarm stress (peers talk over the libp2p relay, not
+# BroadcastChannel). Orchestrated by run.sh, which fills RELAY_MADDR.
+services:
+  relay:
+    build: { context: ../../relay }
+    environment:
+      PORT: 4001
+      ANNOUNCE: /dns4/swarm/tcp/443/tls/ws
+    expose: ["4001"]
+  swarm:
+    image: caddy:2
+    depends_on: [relay]
+    volumes:
+      - ../../web:/srv:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    expose: ["443"]
+  peer:
+    image: mcr.microsoft.com/playwright:v1.53.0-noble
+    depends_on: [swarm]
+    environment:
+      WEB_URL: https://swarm
+      RELAY_MADDR: ${RELAY_MADDR}
+      MINUTES: ${MINUTES:-3}
+      CONTRIB_MS: ${CONTRIB_MS:-4000}
+      SETTLE_MS: ${SETTLE_MS:-60000}
+      LP_DEBUG: ${LP_DEBUG:-}
+    volumes:
+      - ./:/work                                # writable so node_modules can nest
+      - ../node_modules:/work/node_modules:ro   # reuse stress/'s playwright
+    working_dir: /work
+    command: ["node", "peer.mjs"]

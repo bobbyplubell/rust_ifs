@@ -495,7 +495,7 @@ export class Net {
         ...Object.keys(msg.d[kind] ?? {}),
       ]);
       for (const g of gens) {
-        if (sent >= 4) return; // bound per-inv repair work
+        if (sent >= 16) return; // bound per-inv repair work
         if (digests[kind][g] !== (msg.d[kind] ?? {})[g]) {
           this._send({
             kind: 'bucket', to: msg.from, what: kind, gen: Number(g),
@@ -516,7 +516,7 @@ export class Net {
     let sent = 0;
     const sheepIds = new Set([...Object.keys(covDigests), ...Object.keys(msg.c)]);
     for (const sheepId of sheepIds) {
-      if (sent >= 6) return;
+      if (sent >= 24) return;
       if (covDigests[sheepId] !== msg.c[sheepId]) {
         this._send({ kind: 'covreq', to: msg.from, sheepId });
         sent++;

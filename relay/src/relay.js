@@ -1,8 +1,14 @@
 // The swarm's one piece of infrastructure: a libp2p node that
 //   1. accepts WebSocket connections from browsers (they can't accept inbound),
 //   2. acts as a circuit-relay-v2 server so browsers can WebRTC to each other,
-//   3. joins the gossipsub topic so messages flow even before any direct
-//      browser-to-browser link exists.
+//   3. runs gossipsub but does NOT subscribe to the data topic. It still relays
+//      SUBSCRIBE control messages (so peers discover each other) and the circuit
+//      signaling that lets them form DIRECT WebRTC links — but it is NOT a data
+//      hop. Sheep data gossips browser-to-browser over WebRTC, so the relay
+//      never becomes a bandwidth bottleneck as the swarm grows.
+//      Tradeoff: a peer that can't establish WebRTC to anyone is isolated —
+//      there's no data fallback through the relay. For a public deployment
+//      behind hard NATs, add a TURN server rather than re-subscribing the relay.
 // It holds NO authority: it forwards signed facts it cannot forge.
 //
 // Env: PORT (ws listen, default 4001), ANNOUNCE (comma-separated public
@@ -18,7 +24,8 @@ import { noise } from '@chainsafe/libp2p-noise';
 import { yamux } from '@chainsafe/libp2p-yamux';
 import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { identify } from '@libp2p/identify';
-import { TOPIC } from './common.js';
+import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
+import { DISCOVERY_TOPIC } from './common.js';
 
 const port = process.env.PORT || 4001;
 const announce = (process.env.ANNOUNCE || '').split(',').filter(Boolean);
@@ -46,6 +53,9 @@ const node = await createLibp2p({
   transports: [webSockets()],
   connectionEncrypters: [noise()],
   streamMuxers: [yamux()],
+  // Forward the discovery topic only (listenOnly: don't advertise the relay
+  // itself — its address is already baked into every client's config).
+  peerDiscovery: [pubsubPeerDiscovery({ listenOnly: true, topics: [DISCOVERY_TOPIC] })],
   services: {
     identify: identify(),
     relay: circuitRelayServer({
@@ -55,7 +65,8 @@ const node = await createLibp2p({
   },
 });
 
-node.services.pubsub.subscribe(TOPIC);
+// NOTE: intentionally NOT subscribed to TOPIC — discovery/signaling only, see
+// the header. node.services.pubsub.subscribe(TOPIC) would make it a data hop.
 
 console.log('relay peer id:', node.peerId.toString());
 for (const addr of node.getMultiaddrs()) console.log('listening:', addr.toString());
