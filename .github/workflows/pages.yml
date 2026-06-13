@@ -29,6 +29,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/configure-pages@v5
+        with:
+          enablement: true     # turn Pages on (Actions build type) if not already
       - uses: actions/upload-pages-artifact@v3
         with:
           path: web            # serve the web/ subdir as the site root
