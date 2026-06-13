@@ -75,10 +75,13 @@ function handleRenderBatch(msg) {
   );
   const hash = b.hash;
   const hist = b.hist; // BigUint64Array (owns its buffer, copied out of wasm)
+  // The ACTUAL plotted in-frame count (≤ spp) — committed in the contribution
+  // record so the verification gate can do exact count conservation.
+  const count = total_count(hist, msg.w, msg.h, msg.ss).toString();
   b.free?.();
   if (cancelled.has(msg.jobId)) return;
   self.postMessage(
-    { type: 'batch-done', jobId: msg.jobId, hash, hist: hist.buffer, frame: msg.frame, idx: msg.idx },
+    { type: 'batch-done', jobId: msg.jobId, hash, count, hist: hist.buffer, frame: msg.frame, idx: msg.idx },
     [hist.buffer],
   );
 }

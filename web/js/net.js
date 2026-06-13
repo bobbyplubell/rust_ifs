@@ -93,7 +93,7 @@ export const ACCEPTED_VERSIONS = new Set([1]);
 
 export const batchKey = (b) => `${b.sheepId}:${b.frame}:${b.idx}`;
 export const batchSignBytes = (b) =>
-  utf8('batch|' + [b.v, b.sheepId, b.frame, b.idx, b.hash, b.spp, b.gen].join('|'));
+  utf8('batch|' + [b.v, b.sheepId, b.frame, b.idx, b.hash, b.spp, b.count, b.gen].join('|'));
 /** v1: one batch, one vote. Kept as a function so weighting can change later. */
 export const voteValue = (_b) => 1;
 
@@ -115,7 +115,18 @@ export const fraudSignBytes = (f) =>
   utf8('fraud|' + [f.v, f.batchKey, f.expected, f.reporter].join('|'));
 
 /** BroadcastChannel bus name — bumped on wire-format breaks. */
-export const CHANNEL = 'sheep-net-v12';
+export const CHANNEL = 'sheep-net-v14';
+
+// Lossless gzip via the platform CompressionStream (no deps). Used to shrink
+// the heavy render-data histogram in transit; verification is unaffected.
+async function gzip(buf) {
+  const s = new Blob([buf]).stream().pipeThrough(new CompressionStream('gzip'));
+  return new Uint8Array(await new Response(s).arrayBuffer());
+}
+async function gunzip(bytes) {
+  const s = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return await new Response(s).arrayBuffer();
+}
 
 export class BroadcastTransport {
   constructor(channel = CHANNEL) {
@@ -323,6 +334,7 @@ export class Net {
     if (!Number.isInteger(b.frame) || b.frame < 0) return;
     if (!Number.isInteger(b.idx) || b.idx < 0) return;
     if (!Number.isInteger(b.spp) || b.spp <= 0) return;
+    if (!Number.isInteger(b.count) || b.count < 0 || b.count > b.spp) return;
     if (!Number.isInteger(b.gen)) return;
     if (!HEX64.test(b.contributor ?? '')) return;
     if (this.banned.has(b.contributor)) return; // discard everything from banned keys
@@ -372,23 +384,32 @@ export class Net {
 
   async _onWantRender(msg) {
     if (!msg.sheepId || !Number.isInteger(msg.frame) || msg.from === this.pubHex) return;
-    const buf = await this.store.getRender(msg.sheepId, msg.frame);
-    if (!buf) return;
-    const batchKeys = (await this.store.batchesForSheep(msg.sheepId))
-      .filter((b) => b.frame === msg.frame)
-      .map((b) => b.key ?? batchKey(b));
+    const r = await this.store.getRender(msg.sheepId, msg.frame);
+    if (!r || !r.buf || !Array.isArray(r.keys)) return;
+    // Compress the heavy histogram losslessly for transit (sparse + small
+    // values → big savings). The keys are EXACTLY the tiles in r.buf, so the
+    // receiver's gate (total_count == Σ keys' counts) is consistent. Cheaper
+    // transfer costs nothing in trust.
+    const gz = await gzip(r.buf);
+    this.counts.renderBytes = (this.counts.renderBytes ?? 0) + gz.byteLength;
     this._send({
       kind: 'render-data', to: msg.from,
-      sheepId: msg.sheepId, frame: msg.frame, buf, batchKeys,
+      sheepId: msg.sheepId, frame: msg.frame, gz, batchKeys: r.keys,
     });
   }
 
   async _onRenderData(msg) {
     if (msg.to !== this.pubHex || !msg.sheepId || !Number.isInteger(msg.frame)) return;
-    if (!msg.buf || !Array.isArray(msg.batchKeys)) return;
+    if (!Array.isArray(msg.batchKeys)) return;
+    // Decompress (gz) or accept a raw buffer (buf) for robustness.
+    let buf;
+    try {
+      buf = msg.gz ? await gunzip(msg.gz) : msg.buf;
+    } catch { return; }
+    if (!buf || buf.byteLength % 8 !== 0) return;
     // The heavy histogram is NEVER trusted: rebuild a typed view and run the
     // injected gate (re-render sample, count conservation, subtract_check).
-    const hist = new BigUint64Array(msg.buf);
+    const hist = new BigUint64Array(buf);
     let ok = false;
     try {
       ok = await this.verifyRender?.({
@@ -396,8 +417,9 @@ export class Net {
       });
     } catch (e) { console.error(e); ok = false; }
     if (!ok) return; // discard; verifyRender publishes a fraud proof if provable
-    await this.store.putRender(msg.sheepId, msg.frame, msg.buf);
-    this.onRender?.(msg.sheepId, msg.frame, hist);
+    // Cache it WITH its verified keys so we can re-serve consistently.
+    await this.store.putRender(msg.sheepId, msg.frame, buf, msg.batchKeys);
+    this.onRender?.(msg.sheepId, msg.frame, hist, msg.batchKeys);
   }
 
   // -- anti-entropy ------------------------------------------------------------

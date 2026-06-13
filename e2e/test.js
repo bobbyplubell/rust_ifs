@@ -156,6 +156,48 @@ let firstId; // a baked sheep id, reused by the swarm section's peer=1 store
   await p2.close();
 }
 
+// ---- 3b. cheap viewing: fetch a verified (compressed) render ----------------
+{
+  section('render fetch + verify (cheap viewing)');
+  // A contributor (auto-contributes → seeds its accumulation) and a pure viewer
+  // (no contribution → renders nothing itself). The viewer fetches the
+  // contributor's accumulated frame over want-render/render-data (gzip'd),
+  // verifies it by re-rendering a SAMPLE of tiles (not the whole thing), and
+  // adopts it — proving the verified cheap-viewing path end to end.
+  const con = await ctx.newPage();
+  const view = await ctx.newPage();
+  for (const [n, p] of [['con', con], ['view', view]]) {
+    p.on('console', (m) => { if (m.type() === 'error') console.log(`${n} console.error:`, m.text()); });
+    p.on('pageerror', (e) => console.log(`${n} pageerror:`, e.message));
+  }
+  // nocontribute so the contributor's seeded render is STABLE (no auto-growth
+  // racing the viewer's record sync); it seeds via the explicit contributeTo.
+  await con.goto(`${base}/index.html?peer=20&stress=1&nocontribute=1`);
+  // fetchonly: the viewer never re-renders gossiped tiles, so any render it
+  // shows MUST have come from a verified fetch — fetchedRenders proves it.
+  await view.goto(`${base}/index.html?peer=21&stress=1&nocontribute=1&fetchonly=1`);
+  await con.locator('.card').first().waitFor();
+  await view.locator('.card').first().waitFor();
+  await con.waitForFunction(() => !!window.__sheepAct);
+  await view.waitForFunction(() => !!window.__sheepAct);
+
+  // Contributor renders a few frame-0 tiles for firstId (and seeds them).
+  for (let i = 0; i < 3; i++) await con.evaluate((sid) => window.__sheepAct.contributeTo(sid), firstId);
+  await con.waitForTimeout(3000); // let the seed + batch records propagate
+
+  let fetched = 0;
+  for (let t = 0; t < 40; t++) {
+    await view.evaluate((sid) => window.__sheepAct.fetchRender(sid, 0), firstId);
+    await view.waitForTimeout(1000);
+    fetched = await view.evaluate(() => window.__sheepStats.fetchedRenders);
+    if (fetched >= 1) break;
+  }
+  check('viewer fetched + verified a compressed render (no full re-render)',
+    fetched >= 1, `fetchedRenders: ${fetched}`);
+  await con.close();
+  await view.close();
+}
+
 // ---- 4. fraud: forged batch caught by the auditor, key banned ---------------
 {
   section('fraud injection');
@@ -176,7 +218,7 @@ let firstId; // a baked sheep id, reused by the swarm section's peer=1 store
     const record = {
       v: PROTOCOL_VERSION,
       sheepId: sid, frame: 0, idx: 99, hash: 'de'.repeat(32), // plausible but WRONG hash
-      spp: 640000, contributor, gen: gen(),
+      spp: 640000, count: 600000, contributor, gen: gen(),
     };
     record.sig = hex(new Uint8Array(
       await crypto.subtle.sign({ name: 'Ed25519' }, pair.privateKey, batchSignBytes(record))));

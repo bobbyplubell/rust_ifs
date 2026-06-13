@@ -151,10 +151,24 @@
       return acc;
     }
 
+    // Seed the render store with a frame's accumulation so peers can fetch it.
+    // Throttled per frame (the histogram is multi-MB).
+    const SEED_EVERY_MS = 5000;
+    function maybeSeed(f) {
+      const fr = frames[f];
+      if (!fr.acc || !fr.covered.size) return;
+      const now = Date.now();
+      if (now - (fr.lastSeed || 0) < SEED_EVERY_MS) return;
+      fr.lastSeed = now;
+      const keys = [...fr.covered].map((i) => `${id}:${f}:${i}`);
+      store.putRender(id, f, fr.acc.slice().buffer, keys).catch(console.error);
+    }
+
     // Tonemap frame f's accumulation into its ImageBitmap (throttled per frame).
     async function repaint(f) {
       const fr = frames[f];
       if (!fr.acc || !fr.covered.size) return;
+      maybeSeed(f);
       if (fr.tonemapPending) { fr.repaintQueued = true; return; }
       fr.tonemapPending = true;
       const m = await pool.submit({
@@ -285,7 +299,7 @@
       const rec = {
         v: PROTOCOL_VERSION,
         sheepId: id, frame: f, idx, hash: reply.hash, spp: BATCH_SPP,
-        contributor: me.pubHex, gen: g,
+        count: Number(reply.count), contributor: me.pubHex, gen: g,
       };
       rec.sig = await sign(me.pair, batchSignBytes(rec));
       await net.publishBatch(rec);
@@ -333,7 +347,7 @@
       }).done;
       if (totalReply.type !== 'done') return false;
       let expected = 0n;
-      for (const b of claimed) expected += BigInt(b.spp);
+      for (const b of claimed) expected += BigInt(b.count);
       if (BigInt(totalReply.count) !== expected) return false;
 
       const sample = claimed.slice();
@@ -344,6 +358,7 @@
       for (const b of sample.slice(0, Math.min(4, sample.length))) {
         const reply = await pool.submit(renderBatchMsg(frame, b.idx)).done;
         if (reply.type !== 'batch-done') return false;
+        if (Number(reply.count) !== b.count) return false; // record's count was inflated
         if (reply.hash !== b.hash) {
           const f = {
             v: PROTOCOL_VERSION,

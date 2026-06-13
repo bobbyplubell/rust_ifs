@@ -14,7 +14,7 @@ import { PEER_NS } from './identity.js';
 
 export async function openStore() {
   const db = await new Promise((resolve, reject) => {
-    const req = indexedDB.open(`sheep-store-v12-${PEER_NS}`, 1);
+    const req = indexedDB.open(`sheep-store-v14-${PEER_NS}`, 1);
     req.onupgradeneeded = () => {
       req.result.createObjectStore('sheep', { keyPath: 'id' });
       req.result.createObjectStore('batches', { keyPath: 'key' });
@@ -83,8 +83,11 @@ export async function openStore() {
     // fraud
     addFraud: (rec) => addIfAbsent('fraud', rec),
     allFraud: () => getAll('fraud'),
-    // verified render cache (`${sheepId}:${frame}` -> ArrayBuffer)
-    putRender: (sheepId, frame, buf) => kvPut('renders', `${sheepId}:${frame}`, buf),
+    // verified render cache: `${sheepId}:${frame}` -> { buf:ArrayBuffer, keys:[batchKey] }
+    // keys are EXACTLY the tiles summed into buf, so a served render and its
+    // claimed batchKeys stay consistent (the gate checks total_count == Σ counts).
+    putRender: (sheepId, frame, buf, keys) =>
+      kvPut('renders', `${sheepId}:${frame}`, { buf, keys }),
     getRender: (sheepId, frame) => kvGet('renders', `${sheepId}:${frame}`),
     allRenderKeys: () => kvKeys('renders'),
   };

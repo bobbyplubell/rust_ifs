@@ -37,6 +37,11 @@ const pool = new WorkerPool(WORKERS_OVERRIDE ?? undefined);
 // sheep the user explicitly pledges via the "contribute" button. Load/headless
 // modes auto-contribute to keep generating work without a human.
 const AUTO_CONTRIBUTE = !!(params.get('stress') || params.get('autocontribute'));
+// ?fetchonly: CPU-light viewing. Don't re-render gossiped tiles; instead fetch
+// the swarm's accumulated render (one transfer + a sampled verify) and display
+// that. The cheap path the lossless-compressed render-data was built for.
+const FETCH_ONLY = !!params.get('fetchonly');
+let fetchedRenders = 0; // verified renders adopted from peers (vs rendered locally)
 
 // Frame every card shows. The flock is a still gallery of frame 0; the
 // fullscreen view (sheep.html) animates the whole loop.
@@ -119,7 +124,7 @@ async function main() {
     onSheep: () => scheduleRebuild(),
     onBatch: (rec) => onBatch(rec).catch(console.error),
     onFraud: () => scheduleRebuild(), // a discredited contributor changes tallies
-    onRender: (sheepId, frame, hist) => onRender(sheepId, frame, hist).catch(console.error),
+    onRender: (sheepId, frame, hist, keys) => onRender(sheepId, frame, hist, keys).catch(console.error),
   });
 
   auditor = new Auditor({
@@ -412,10 +417,25 @@ async function paintPreview(entry) {
   }
 }
 
+// Seed the render store with this card's accumulation so peers can fetch it
+// (cheap viewing: they verify a sample of tiles instead of re-rendering all).
+// Throttled — the histogram is multi-MB. Persists across reloads as a bonus.
+const SEED_EVERY_MS = 5000;
+function maybeSeed(entry) {
+  if (!entry.acc0 || !entry.covered.size) return;
+  const now = Date.now();
+  if (now - (entry.lastSeed || 0) < SEED_EVERY_MS) return;
+  entry.lastSeed = now;
+  // Keys are EXACTLY the tiles in acc0 (entry.covered) → render + keys consistent.
+  const keys = [...entry.covered].map((i) => `${entry.record.id}:${CARD_FRAME}:${i}`);
+  store.putRender(entry.record.id, CARD_FRAME, entry.acc0.slice().buffer, keys).catch(console.error);
+}
+
 // Tonemap a card's accumulated histogram and paint it. Throttled: at most one
 // tonemap in flight per card, with one coalesced repaint queued behind it.
 function repaint(entry) {
   if (!entry.acc0 || !entry.covered.size) return;
+  maybeSeed(entry);
   if (entry.tonemapPending) { entry.repaintQueued = true; return; }
   entry.tonemapPending = true;
   // Copy: the worker takes ownership of the transferred buffer.
@@ -449,34 +469,47 @@ async function onBatch(rec) {
   const entry = cards.get(rec.sheepId);
   if (!entry || banned.has(rec.contributor)) return;
   markTally(rec.sheepId);
-  const cov = coveredFor(entry, rec.frame);
-  if (cov.has(rec.idx)) return;
   if (rec.frame === CARD_FRAME) {
-    // The displayed frame: render it locally and merge so the card sharpens.
-    const reply = await pool.submit(renderBatchMsg(entry.record, CARD_FRAME, rec.idx)).done;
-    if (reply.type === 'batch-done' && mergeBatchInto(entry, rec.idx, new BigUint64Array(reply.hist))) {
-      repaint(entry);
+    if (FETCH_ONLY) {
+      maybeFetch(entry); // pull the verified accumulation instead of rendering
+    } else if (!entry.covered.has(rec.idx)) {
+      // The displayed frame: render it locally and merge so the card sharpens.
+      const reply = await pool.submit(renderBatchMsg(entry.record, CARD_FRAME, rec.idx)).done;
+      if (reply.type === 'batch-done' && mergeBatchInto(entry, rec.idx, new BigUint64Array(reply.hist))) {
+        repaint(entry);
+      }
     }
   } else {
-    cov.add(rec.idx); // other frames: just track coverage (shown in fullscreen)
+    coveredFor(entry, rec.frame).add(rec.idx); // other frames: track coverage
   }
+}
+
+// Fetch-only viewing: pull the swarm's accumulated frame-0 render (verified)
+// instead of rendering each gossiped tile ourselves. Throttled per card.
+const FETCH_EVERY_MS = 4000;
+function maybeFetch(entry) {
+  const now = Date.now();
+  if (now - (entry.lastFetch || 0) < FETCH_EVERY_MS) return;
+  entry.lastFetch = now;
+  net.requestRender(entry.record.id, CARD_FRAME);
 }
 
 // A verified merged histogram for (sheep, frame) arrived from the swarm (it
 // already passed the Verification gate in net.js). Merge it wholesale into the
 // card's accumulation. We can't dedup at idx granularity here (it's a sum of
 // many batches), so only adopt it if it covers strictly more than we hold.
-async function onRender(sheepId, frame, hist) {
+async function onRender(sheepId, frame, hist, batchKeys = []) {
   if (frame !== CARD_FRAME) return;
   const entry = cards.get(sheepId);
   if (!entry) return;
-  // Count the merged render's batches via store coverage; only adopt if it
-  // beats our current coverage (avoids double-counting our own contributions).
-  const merged = (await store.batchesForSheep(sheepId)).filter((b) => b.frame === frame).length;
-  if (merged <= entry.covered.size) return;
+  // batchKeys are the tiles the verified histogram actually contains (the gate
+  // checked them), so covered/acc0 stay consistent for re-seeding. Adopt only
+  // if it beats what we already display.
+  const idxs = batchKeys.map((k) => Number(k.split(':')[2])).filter((n) => Number.isInteger(n));
+  if (idxs.length <= entry.covered.size) return;
   entry.acc0 = hist instanceof BigUint64Array ? hist.slice() : new BigUint64Array(hist);
-  entry.covered = new Set(
-    (await store.batchesForSheep(sheepId)).filter((b) => b.frame === frame).map((b) => b.idx));
+  entry.covered = new Set(idxs);
+  fetchedRenders++;
   repaint(entry);
 }
 
@@ -514,7 +547,7 @@ async function verifyRender(lookupSheep, { sheepId, frame, hist, batchKeys }) {
   }).done;
   if (totalReply.type !== 'done') return false;
   let expected = 0n;
-  for (const b of claimed) expected += BigInt(b.spp);
+  for (const b of claimed) expected += BigInt(b.count);
   if (BigInt(totalReply.count) !== expected) return false;
 
   // Spot re-render: a random sample of the claimed batches. Each must hash to
@@ -523,6 +556,7 @@ async function verifyRender(lookupSheep, { sheepId, frame, hist, batchKeys }) {
   for (const b of sample) {
     const reply = await pool.submit(renderBatchMsg(sheep, frame, b.idx)).done;
     if (reply.type !== 'batch-done') return false;
+    if (Number(reply.count) !== b.count) return false; // record's count was inflated
     if (reply.hash !== b.hash) {
       // The contributor signed a hash that doesn't match the true render:
       // provable fraud. Publish it (bans them everywhere).
@@ -657,7 +691,7 @@ async function contributeBatch(entry) {
   const record = {
     v: PROTOCOL_VERSION,
     sheepId: entry.record.id, frame, idx, hash: reply.hash,
-    spp: entry.spec.spp, contributor: me.pubHex, gen: g,
+    spp: entry.spec.spp, count: Number(reply.count), contributor: me.pubHex, gen: g,
   };
   record.sig = await sign(me.pair, batchSignBytes(record));
   await net.publishBatch(record);
@@ -832,6 +866,7 @@ function installDebugHooks() {
     get frauds() { return auditor.stats.frauds; },
     get banned() { return [...banned]; },
     get renders() { return store.allRenderKeys().then((k) => k.length); },
+    get fetchedRenders() { return fetchedRenders; },
     get pool() {
       return { queued: pool.queue.length, running: pool.running, chunks: pool.chunksRendered };
     },
@@ -873,6 +908,14 @@ function installStressHooks() {
       await net.publishSheep(record);
       scheduleRebuild();
       return bred.childId;
+    },
+    // Ask a peer for the verified accumulated render of (sheep, frame) — the
+    // cheap-viewing path (fetch + sample-verify instead of re-rendering all).
+    fetchRender: (sheepId, frame = CARD_FRAME) => net.requestRender(sheepId, frame),
+    // Contribute one tile to a SPECIFIC sheep (deterministic, for tests).
+    async contributeTo(sheepId) {
+      const entry = cards.get(sheepId);
+      return entry ? contributeBatch(entry) : null;
     },
   };
 
