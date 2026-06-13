@@ -82,27 +82,24 @@ pub fn render_frame(
     }
 }
 
-/// Tone-map a raw histogram (cells [r,g,b,count] f64 row-major at `w*ss x
-/// h*ss`) — used to display cross-peer ACCUMULATED renders: verified summed
-/// histograms from many voters' proofs, tonemapped locally.
+/// Tone-map a raw INTEGER histogram (cells [r_fixed, g_fixed, b_fixed, count]
+/// u64, row-major at `w*ss x h*ss`, passed from JS as a `BigUint64Array`) —
+/// used to display cross-peer ACCUMULATED renders: verified summed integer
+/// histograms from many contributors' batches, tonemapped locally.
+///
+/// (Integer-era replacement for the old float `tonemap_hist`; the histogram
+/// layout matches `render_batch().hist` and `total_count`/`subtract_check`.)
 #[wasm_bindgen]
-pub fn tonemap_hist(
-    hist: &[f64],
+pub fn tonemap_hist_int(
+    hist: &[u64],
     genome_json: &str,
     width: u32,
     height: u32,
     ss: u32,
 ) -> Result<Vec<u8>, JsValue> {
     let genome = parse_genome_unvalidated(genome_json)?;
-    let (w, h, s) = (width as usize, height as usize, ss as usize);
-    if hist.len() != w * s * h * s * 4 {
-        return Err(JsValue::from_str("hist length does not match dimensions"));
-    }
-    let mut accum = Accum::new(w * s, h * s);
-    for (cell, src) in accum.data.iter_mut().zip(hist.chunks_exact(4)) {
-        cell.copy_from_slice(src);
-    }
-    Ok(tonemap(&accum, &genome, w, h, s))
+    let accum = accum_from_hist(hist, width, height, ss)?;
+    Ok(tonemap(&accum, &genome, width as usize, height as usize, ss as usize))
 }
 
 // ---- genetics: canonical JSON, sheep_id, breeding ---------------------------
@@ -196,6 +193,37 @@ pub fn random_genome_json(seed: u32, transforms: u32) -> Result<String, JsValue>
 fn parse_genome_unvalidated(genome_json: &str) -> Result<Genome, JsValue> {
     serde_json::from_str(genome_json)
         .map_err(|e| JsValue::from_str(&format!("bad genome json: {e}")))
+}
+
+/// Rebuild an integer `Accum` from a flat `u64` histogram (cells of 4 in order
+/// [r_fixed, g_fixed, b_fixed, count]) supplied from JS as a `BigUint64Array`.
+fn accum_from_hist(hist: &[u64], width: u32, height: u32, ss: u32) -> Result<Accum, JsValue> {
+    let (w, h, s) = (width as usize, height as usize, ss as usize);
+    if hist.len() != w * s * h * s * 4 {
+        return Err(JsValue::from_str("hist length does not match dimensions"));
+    }
+    let mut accum = Accum::new(w * s, h * s);
+    for (cell, src) in accum.data.iter_mut().zip(hist.chunks_exact(4)) {
+        cell.copy_from_slice(src);
+    }
+    Ok(accum)
+}
+
+/// Decode a 32-byte sheep_id from a 64-char hex string.
+fn sheep_id_bytes(sheep_id_hex: &str) -> Result<[u8; 32], JsValue> {
+    let hex = sheep_id_hex.trim();
+    if hex.len() != 64 {
+        return Err(JsValue::from_str(&format!(
+            "sheep_id must be 64 hex chars (32 bytes), got {}",
+            hex.len()
+        )));
+    }
+    let mut bytes = [0u8; 32];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| JsValue::from_str("sheep_id is not valid hex"))?;
+    }
+    Ok(bytes)
 }
 
 fn parse_challenge(challenge_hex: &str) -> Result<chunked::Challenge, JsValue> {
@@ -292,14 +320,15 @@ impl ChunkedRender {
 }
 
 /// One frame of a loop proof: hash (the proof unit), the tone-mapped RGBA
-/// (rendering your proof doubles as watching the loop), and the raw
-/// accumulation histogram (cells [r,g,b,count] f64, row-major) so frame
-/// histograms can be summed into a cross-peer accumulated render.
+/// (rendering your proof doubles as watching the loop), and the raw integer
+/// accumulation histogram (cells [r_fixed, g_fixed, b_fixed, count] u64,
+/// row-major; reaches JS as a `BigUint64Array`) so frame histograms can be
+/// summed into a cross-peer accumulated render.
 #[wasm_bindgen]
 pub struct ProofFrame {
     hash: String,
     rgba: Vec<u8>,
-    hist: Vec<f64>,
+    hist: Vec<u64>,
 }
 
 #[wasm_bindgen]
@@ -313,7 +342,7 @@ impl ProofFrame {
         self.rgba.clone()
     }
     #[wasm_bindgen(getter)]
-    pub fn hist(&self) -> Vec<f64> {
+    pub fn hist(&self) -> Vec<u64> {
         self.hist.clone()
     }
 }
@@ -395,4 +424,110 @@ pub fn audit_chunk(
 #[wasm_bindgen]
 pub fn challenge_from_seed(seed: u32) -> String {
     chunked::to_hex(&chunked::challenge_from_seed(seed as u64))
+}
+
+// ---- batch primitives (protocol v2 unit of work) ---------------------------
+
+/// One rendered batch: its content hash and its integer histogram.
+///
+/// `hist` is the flat integer histogram (cells [r_fixed, g_fixed, b_fixed,
+/// count] u64, row-major, length `w*ss*h*ss*4`) and reaches JS as a
+/// `BigUint64Array` (zero float ambiguity, transferable). `hash` is the
+/// lowercase hex of `sha256(hist LE bytes)` — the same bytes the histogram
+/// serializes to, so JS can re-hash a merged histogram and get a matching id.
+#[wasm_bindgen]
+pub struct RenderedBatch {
+    hash: String,
+    hist: Vec<u64>,
+}
+
+#[wasm_bindgen]
+impl RenderedBatch {
+    #[wasm_bindgen(getter)]
+    pub fn hash(&self) -> String {
+        self.hash.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn hist(&self) -> Vec<u64> {
+        self.hist.clone()
+    }
+}
+
+/// Render batch `(frame, idx)` of the sheep identified by `sheep_id_hex`
+/// (32-byte hex). The genome is animated to `phase = frame / N_FRAMES`, then
+/// `spp` samples are plotted from `batch_seed(sheep_id, frame, idx)` into an
+/// integer histogram at `w*ss x h*ss`. Deterministic: every peer rendering the
+/// same args gets a byte-identical `hist` and `hash`.
+#[wasm_bindgen]
+pub fn render_batch(
+    genome_json: &str,
+    sheep_id_hex: &str,
+    frame: u32,
+    idx: u32,
+    w: usize,
+    h: usize,
+    ss: usize,
+    spp: u32,
+) -> Result<RenderedBatch, JsValue> {
+    let genome = parse_genome_unvalidated(genome_json)?;
+    let sheep_id = sheep_id_bytes(sheep_id_hex)?;
+    let accum = chunked::render_batch(&genome, &sheep_id, frame, idx, w, h, ss, spp);
+    let hash = chunked::hist_hash_hex(&accum);
+    let hist = accum.data.iter().flatten().copied().collect();
+    Ok(RenderedBatch { hash, hist })
+}
+
+/// Audit primitive: re-render batch `(frame, idx)` and return ONLY its content
+/// hash (no histogram kept). Same determinism as `render_batch`.
+#[wasm_bindgen]
+pub fn batch_hash(
+    genome_json: &str,
+    sheep_id_hex: &str,
+    frame: u32,
+    idx: u32,
+    w: usize,
+    h: usize,
+    ss: usize,
+    spp: u32,
+) -> Result<String, JsValue> {
+    let genome = parse_genome_unvalidated(genome_json)?;
+    let sheep_id = sheep_id_bytes(sheep_id_hex)?;
+    let accum = chunked::render_batch(&genome, &sheep_id, frame, idx, w, h, ss, spp);
+    Ok(chunked::hist_hash_hex(&accum))
+}
+
+/// Verification helper: total `count` over all cells of an integer histogram
+/// (the count-conservation left side). `hist` is a `BigUint64Array`.
+#[wasm_bindgen]
+pub fn total_count(
+    hist: &[u64],
+    width: u32,
+    height: u32,
+    ss: u32,
+) -> Result<u64, JsValue> {
+    let accum = accum_from_hist(hist, width, height, ss)?;
+    Ok(chunked::total_count(&accum))
+}
+
+/// Verification helper: `true` iff subtracting integer histogram `batch` from
+/// `acc` underflows no channel (confirms `batch ⊆ acc`). Both are
+/// `BigUint64Array` of the same dimensions.
+#[wasm_bindgen]
+pub fn subtract_check(
+    acc: &[u64],
+    batch: &[u64],
+    width: u32,
+    height: u32,
+    ss: u32,
+) -> Result<bool, JsValue> {
+    let a = accum_from_hist(acc, width, height, ss)?;
+    let b = accum_from_hist(batch, width, height, ss)?;
+    Ok(chunked::subtract_ok(&a, &b))
+}
+
+/// The animation frame count of a sheep's loop (`N_FRAMES`), exposed so JS uses
+/// the same constant the renderer does.
+#[wasm_bindgen]
+pub fn n_frames() -> u32 {
+    chunked::N_FRAMES
 }

@@ -29,11 +29,12 @@ pub use breed::{breed, crossover, mutate, BREED_MUTATION_RATE};
 #[cfg(feature = "serde")]
 pub use canonical::{canonical_json, canonicalize, sheep_id, sheep_id_hex};
 pub use chunked::{
-    challenge_from_hex, challenge_from_seed, chunk_hash, chunk_hash_hex, chunk_seed, render_chunk,
-    render_proof_frame, sha256_hex, to_hex, Challenge, CHUNK_BURN_IN,
+    batch_seed, challenge_from_hex, challenge_from_seed, chunk_hash, chunk_hash_hex, chunk_seed,
+    hist_hash, hist_hash_hex, render_batch, render_chunk, render_proof_frame, sha256_hex,
+    subtract_ok, to_hex, total_count, Challenge, CHUNK_BURN_IN, N_FRAMES,
 };
 pub use genome::{Camera, Genome, Transform};
 pub use palette::{Palette, Stop};
-pub use render::{accumulate, iterate, render, tonemap, Accum, RenderOpts};
+pub use render::{accumulate, iterate, render, tonemap, Accum, RenderOpts, BLUR_FP, COLOR_FP};
 pub use rng::Rng;
 pub use variations::Variation;

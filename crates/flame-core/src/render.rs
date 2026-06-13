@@ -45,16 +45,40 @@ impl Default for RenderOpts {
     }
 }
 
+/// Fixed-point scale for color channels: a channel value in `[0,1]` is stored
+/// as `round(channel * COLOR_FP) as u64`. With 65535 this is a `u16` of
+/// precision per sample, summed into `u64` accumulators (headroom for billions
+/// of samples). This is a PROTOCOL CONSTANT — changing it changes every
+/// histogram hash.
+pub const COLOR_FP: f64 = 65535.0;
+
+/// Directional-blur weight resolution. The float intensity `s ∈ [0,1]` of a
+/// weighted plot (directional motion blur, Draves sec. 9.1) is quantized to an
+/// integer weight `w = round(s * BLUR_FP) as u64`, and a weighted plot
+/// contributes `w` to the count channel and `round(channel*COLOR_FP) * w` to
+/// each color channel. So a weighted histogram's `count` is measured in units
+/// of `1/BLUR_FP` of a sample; an UNWEIGHTED plot (`add`) always contributes
+/// exactly `1` to count and `round(channel*COLOR_FP)` to color, so for any
+/// unweighted render `total_count == number of plotted samples` exactly. This
+/// keeps integer addition exactly associative/commutative in both cases.
+pub const BLUR_FP: u64 = 256;
+
 /// High-res linear accumulation buffer (histogram): per cell
-/// `[r_sum, g_sum, b_sum, count]`, row-major, `w` cells per row.
+/// `[r_sum, g_sum, b_sum, count]` as INTEGER fixed-point, row-major, `w` cells
+/// per row. Color channels are fixed-point (`* COLOR_FP`); `count` is in plot
+/// units (1 per unweighted sample; `BLUR_FP` per fully-weighted blurred
+/// sample — see `BLUR_FP`).
 ///
-/// Histograms are additive: the protocol render is the element-wise sum of
-/// independent chunk accumulations (see `crate::chunked`).
+/// Integer accumulation makes the histogram additive AND bit-exact regardless
+/// of summation order: the protocol render is the element-wise integer sum of
+/// independent batch/chunk accumulations (see `crate::chunked`), and two peers
+/// merging the same set of batches in any order get byte-identical bytes — the
+/// foundation of the content-addressed shared sheep.
 #[derive(Debug, Clone)]
 pub struct Accum {
     pub w: usize,
     pub h: usize,
-    pub data: Vec<[f64; 4]>,
+    pub data: Vec<[u64; 4]>,
 }
 
 impl Accum {
@@ -62,27 +86,49 @@ impl Accum {
         Accum {
             w,
             h,
-            data: vec![[0.0; 4]; w * h],
+            data: vec![[0; 4]; w * h],
         }
     }
 
+    /// Quantize a linear color channel in `[0,1]` to fixed-point.
+    #[inline]
+    fn quantize(channel: f64) -> u64 {
+        // `.round()` is plain IEEE rounding (not a transcendental), exactly
+        // specified on all targets. Clamp guards against tiny out-of-range
+        // palette values so the cast never wraps.
+        (channel.clamp(0.0, 1.0) * COLOR_FP).round() as u64
+    }
+
+    /// Plot one unweighted sample: add the fixed-point color and `1` to count.
     #[inline]
     pub fn add(&mut self, x: usize, y: usize, rgb: [f64; 3]) {
-        self.add_scaled(x, y, rgb, 1.0);
+        let cell = &mut self.data[y * self.w + x];
+        cell[0] += Self::quantize(rgb[0]);
+        cell[1] += Self::quantize(rgb[1]);
+        cell[2] += Self::quantize(rgb[2]);
+        cell[3] += 1;
     }
 
     /// Add with an intensity scale (directional motion blur: earlier temporal
-    /// steps contribute less; see Draves sec. 9.1).
+    /// steps contribute less; see Draves sec. 9.1). The float intensity is
+    /// quantized to an integer weight `w = round(s * BLUR_FP)`; the plot then
+    /// contributes `w` to the count and `quantize(channel) * w` to each color
+    /// channel, keeping accumulation exact integer arithmetic. See `BLUR_FP`.
     #[inline]
     pub fn add_scaled(&mut self, x: usize, y: usize, rgb: [f64; 3], s: f64) {
+        let w = (s.clamp(0.0, 1.0) * BLUR_FP as f64).round() as u64;
+        if w == 0 {
+            return;
+        }
         let cell = &mut self.data[y * self.w + x];
-        cell[0] += rgb[0] * s;
-        cell[1] += rgb[1] * s;
-        cell[2] += rgb[2] * s;
-        cell[3] += s;
+        cell[0] += Self::quantize(rgb[0]) * w;
+        cell[1] += Self::quantize(rgb[1]) * w;
+        cell[2] += Self::quantize(rgb[2]) * w;
+        cell[3] += w;
     }
 
-    /// Element-wise add `other` into `self`. Panics on dimension mismatch.
+    /// Element-wise integer add `other` into `self`. Exact and order-
+    /// independent. Panics on dimension mismatch.
     pub fn merge(&mut self, other: &Accum) {
         assert_eq!(self.w, other.w, "accum width mismatch");
         assert_eq!(self.h, other.h, "accum height mismatch");
@@ -233,12 +279,27 @@ pub fn iterate(
 /// Run the chaos game for `(samples, burn_in, seed)` and accumulate the plotted
 /// points into `accum` (which must be sized `width*ss x height*ss` for the
 /// camera framing implied by its dimensions).
+///
+/// This is the UNWEIGHTED path: each plotted sample adds exactly `1` to count,
+/// so `total_count == number of plotted samples`. The protocol render
+/// (chunks/batches) always uses this path; only display-side directional motion
+/// blur uses `accumulate_scaled`.
 pub fn accumulate(genome: &Genome, samples: u64, burn_in: u64, seed: u64, accum: &mut Accum) {
-    accumulate_scaled(genome, samples, burn_in, seed, accum, 1.0);
+    let (hw, hh) = (accum.w, accum.h);
+    let to_img = genome.camera.world_to_image(hw, hh);
+
+    iterate(genome, samples, burn_in, seed, |px, py, rgb| {
+        let (ix, iy) = to_img.apply(px, py);
+        if ix >= 0.0 && iy >= 0.0 && ix < hw as f64 && iy < hh as f64 {
+            accum.add(ix as usize, iy as usize, rgb);
+        }
+    });
 }
 
 /// `accumulate` with an intensity scale on every plotted point (directional
-/// motion blur, Draves sec. 9.1).
+/// motion blur, Draves sec. 9.1). The scale is quantized to an integer weight
+/// (`* BLUR_FP`), so a blurred histogram's counts live in `1/BLUR_FP`-sample
+/// units (see `Accum::add_scaled`). Display-only.
 pub fn accumulate_scaled(
     genome: &Genome,
     samples: u64,
@@ -290,6 +351,24 @@ pub fn tonemap(accum: &Accum, genome: &Genome, width: usize, height: usize, ss: 
     let (ow, oh) = (width, height);
     let (hw, hh) = (accum.w, accum.h);
 
+    // Convert the integer histogram back to the float `[r_sum, g_sum, b_sum,
+    // count]` the tone-map pipeline below was written against: color channels
+    // divide out the fixed-point scale (`/ COLOR_FP`), the count is read as-is.
+    // The rest of the algorithm is UNCHANGED — only its input representation
+    // moved from float to integer (see ARCHITECTURE.md "Renderer").
+    let data: Vec<[f64; 4]> = accum
+        .data
+        .iter()
+        .map(|c| {
+            [
+                c[0] as f64 / COLOR_FP,
+                c[1] as f64 / COLOR_FP,
+                c[2] as f64 / COLOR_FP,
+                c[3] as f64,
+            ]
+        })
+        .collect();
+
     // Exposure normalized to the MEAN nonzero density, NOT raw counts. Cell
     // counts grow with the number of accumulated samples, so a raw-count white
     // point makes log(1+c)/log(1+white) drift toward 1 for every cell as
@@ -299,7 +378,7 @@ pub fn tonemap(accum: &Accum, genome: &Genome, width: usize, height: usize, ss: 
     // falls ~1/sqrt(samples) — the same effect as flam3's 1/sample_density
     // scaling. White point = a high percentile measured in those same units.
     let (norm_ratio, mean_nz) = {
-        let mut counts: Vec<f64> = accum.data.iter().map(|c| c[3]).filter(|&c| c > 0.0).collect();
+        let mut counts: Vec<f64> = data.iter().map(|c| c[3]).filter(|&c| c > 0.0).collect();
         if counts.is_empty() {
             (0.0, 0.0)
         } else {
@@ -318,7 +397,7 @@ pub fn tonemap(accum: &Accum, genome: &Genome, width: usize, height: usize, ss: 
     // luminance l in [0,1] (density measured in mean units, sample-invariant);
     // alpha channel carries l for compositing.
     let mut resolved = vec![[0.0f64; 4]; hw * hh];
-    for (i, cell) in accum.data.iter().enumerate() {
+    for (i, cell) in data.iter().enumerate() {
         let c = cell[3];
         if c <= 0.0 {
             continue;
@@ -348,10 +427,10 @@ pub fn tonemap(accum: &Accum, genome: &Genome, width: usize, height: usize, ss: 
             let base = y * hw;
             let mut cnt = 0usize;
             for x in 0..hw + MAXR {
-                if x < hw && accum.data[base + x][3] > 0.0 {
+                if x < hw && data[base + x][3] > 0.0 {
                     cnt += 1;
                 }
-                if x >= 2 * MAXR + 1 && accum.data[base + x - 2 * MAXR - 1][3] > 0.0 {
+                if x >= 2 * MAXR + 1 && data[base + x - 2 * MAXR - 1][3] > 0.0 {
                     cnt -= 1;
                 }
                 if x >= MAXR {
@@ -381,7 +460,7 @@ pub fn tonemap(accum: &Accum, genome: &Genome, width: usize, height: usize, ss: 
                 if !near[y * hw + x] {
                     continue; // provably zero result
                 }
-                let c = accum.data[y * hw + x][3];
+                let c = data[y * hw + x][3];
                 let rad: i64 = if c >= SHARP {
                     0
                 } else if c >= SHARP * 0.25 {
