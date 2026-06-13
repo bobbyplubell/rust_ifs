@@ -87,7 +87,8 @@ async function main() {
   if (relays.length) {
     try {
       const { createLibp2pTransport } = await import('./vendor/libp2p.js');
-      const lp = await createLibp2pTransport({ relays });
+      const stun = (params.get('stun') || '').split(',').map((s) => s.trim()).filter(Boolean);
+      const lp = await createLibp2pTransport({ relays, stun });
       transports.push(lp);
       window.__libp2p = lp.node; // diagnostics: connection/discovery inspection
       console.log('libp2p transport up; relays:', relays);

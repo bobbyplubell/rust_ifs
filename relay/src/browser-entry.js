@@ -14,12 +14,22 @@ import { bootstrap } from '@libp2p/bootstrap';
 import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
 import { TOPIC, DISCOVERY_TOPIC, enc, dec } from './common.js';
 
+// Public STUN servers (used unless the caller passes its own). STUN is a cheap,
+// stateless service — it just echoes back the address it sees — so leaning on
+// free public ones is fine; data never flows through them.
+const DEFAULT_STUN = [
+  'stun:stun.l.google.com:19302',
+  'stun:stun.cloudflare.com:3478',
+];
+
 /**
  * @param relays  array of relay multiaddrs incl. /p2p/<peer-id>, e.g.
  *                ['/dns4/relay.example.com/tcp/443/wss/p2p/12D3...']
+ * @param stun    optional array of STUN urls (defaults to DEFAULT_STUN)
  * @returns {send, onMessage, peerCount, node}
  */
-export async function createLibp2pTransport({ relays }) {
+export async function createLibp2pTransport({ relays, stun }) {
+  const stunUrls = (stun && stun.length) ? stun : DEFAULT_STUN;
   const node = await createLibp2p({
     // Listen via WebRTC, signaled through a relay reservation: this is what
     // lets two browsers talk directly after the relay introduces them.
@@ -32,7 +42,17 @@ export async function createLibp2pTransport({ relays }) {
     },
     transports: [
       webSockets(),
-      webRTC(),
+      // STUN lets peers discover their public (server-reflexive) address so two
+      // browsers behind different NATs can hole-punch a DIRECT connection. With
+      // no iceServers a browser only has host candidates — fine on one LAN, but
+      // it can't reach a peer across the internet. (No TURN: the ~10-20% of pairs
+      // behind symmetric NAT won't connect — acceptable for now, add coturn for
+      // full coverage.) Override via ?stun=<url,url>.
+      webRTC({
+        rtcConfiguration: {
+          iceServers: [{ urls: stunUrls }],
+        },
+      }),
       circuitRelayTransport(),
     ],
     connectionEncrypters: [noise()],
