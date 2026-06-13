@@ -30,6 +30,12 @@ const params = new URLSearchParams(location.search);
 const WORKERS_OVERRIDE = Number(params.get('workers')) || null;
 const pool = new WorkerPool(WORKERS_OVERRIDE ?? undefined);
 
+// Contribution is MANUAL: the gallery passively shows what the swarm has
+// rendered so far; rendering work (and the vote it earns) only happens for
+// sheep the user explicitly pledges via the "contribute" button. Load/headless
+// modes auto-contribute to keep generating work without a human.
+const AUTO_CONTRIBUTE = !!(params.get('stress') || params.get('autocontribute'));
+
 // Frame every card shows. The flock is a still gallery of frame 0; the
 // fullscreen view (sheep.html) animates the whole loop.
 const CARD_FRAME = 0;
@@ -482,9 +488,10 @@ async function contributeStep(force = false) {
   if (!force && pool.running >= pool.size) return null;
   const list = [...cards.values()];
   if (!list.length) return null;
-  // Prefer visible-on-screen and explicitly pledged cards; fall back to all.
-  let pickable = list.filter((e) => e.pledged || e.onScreen);
-  if (!pickable.length) pickable = list;
+  // Only render for sheep the user explicitly pledged to (manual contribution).
+  // Auto mode (stress/headless) also takes on-screen cards to generate load.
+  let pickable = list.filter((e) => e.pledged || (AUTO_CONTRIBUTE && e.onScreen));
+  if (!pickable.length) return null;
   // Round-robin starting point.
   contribCursor = (contribCursor + 1) % pickable.length;
   for (let n = 0; n < pickable.length; n++) {
