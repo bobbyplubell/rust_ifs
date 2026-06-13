@@ -27,7 +27,9 @@ export function handle(pubHex) {
 /** Short + long provenance for a sheep record. */
 export function provenance(record) {
   const g = record.gen - GENESIS_GEN;
-  const pair = record.parents
+  // Two-parent (crossover) records render a pair; mutants carry a single
+  // parent and immigrants carry none, so guard the second slot.
+  const pair = record.parents && record.parents.length >= 2
     ? `${record.parents[0].slice(0, 8)} × ${record.parents[1].slice(0, 8)}`
     : null;
   if (record.baked) {

@@ -30,6 +30,7 @@
   <div id="hud">
     <span id="info">loading…</span>
     <span id="sheep-id" class="id"></span>
+    <span id="samples" class="id"></span>
     <span id="quality">
       <button data-q="low">low</button>
       <button data-q="med">med</button>
@@ -64,11 +65,18 @@
     // One knob governs both the still and the spin. Spin budgets trade frame
     // rate for density: ultra runs ~9 fps but the motion-blur shutter spans
     // the real frame interval, so slower playback means longer blur, not jank.
-    const QUALITY = {
-      low:   { width: 384,  height: 384,  ss: 1, nChunks: 32, samplesPerChunk: 120_000 },
-      med:   { width: 512,  height: 512,  ss: 2, nChunks: 64, samplesPerChunk: 250_000 },
-      high:  { width: 768,  height: 768,  ss: 2, nChunks: 64, samplesPerChunk: 650_000 },
-      ultra: { width: 1024, height: 1024, ss: 2, nChunks: 64, samplesPerChunk: 1_500_000 },
+    // The still is a *progressive accumulation*, not a one-shot render: one
+    // persistent histogram that keeps taking fresh sample batches, so the image
+    // appears fast (first batch) and keeps cleaning up the longer you watch
+    // (noise ~1/sqrt(samples)) — flam3's own model. Resolution is fixed per
+    // tier; quality comes from accumulated samples, not a bigger single job.
+    // CPU: small chunks + throttled paint keep the UI responsive. GPU (when
+    // present): large batches converge in ~a second, then it idles.
+    const PROGRESSIVE = {
+      low:   { width: 512,  height: 512,  ss: 1, samplesPerChunk: 220_000, paintEvery: 3, gpuBatch: 6_000_000,  gpuConverge: 120e6 },
+      med:   { width: 768,  height: 768,  ss: 1, samplesPerChunk: 320_000, paintEvery: 3, gpuBatch: 10_000_000, gpuConverge: 200e6 },
+      high:  { width: 1024, height: 1024, ss: 1, samplesPerChunk: 500_000, paintEvery: 4, gpuBatch: 16_000_000, gpuConverge: 350e6 },
+      ultra: { width: 1024, height: 1024, ss: 2, samplesPerChunk: 700_000, paintEvery: 6, gpuBatch: 24_000_000, gpuConverge: 600e6 },
     };
     const SPIN = {
       low:   { budgetMs: 30,  maxS: 32_000_000,  startS: 6_000_000,  sizeCap: 640,  ss: 1, temporal: 4 },
@@ -83,13 +91,13 @@
       ultra: { width: 448, height: 448, samples: 1_000_000, seed: 7 },
     };
     let quality = localStorage.getItem('sheep-quality');
-    if (!QUALITY[quality]) quality = null; // null -> auto-benched in main()
+    if (!PROGRESSIVE[quality]) quality = null; // null -> auto-benched in main()
     const LOOP_MS = 14_000;
 
     // WebGPU preview (display-only — proofs are CPU-deterministic, the GPU's
     // per-thread RNG stream is a different sample of the same attractor).
     let gpu = null;
-    GpuFlame.create().then((g) => {
+    const gpuReady = GpuFlame.create().then((g) => {
       gpu = g;
       if (g) {
         $('#spin').textContent = 'spin (gpu)';
@@ -98,6 +106,7 @@
         $('#spin').title =
           'WebGPU unavailable in this browser — spin uses the slower CPU fallback';
       }
+      return g;
     });
 
     async function findRecord() {
@@ -121,8 +130,7 @@
     }
 
     let record = null;
-    let still = null;   // remembered crisp frame
-    let stillJob = null;
+    let rendered = false; // a real still has painted (gate the placeholders)
 
     function markQuality() {
       for (const b of document.querySelectorAll('#quality button')) {
@@ -130,16 +138,16 @@
       }
     }
 
-    async function renderStill() {
-      stillJob?.cancel();
-      const spec = QUALITY[quality];
-      const challengeHex = await sha256Hex(utf8(`view|${id}`));
-      stillJob = pool.submit(
-        { type: 'render', genomeJson: record.genome, challengeHex, ...spec, tonemapEvery: 8 },
-        { onProgress: (p) => { if (p.rgba) paint(p); } },
-      );
-      const done = await stillJob.done;
-      if (done.type === 'done') { paint(done); still = done; }
+    function showSamples(n) {
+      $('#samples').textContent = !n ? ''
+        : n >= 1e9 ? `${(n / 1e9).toFixed(1)}B samples`
+        : n >= 1e6 ? `${Math.round(n / 1e6)}M samples`
+        : `${Math.round(n / 1e3)}k samples`;
+    }
+
+    function useCanvas(which) { // 'cpu' (#cv) | 'gpu' (#cvgpu)
+      $('#cv').hidden = which !== 'cpu';
+      $('#cvgpu').hidden = which !== 'gpu';
     }
 
     function paint(m) {
@@ -147,16 +155,88 @@
       ctx.putImageData(new ImageData(new Uint8ClampedArray(m.rgba), m.width, m.height), 0, 0);
     }
 
+    // ---- progressive still ---------------------------------------------------
+
+    let stillCtl = null; // { stop, job } for the running accumulation
+
+    function stopStill() {
+      if (!stillCtl) return;
+      stillCtl.stop = true;
+      stillCtl.job?.cancel();
+      stillCtl = null;
+    }
+
+    async function renderStill() {
+      stopStill();
+      showSamples(0);
+      const spec = PROGRESSIVE[quality];
+      const ctl = { stop: false, job: null };
+      stillCtl = ctl;
+      if (gpu) await stillGpu(ctl, spec); else stillCpu(ctl, spec);
+    }
+
+    // GPU: re-dispatch into ONE histogram (accumulate) with a fresh seed each
+    // batch; converges in ~a second, then idles so it isn't pegging the GPU on
+    // a static image. Falls back to CPU on device loss.
+    async function stillGpu(ctl, spec) {
+      const cvgpu = $('#cvgpu');
+      try {
+        const px = Math.min(window.innerWidth, window.innerHeight) * (window.devicePixelRatio || 1);
+        const size = Math.min(spec.width, Math.max(384, Math.round(px / 8) * 8));
+        cvgpu.width = size; cvgpu.height = size;
+        gpu.configure(cvgpu);
+        useCanvas('gpu');
+        let total = 0;
+        for (let k = 0; !ctl.stop; k++) {
+          await gpu.frame(record.genome, 0, {
+            width: size, height: size, ss: spec.ss, samples: spec.gpuBatch,
+            seed: (7 + k * 0x9e3779b9) >>> 0, accumulate: k > 0,
+          });
+          rendered = true;
+          total += spec.gpuBatch;
+          showSamples(total);
+          if (total >= spec.gpuConverge) break; // clean enough — leave it up
+          await new Promise(requestAnimationFrame);
+        }
+      } catch (err) {
+        console.warn('gpu still failed, falling back to cpu:', err);
+        gpu = null;
+        useCanvas('cpu');
+        if (!ctl.stop) stillCpu(ctl, spec);
+      }
+    }
+
+    // CPU: small fresh-seeded chunks accumulate into one histogram in the
+    // worker; it paints a throttled tonemap each few chunks and keeps refining
+    // until cancelled. Responsive (chunks yield) and unbounded in quality.
+    function stillCpu(ctl, spec) {
+      useCanvas('cpu');
+      sha256Hex(utf8(`view|${id}`)).then((challengeHex) => {
+        if (ctl.stop) return;
+        ctl.job = pool.submit(
+          {
+            type: 'accumulate', genomeJson: record.genome, challengeHex,
+            width: spec.width, height: spec.height, ss: spec.ss,
+            samplesPerChunk: spec.samplesPerChunk, paintEvery: spec.paintEvery,
+          },
+          { onProgress: (p) => {
+            if (ctl.stop || !p.rgba) return;
+            paint(p); rendered = true; showSamples(p.samples);
+          } },
+        );
+      });
+    }
+
     let spinning = null;
     async function toggleSpin() {
       if (spinning) {
         spinning.stop = true; spinning = null;
         $('#spin').textContent = gpu ? 'spin (gpu)' : 'spin';
-        $('#cvgpu').hidden = true;
-        $('#cv').hidden = false;
-        if (still) paint(still); else renderStill();
+        renderStill(); // resume progressive refinement of the still
         return;
       }
+      stopStill();
+      showSamples(0);
       const s = { stop: false };
       spinning = s;
       $('#spin').textContent = 'stop';
@@ -174,8 +254,7 @@
         cvgpu.width = size;
         cvgpu.height = size;
         gpu.configure(cvgpu);
-        cvgpu.hidden = false;
-        $('#cv').hidden = true;
+        useCanvas('gpu');
 
         // Adaptive quality: float the sample count toward a frame-time budget
         // so weak GPUs stay smooth and strong ones get dense, clean frames.
@@ -203,13 +282,13 @@
         // GPU died (device loss, validation): fall back to CPU for the session.
         console.warn('gpu spin failed, falling back to cpu:', err);
         gpu = null;
-        cvgpu.hidden = true;
-        $('#cv').hidden = false;
+        useCanvas('cpu');
         if (!s.stop) await spinCpu(s);
       }
     }
 
     async function spinCpu(s) {
+      useCanvas('cpu');
       const frameJob = () => pool.submit({
         type: 'frame', genomeJson: record.genome,
         phase: (performance.now() % LOOP_MS) / LOOP_MS, ...CPU_FRAME[quality],
@@ -257,7 +336,7 @@
           localStorage.removeItem(`sheep-preview-${id}`);
           const img = new Image();
           img.onload = () => {
-            if (!still) {
+            if (!rendered) {
               cv.width = img.width;
               cv.height = img.height;
               ctx.drawImage(img, 0, 0);
@@ -282,12 +361,12 @@
           const inc = new Float64Array(buf);
           for (let k = 0; k < cells; k++) acc[k] += inc[k];
         }
-        if (acc && !still) {
+        if (acc && !rendered) {
           const m = await pool.submit({
             type: 'tonemap-hist', hist: acc.buffer, genomeJson: record.genome,
             width: spec.width, height: spec.height, ss: spec.ss,
           }).done;
-          if (m.type === 'done' && !still) paint(m);
+          if (m.type === 'done' && !rendered) paint(m);
         }
       })().catch(console.error);
 
@@ -298,11 +377,10 @@
           quality = b.dataset.q;
           localStorage.setItem('sheep-quality', quality);
           markQuality();
-          still = null;
           if (spinning) {
             // Restart the spin with the new budgets/resolution.
-            toggleSpin().catch(console.error); // stop (paints still placeholder)
-            toggleSpin().catch(console.error); // start fresh
+            toggleSpin().catch(console.error); // stop -> resumes still
+            toggleSpin().catch(console.error); // start fresh spin
           } else {
             renderStill().catch(console.error);
           }
@@ -316,6 +394,9 @@
         a.click();
         URL.revokeObjectURL(a.href);
       };
+      // Give WebGPU a moment to come up so the still uses the fast accumulating
+      // path on capable machines; otherwise start the CPU still immediately.
+      await Promise.race([gpuReady, new Promise((r) => setTimeout(r, 2500))]);
       await renderStill();
     }
 

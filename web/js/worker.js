@@ -65,6 +65,7 @@ self.onmessage = async (event) => {
     await wasmReady;
     switch (msg.type) {
       case 'render':     await handleRender(msg); break;
+      case 'accumulate': await handleAccumulate(msg); break;
       case 'audit':      handleAudit(msg); break;
       case 'breed':      handleBreed(msg); break;
       case 'mutate':     handleMutate(msg); break;
@@ -126,6 +127,38 @@ async function handleRender(msg) {
     if (cancelled.has(jobId)) return;
     const rgba = renderer.tonemap().buffer;
     self.postMessage({ type: 'done', jobId, hashes, rgba, width, height }, [rgba]);
+  } finally {
+    renderer.free();
+  }
+}
+
+// Progressive, unbounded accumulation for the full-screen still. One
+// persistent histogram; each chunk adds an independent batch (fresh per-idx
+// seed) so noise falls ~1/sqrt(samples) the longer it runs. Paints are
+// throttled and the heavy proof bookkeeping (per-chunk hashes) is dropped —
+// this is display-only. Runs until cancelled (navigate away / spin / requality).
+async function handleAccumulate(msg) {
+  const { jobId, genomeJson, width, height, ss, samplesPerChunk } = msg;
+  const paintEvery = msg.paintEvery || 4;
+  const maxChunks = msg.maxChunks || 1_000_000;
+  const challengeHex = resolveChallenge(msg);
+
+  const renderer = new ChunkedRender(
+    genomeJson, width, height, ss, samplesPerChunk, maxChunks, challengeHex,
+  );
+  try {
+    for (let i = 0; i < maxChunks; i++) {
+      if (cancelled.has(jobId)) return;
+      renderer.render_chunk(i);
+      if ((i + 1) % paintEvery === 0) {
+        const rgba = renderer.tonemap(); // fresh copy out of wasm memory
+        self.postMessage({
+          type: 'progress', jobId, chunkIdx: i, width, height,
+          samples: (i + 1) * samplesPerChunk, rgba: rgba.buffer,
+        }, [rgba.buffer]);
+      }
+      await yieldToEventLoop();
+    }
   } finally {
     renderer.free();
   }

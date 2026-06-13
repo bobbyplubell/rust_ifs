@@ -181,7 +181,7 @@ export class GpuFlame {
    *  the running max across a spin stabilizes exposure within one loop. */
   async frame(genomeJson, phase, {
     width, height, ss = 1, samples = 4_000_000, seed = 7, keepExposure = false,
-    shutter = 0, temporal = 1, directional = 0,
+    shutter = 0, temporal = 1, directional = 0, accumulate = false,
   } = {}) {
     const base = typeof genomeJson === 'string' ? JSON.parse(genomeJson) : genomeJson;
     const steps = shutter > 0 ? Math.max(1, temporal) : 1;
@@ -228,7 +228,10 @@ export class GpuFlame {
     }
 
     const enc = d.createCommandEncoder();
-    enc.clearBuffer(this.buf.hist);
+    // accumulate: keep the histogram across calls so a static image converges
+    // (noise ~1/sqrt(samples)) as more batches land. Density stats/exposure are
+    // recomputed from the (growing) histogram each call, so they stay correct.
+    if (!accumulate) enc.clearBuffer(this.buf.hist);
     enc.clearBuffer(this.buf.stats); // density stats are per-frame
     if (!keepExposure) enc.clearBuffer(this.buf.max); // exposure may be sticky
     const pass = enc.beginComputePass();
