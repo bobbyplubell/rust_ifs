@@ -4,6 +4,14 @@ Running list of designed-but-not-yet-built ideas, captured from design
 discussions. Ordered roughly by priority within each section. The committed
 design lives in ARCHITECTURE.md; this is the "next" list.
 
+## Done (for reference)
+- Breeding gate (protocol-enforced in gens.js + UI mirror).
+- "What is this" page rewrite (4 sections).
+- Future-proofing: protocol version field in every record; render spec is
+  data (SPEC_SCHEDULE / specForGen, keyed to each sheep's birth gen).
+- Contribute to the fuzziest (least-covered) frame; per-frame tile map.
+- Manual contribution; decoupled smooth playback + hover-to-animate.
+
 ## Enforcement principle
 
 Everything that affects shared outcomes must be **protocol-enforced**, never
@@ -17,12 +25,6 @@ Anything "client-side only" must be genuinely local (whether *you* spend CPU,
 what you display) with no shared consequence.
 
 ## Game mechanics
-
-### Breeding gate — IN PROGRESS (protocol-enforced)
-You may only release a bred child if you (the author) have contributed
-≥ `BREED_MIN_TILES` tiles to **both** parents. Enforced in gens.js (a release
-is admitted to the flock only if the fact set holds ≥T author-batches on each
-parent) AND mirrored as a UI gate for instant feedback. Threshold TBD (~4–8).
 
 ### Vote-credit economy (the big open design)
 Decouple render-work from voting. Contributing earns a **vote credit**; you
@@ -69,18 +71,6 @@ just shown live on the sheep view.
 ### Rank badges #1 #2 #3
 Show leaderboard position on cards (and the sheep view). Derivable from the
 current-gen tallies (sort, top-3). Mostly UI.
-
-## Docs / onboarding
-
-### "What is this?" page (about.html) — sections
-Concise, but the technical ones explain the architecture well:
-1. **What is this** — Electric Sheep reborn; community-rendered fractal flames.
-2. **How do I play** — view, contribute tiles (render = vote + beautify),
-   breed (gated), curate selection.
-3. **How does it work** — deterministic renderer, batches as shared tiles,
-   integer histograms, the verification gate, generations, no server.
-4. **The original Electric Sheep** — Draves' distributed screensaver, render
-   farm, genetic voting; what we kept and what's different (p2p, proofs).
 
 ## Renderer / scale (from ARCHITECTURE "Known limits")
 
