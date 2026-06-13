@@ -235,6 +235,7 @@ async function rebuildFlock() {
     if (!living.has(id)) {
       if (spinning?.entry === entry) { spinning.stop = true; spinning = null; }
       stopReplay(entry);
+      flockVisibility.unobserve(entry.card);
       const at = selected.indexOf(id);
       if (at !== -1) { selected.splice(at, 1); $('#nursery').hidden = true; }
       entry.card.remove();
@@ -296,8 +297,9 @@ function addCard(record) {
   card.append(canvas, bar, meta);
   $('#flock').append(card);
 
-  const entry = { record, canvas, tallyEl, spinBtn, voteBtn, cullBtn, card, barFill };
+  const entry = { record, canvas, tallyEl, spinBtn, voteBtn, cullBtn, card, barFill, onScreen: true };
   cards.set(record.id, entry);
+  flockVisibility.observe(card);
   updateTally(record.id);
 
   canvas.addEventListener('click', () => toggleSelect(record.id));
@@ -489,26 +491,100 @@ async function paintAccum(entry, spec) {
 
 // Replay a completed proof loop on a card — the reward for voting: your
 // proven sheep dances. Costs nothing (cached frames).
-function startReplay(entry, frames) {
-  stopReplay(entry);
-  if (entry.canvas.width !== frames[0].width) {
-    entry.canvas.width = frames[0].width;
-    entry.canvas.height = frames[0].height;
+//
+// The loop is cached as downscaled ImageBitmaps (GPU-resident, drawn with
+// drawImage — not full-res putImageData on the main thread) and ALL cards are
+// driven by one shared requestAnimationFrame ticker. Naive per-card
+// setIntervals pushing 384² putImageData saturated the main thread once a few
+// sheep were autoplaying — that both lagged the page and made the timers fire
+// irregularly, which is what read as glitching. Adjacent frames are cross-
+// faded so the slow 64-frame loop looks smooth instead of stepping at ~4 fps.
+const REPLAY_PX = 224;        // cached frame size (cards display ~200–280px wide)
+const REPLAY_MS = 14_000;     // full-loop period
+const REPLAY_CACHE_CAP = 12;  // cards retaining decoded loop bitmaps (LRU)
+const animating = new Set();  // entries with a live loop
+const replayLru = [];         // sheepIds, most-recently-started last
+let tickerOn = false;
+
+function replayTick(now) {
+  for (const entry of animating) {
+    if (!entry.onScreen || !entry.replayFrames) continue;
+    const n = entry.replayFrames.length;
+    const pos = ((now % REPLAY_MS) / REPLAY_MS) * n;
+    const i = Math.floor(pos) % n;
+    const frac = pos - Math.floor(pos);
+    const { rctx, canvas, replayFrames } = entry;
+    const w = canvas.width;
+    const h = canvas.height;
+    rctx.globalAlpha = 1;
+    rctx.drawImage(replayFrames[i], 0, 0, w, h);
+    rctx.globalAlpha = frac;          // cross-fade into the next keyframe
+    rctx.drawImage(replayFrames[(i + 1) % n], 0, 0, w, h);
+    rctx.globalAlpha = 1;
   }
-  const ctx = entry.canvas.getContext('2d');
-  let i = 0;
-  entry.replay = setInterval(() => {
-    ctx.putImageData(frames[i], 0, 0);
-    i = (i + 1) % frames.length;
-  }, Math.round(14_000 / frames.length));
+  if (animating.size) requestAnimationFrame(replayTick);
+  else tickerOn = false;
+}
+
+function ensureTicker() {
+  if (!tickerOn && animating.size) {
+    tickerOn = true;
+    requestAnimationFrame(replayTick);
+  }
+}
+
+function touchReplayLru(entry) {
+  const id = entry.record.id;
+  const at = replayLru.indexOf(id);
+  if (at !== -1) replayLru.splice(at, 1);
+  replayLru.push(id);
+  while (replayLru.length > REPLAY_CACHE_CAP) {
+    const evict = cards.get(replayLru[0]);
+    if (evict) stopReplay(evict); // releases bitmaps; card keeps its last frame
+    else replayLru.shift();
+  }
+}
+
+async function startReplay(entry, frames) {
+  stopReplay(entry);
+  if (typeof createImageBitmap !== 'function') return; // leave the static render
+  let bitmaps;
+  try {
+    bitmaps = await Promise.all(frames.map((f) => createImageBitmap(f, {
+      resizeWidth: REPLAY_PX, resizeHeight: REPLAY_PX, resizeQuality: 'medium',
+    })));
+  } catch {
+    return;
+  }
+  if (!cards.has(entry.record.id)) { bitmaps.forEach((b) => b.close()); return; }
+  entry.replayFrames = bitmaps;
+  entry.rctx = entry.canvas.getContext('2d');
+  entry.replay = true;
+  animating.add(entry);
+  touchReplayLru(entry);
+  ensureTicker();
 }
 
 function stopReplay(entry) {
-  if (entry.replay) {
-    clearInterval(entry.replay);
-    entry.replay = null;
+  animating.delete(entry);
+  entry.replay = false;
+  if (entry.replayFrames) {
+    entry.replayFrames.forEach((b) => b.close());
+    entry.replayFrames = null;
   }
+  const at = replayLru.indexOf(entry.record.id);
+  if (at !== -1) replayLru.splice(at, 1);
 }
+
+// Don't burn GPU/CPU animating cards scrolled out of view; rAF also auto-
+// throttles when the tab is backgrounded.
+const flockVisibility = new IntersectionObserver((records) => {
+  for (const r of records) {
+    const entry = cards.get(r.target.dataset.id);
+    if (entry) entry.onScreen = r.isIntersecting;
+  }
+  ensureTicker();
+}, { rootMargin: '120px' });
 
 // ---- voting ----------------------------------------------------------------
 
@@ -561,7 +637,7 @@ async function vote(entry, dir = 1) {
   for (let k = 0; k < cells; k++) entry.sumAccum[k] += res.sum[k];
   entry.sumCount++;
   btn.textContent = dir === 1 ? 'voted ✓' : 'culled ✗';
-  startReplay(entry, res.frames);
+  startReplay(entry, res.frames).catch(console.error);
   requestSums(entry.record.id);
 }
 
