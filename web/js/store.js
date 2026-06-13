@@ -1,18 +1,25 @@
-// store.js — the append-only fact sets (ARCHITECTURE.md "state is a set of
-// signed, immutable facts"), persisted in IndexedDB. Grow-only: records are
-// added if absent, never updated or removed. Namespaced per ?peer=N so dev
-// tabs have independent state.
+// store.js — the append-only fact sets (ARCHITECTURE.md "the sheep is the shared
+// object" / "Data model"), persisted in IndexedDB. Grow-only: records are added
+// if absent, never updated or removed. Namespaced per ?peer=N so dev tabs have
+// independent state.
+//
+// v11 (batch-contribution era). Object stores:
+//   sheep   keyPath 'id'   — content-addressed sheep records
+//   batches keyPath 'key'  — batch contributions, key = batchKey(sheepId:f:i)
+//   fraud   keyPath 'key'  — fraud proofs, key = batchKey of the offender
+//   renders kv            — `${sheepId}:${frame}` -> verified histogram bytes
+//                            (ArrayBuffer), a cache/serving store for the gate.
 
 import { PEER_NS } from './identity.js';
 
 export async function openStore() {
   const db = await new Promise((resolve, reject) => {
-    const req = indexedDB.open(`sheep-store-v10-${PEER_NS}`, 1);
+    const req = indexedDB.open(`sheep-store-v11-${PEER_NS}`, 1);
     req.onupgradeneeded = () => {
       req.result.createObjectStore('sheep', { keyPath: 'id' });
-      req.result.createObjectStore('votes', { keyPath: 'key' });
+      req.result.createObjectStore('batches', { keyPath: 'key' });
       req.result.createObjectStore('fraud', { keyPath: 'key' });
-      req.result.createObjectStore('sums'); // voteKey -> summed histogram ArrayBuffer
+      req.result.createObjectStore('renders'); // `${sheepId}:${frame}` -> ArrayBuffer
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -56,14 +63,29 @@ export async function openStore() {
     });
   }
 
+  function kvKeys(storeName) {
+    return new Promise((resolve, reject) => {
+      const req = db.transaction(storeName).objectStore(storeName).getAllKeys();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
   return {
-    putSum: (voteKey, buf) => kvPut('sums', voteKey, buf),
-    getSum: (voteKey) => kvGet('sums', voteKey),
+    // sheep
     addSheep: (rec) => addIfAbsent('sheep', rec),
-    addVote: (rec) => addIfAbsent('votes', rec),
-    addFraud: (rec) => addIfAbsent('fraud', rec),
     allSheep: () => getAll('sheep'),
-    allVotes: () => getAll('votes'),
+    // batches — keyPath is `key`, set by net to batchKey(b)
+    addBatch: (rec) => addIfAbsent('batches', rec),
+    allBatches: () => getAll('batches'),
+    batchesForSheep: async (sheepId) =>
+      (await getAll('batches')).filter((b) => b.sheepId === sheepId),
+    // fraud
+    addFraud: (rec) => addIfAbsent('fraud', rec),
     allFraud: () => getAll('fraud'),
+    // verified render cache (`${sheepId}:${frame}` -> ArrayBuffer)
+    putRender: (sheepId, frame, buf) => kvPut('renders', `${sheepId}:${frame}`, buf),
+    getRender: (sheepId, frame) => kvGet('renders', `${sheepId}:${frame}`),
+    allRenderKeys: () => kvKeys('renders'),
   };
 }
