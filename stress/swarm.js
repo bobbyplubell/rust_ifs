@@ -134,7 +134,7 @@ async function sampleMetrics() {
     t: Date.now(), kind: 'sample', peers: PEERS, sampled: dumps.length,
     batchesMin: batches[0], batchesMed: med(batches), batchesMax: batches.at(-1),
     distinctTallyViews: fingerprints.size,
-    sumsMed: med(nums((d) => d.sums)),
+    rendersMed: med(nums((d) => d.renders ?? 0)),
     auditsMed: med(nums((d) => d.audits)),
     fraudTotal: dumps.reduce((a, d) => a + d.fraud, 0),
     sentBytesMed: med(sentBytes),

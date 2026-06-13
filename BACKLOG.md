@@ -79,9 +79,9 @@ current-gen tallies (sort, top-3). Mostly UI.
   higher `from` gen to give NEW sheep a crisper spec without breaking old
   sheep's tiles. Constraint: keep nFrames constant across specs (sheep.html
   rebinds only resolution). Measure histogram/sync cost first.
-- **Compressed-frame fidelity** for CPU-light viewers: serve tonemapped
-  frames / short video (a few MB) so viewers can watch without re-rendering;
-  verify by spot re-render. Currently viewers re-render from the ledger.
+- DONE: cheap verified viewing — render-data is gzip'd (lossless) and a viewer
+  can ?fetchonly to fetch+sample-verify the accumulated render instead of
+  re-rendering every tile. Relay production deploy recipe in relay/deploy/.
 - **Pruning + finality** (generation blocks digest) for unbounded-history scale.
 - **Hover animation** currently shows preview-quality motion (not the
   accumulated render); optionally prefer accumulated frames where they exist.
