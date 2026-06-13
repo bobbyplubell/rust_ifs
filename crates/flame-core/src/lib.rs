@@ -18,6 +18,7 @@ pub mod fmath;
 pub mod genome;
 pub mod interpolate;
 pub mod palette;
+pub mod palettes_lib;
 pub mod render;
 pub mod rng;
 pub mod variations;

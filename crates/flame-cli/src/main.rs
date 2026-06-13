@@ -125,29 +125,35 @@ fn cmd_render(opts: &HashMap<String, String>) {
 fn cmd_animate(opts: &HashMap<String, String>) {
     let ropts = render_opts(opts);
     let transforms = get(opts, "transforms", 3usize);
-    let seed_a: u64 = get(opts, "seed-a", 1);
-    let seed_b: u64 = get(opts, "seed-b", 2);
     let frames: usize = get(opts, "frames", 60);
     let rotate = opts.contains_key("rotate");
     let dir = opts.get("out-dir").cloned().unwrap_or_else(|| "frames".into());
     fs::create_dir_all(&dir).expect("create out-dir");
 
-    // Two random genomes with the *same* shape so they interpolate cleanly.
-    let mut rng_a = flame_core::rng::Rng::new(seed_a);
-    let mut rng_b = flame_core::rng::Rng::new(seed_b);
-    let mut a = Genome::random(&mut rng_a, transforms);
-    let mut b = Genome::random(&mut rng_b, transforms);
-    // Force matching final-transform presence for clean interpolation.
-    if a.final_transform.is_some() != b.final_transform.is_some() {
-        a.final_transform = None;
-        b.final_transform = None;
+    // Keyframes: --seeds a,b,c,... (flam3-style smooth Catmull-Rom loop), or
+    // the legacy --seed-a/--seed-b pair (a 2-key cycle through the spline).
+    let seeds: Vec<u64> = match opts.get("seeds") {
+        Some(s) => s.split(',').map(|v| v.trim().parse().expect("bad --seeds")).collect(),
+        None => vec![get(opts, "seed-a", 1), get(opts, "seed-b", 2)],
+    };
+    assert!(seeds.len() >= 2, "need at least 2 keyframe seeds");
+    let mut keys: Vec<Genome> = seeds
+        .iter()
+        .map(|&s| {
+            let mut rng = flame_core::rng::Rng::new(s);
+            Genome::random(&mut rng, transforms)
+        })
+        .collect();
+    // Matching final-transform presence interpolates cleanly.
+    if keys.iter().any(|g| g.final_transform.is_none()) {
+        for g in &mut keys {
+            g.final_transform = None;
+        }
     }
 
     for f in 0..frames {
-        // Smooth there-and-back loop via a cosine ease over [0,1].
         let phase = f as f64 / frames as f64;
-        let t = 0.5 - 0.5 * (phase * std::f64::consts::TAU).cos();
-        let mut g = a.lerp(&b, t);
+        let mut g = flame_core::interpolate::spline_loop(&keys, phase);
         if rotate {
             g.camera.rotate = phase * std::f64::consts::TAU;
         }

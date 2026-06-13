@@ -47,12 +47,33 @@ impl Palette {
         ]
     }
 
-    /// A random palette from a cosine gradient (Quilez-style):
+    /// A palette from the embedded flam3 library (see `palettes_lib`),
+    /// converted to 16 stops. `idx` wraps.
+    pub fn from_library(idx: usize) -> Palette {
+        let data = &crate::palettes_lib::LIBRARY[idx % crate::palettes_lib::N_LIBRARY];
+        let stops = (0..16)
+            .map(|i| Stop {
+                pos: i as f64 / 15.0,
+                rgb: [
+                    data[i * 3] as f64 / 255.0,
+                    data[i * 3 + 1] as f64 / 255.0,
+                    data[i * 3 + 2] as f64 / 255.0,
+                ],
+            })
+            .collect();
+        Palette { stops }
+    }
+
+    /// A random palette: usually one of the 702 flam3 library palettes (the
+    /// hand-curated originals), sometimes a cosine gradient (Quilez-style):
     /// `color(t) = a + b*cos(2pi*(c*t + d))` per channel — hue-correlated,
     /// smooth, with a built-in bright-to-dark ramp that reads as lighting.
     /// Uniform-random stops average into pastel mud; these don't.
     pub fn random(rng: &mut Rng) -> Palette {
         use crate::fmath;
+        if rng.chance(0.7) {
+            return Palette::from_library(rng.below(crate::palettes_lib::N_LIBRARY));
+        }
         const N: usize = 8;
         let a = [rng.range(0.35, 0.6), rng.range(0.35, 0.6), rng.range(0.35, 0.6)];
         let b = [rng.range(0.25, 0.5), rng.range(0.25, 0.5), rng.range(0.25, 0.5)];

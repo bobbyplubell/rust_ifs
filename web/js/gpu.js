@@ -50,9 +50,16 @@ function packTransform(out, base, t) {
 function packGenome(g) {
   const n = g.transforms.length;
   const hasFinal = g.final_transform ? 1 : 0;
-  const out = new Float32Array((n + hasFinal) * STRIDE);
+  // Transform blocks, then the n x n xaos transition matrix.
+  const out = new Float32Array((n + hasFinal) * STRIDE + n * n);
   g.transforms.forEach((t, i) => packTransform(out, i * STRIDE, t));
   if (hasFinal) packTransform(out, n * STRIDE, g.final_transform);
+  const xbase = (n + hasFinal) * STRIDE;
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < n; j++) {
+      out[xbase + i * n + j] = g.transforms[i].xaos?.[j] ?? 1;
+    }
+  }
   return { data: out, n, hasFinal };
 }
 

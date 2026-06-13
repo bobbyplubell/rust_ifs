@@ -34,6 +34,11 @@ pub struct Transform {
     /// 0 leaves color untouched (REQUIRED for symmetry transforms, per the
     /// paper sec. 7, or colors wash out).
     pub color_speed: f64,
+    /// Xaos (flam3): transition multipliers FROM this transform TO each
+    /// transform `j` — when this transform was just applied, the next pick
+    /// uses `weight_j * xaos[j]`. All-ones = classic behavior. Length must
+    /// equal the genome's transform count.
+    pub xaos: Vec<f64>,
 }
 
 impl Transform {
@@ -149,6 +154,7 @@ impl Transform {
             variations,
             pvals: Self::random_pvals(rng),
             color_speed: 0.5,
+            xaos: Vec::new(), // sized by Genome::random / breeding
         }
     }
 }
@@ -211,6 +217,18 @@ pub struct Genome {
 }
 
 impl Genome {
+    /// Size every transform's xaos row to the transform count (pad with 1.0,
+    /// truncate extras) — called after any structural change.
+    pub fn fix_xaos(&mut self) {
+        let n = self.transforms.len();
+        for t in &mut self.transforms {
+            t.xaos.resize(n, 1.0);
+        }
+        if let Some(t) = &mut self.final_transform {
+            t.xaos.clear(); // the final transform is not in the rotation
+        }
+    }
+
     /// Frame the camera on the attractor: probe-iterate with a FIXED seed,
     /// fit the 5th-95th percentile bounding box, and set center/scale with
     /// some margin. Deterministic (fixed probe seed, exact ops only), so
@@ -245,13 +263,32 @@ impl Genome {
         self.camera.rotate = 0.0;
     }
 
-    /// Pick a transform index by weight using a uniform draw.
+    /// Pick the next transform index: weights modulated by the previous
+    /// transform's xaos row (flam3 transition weights). `prev = None` (the
+    /// first pick) and degenerate all-zero rows fall back to plain weights.
     #[inline]
-    pub fn pick(&self, rng: &mut Rng) -> usize {
-        let total: f64 = self.transforms.iter().map(|t| t.weight).sum();
+    pub fn pick(&self, prev: Option<usize>, rng: &mut Rng) -> usize {
+        let row = prev.and_then(|p| {
+            let row = &self.transforms[p].xaos;
+            if row.len() == self.transforms.len() { Some(row) } else { None }
+        });
+        let xw = |i: usize, t: &Transform| t.weight * row.map_or(1.0, |r| r[i]);
+        let total: f64 = self.transforms.iter().enumerate().map(|(i, t)| xw(i, t)).sum();
+        if !(total > 0.0) {
+            // Degenerate row: plain weighted pick.
+            let total: f64 = self.transforms.iter().map(|t| t.weight).sum();
+            let mut r = rng.range(0.0, total);
+            for (i, t) in self.transforms.iter().enumerate() {
+                r -= t.weight;
+                if r <= 0.0 {
+                    return i;
+                }
+            }
+            return self.transforms.len() - 1;
+        }
         let mut r = rng.range(0.0, total);
         for (i, t) in self.transforms.iter().enumerate() {
-            r -= t.weight;
+            r -= xw(i, t);
             if r <= 0.0 {
                 return i;
             }
@@ -271,7 +308,7 @@ impl Genome {
         // the color coordinate is untouched (else colors wash out).
         if rng.chance(0.45) && n + 3 <= 8 {
             let base_sum: f64 = transforms.iter().map(|t| t.weight).sum();
-            let mut symmetry = |affine: Affine, rng: &mut Rng| {
+            let symmetry = |affine: Affine, rng: &mut Rng| {
                 let mut variations = vec![0.0; Variation::ALL.len()];
                 variations[Variation::Linear.index()] = 1.0;
                 Transform {
@@ -282,6 +319,7 @@ impl Genome {
                     variations,
                     pvals: Transform::random_pvals(rng),
                     color_speed: 0.0,
+                    xaos: Vec::new(),
                 }
             };
             if rng.chance(0.25) {
@@ -313,6 +351,17 @@ impl Genome {
             vibrancy: 1.0,
             background: [0.0, 0.0, 0.0],
         };
+        genome.fix_xaos();
+        // Occasional sparse xaos: suppress or boost a few transitions —
+        // structure within structure (flam3's signature trick).
+        if rng.chance(0.3) {
+            let n = genome.transforms.len();
+            for _ in 0..(1 + rng.below(n)) {
+                let i = rng.below(n);
+                let j = rng.below(n);
+                genome.transforms[i].xaos[j] = if rng.chance(0.5) { 0.0 } else { rng.range(0.2, 3.0) };
+            }
+        }
         genome.auto_frame();
         genome
     }

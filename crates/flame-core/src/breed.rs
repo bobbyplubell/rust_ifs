@@ -62,7 +62,7 @@ pub fn crossover(a: &Genome, b: &Genome, rng: &mut Rng) -> Genome {
     let vibrancy = if rng.chance(0.5) { a.vibrancy } else { b.vibrancy };
     let background = if rng.chance(0.5) { a.background } else { b.background };
 
-    Genome {
+    let mut child = Genome {
         transforms,
         final_transform,
         palette,
@@ -71,7 +71,10 @@ pub fn crossover(a: &Genome, b: &Genome, rng: &mut Rng) -> Genome {
         gamma,
         vibrancy,
         background,
-    }
+    };
+    // Xaos rows came from parents with possibly different transform counts.
+    child.fix_xaos();
+    child
 }
 
 /// Jitter every coefficient of a transform's pre and post affines.
@@ -97,6 +100,15 @@ fn mutate_transform(t: &mut Transform, rng: &mut Rng, rate: f64) {
     }
     if rng.chance(rate * 0.5) {
         t.color_speed = (t.color_speed + rng.range(-0.15, 0.15)).clamp(0.0, 1.0);
+    }
+    if rng.chance(rate * 0.5) && !t.xaos.is_empty() {
+        // Mutate one transition weight: suppress, boost, or jitter.
+        let j = rng.below(t.xaos.len());
+        t.xaos[j] = match rng.below(3) {
+            0 => 0.0,
+            1 => 1.0,
+            _ => (t.xaos[j] + rng.range(-0.5, 0.5)).max(0.0),
+        };
     }
     if rng.chance(rate * 0.5) {
         // Re-roll one variation weight, same style as Transform::random.
@@ -130,11 +142,16 @@ pub fn mutate(g: &mut Genome, rng: &mut Rng, rate: f64) {
         g.camera.rotate += rng.range(-0.2, 0.2);
     }
 
-    // Palette.
+    // Palette: usually jitter, occasionally swap to a fresh library palette.
     if rng.chance(rate) {
-        for stop in &mut g.palette.stops {
-            for ch in &mut stop.rgb {
-                *ch = (*ch + rng.range(-0.08, 0.08)).clamp(0.0, 1.0);
+        if rng.chance(0.25) {
+            g.palette = crate::palette::Palette::from_library(
+                rng.below(crate::palettes_lib::N_LIBRARY));
+        } else {
+            for stop in &mut g.palette.stops {
+                for ch in &mut stop.rgb {
+                    *ch = (*ch + rng.range(-0.08, 0.08)).clamp(0.0, 1.0);
+                }
             }
         }
     }
@@ -148,7 +165,14 @@ pub fn mutate(g: &mut Genome, rng: &mut Rng, rate: f64) {
         } else {
             let idx = rng.below(g.transforms.len());
             g.transforms.remove(idx);
+            // Drop the removed transform's column from every xaos row.
+            for t in &mut g.transforms {
+                if idx < t.xaos.len() {
+                    t.xaos.remove(idx);
+                }
+            }
         }
+        g.fix_xaos();
     }
 }
 
@@ -202,11 +226,20 @@ impl Genome {
             if !t.color_speed.is_finite() || !(0.0..=1.0).contains(&t.color_speed) {
                 return Err(format!("{what}: color_speed {} outside [0, 1]", t.color_speed));
             }
+            if t.xaos.iter().any(|v| !v.is_finite() || *v < 0.0) {
+                return Err(format!("{what}: bad xaos entry"));
+            }
             Ok(())
         };
 
         for (i, t) in self.transforms.iter().enumerate() {
             check_transform(t, &format!("transform {i}"))?;
+            if t.xaos.len() != n {
+                return Err(format!(
+                    "transform {i}: xaos row has {} entries, expected {n}",
+                    t.xaos.len()
+                ));
+            }
         }
         if let Some(t) = &self.final_transform {
             check_transform(t, "final transform")?;

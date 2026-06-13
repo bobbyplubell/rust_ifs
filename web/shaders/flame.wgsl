@@ -276,11 +276,35 @@ fn apply_tx(t: u32, p: vec2<f32>, state: ptr<function, u32>) -> vec2<f32> {
     );
 }
 
-fn pick(state: ptr<function, u32>) -> u32 {
+// Xaos transition matrix: rows appended after all transform blocks.
+fn xaos_at(prev: u32, i: u32) -> f32 {
     let n = params.dims.z;
-    var rr = rnd(state) * params.cam2.w; // total_weight
+    let base = (n + params.dims.w) * STRIDE;
+    return genome[base + prev * n + i];
+}
+
+fn pick(has_prev: bool, prev: u32, state: ptr<function, u32>) -> u32 {
+    let n = params.dims.z;
+    var total = 0.0;
     for (var i = 0u; i < n; i = i + 1u) {
-        rr = rr - field(i, 0u);
+        var f = 1.0;
+        if (has_prev) { f = xaos_at(prev, i); }
+        total = total + field(i, 0u) * f;
+    }
+    if (!(total > 0.0)) {
+        // Degenerate row: plain weighted pick.
+        var rr = rnd(state) * params.cam2.w;
+        for (var i = 0u; i < n; i = i + 1u) {
+            rr = rr - field(i, 0u);
+            if (rr <= 0.0) { return i; }
+        }
+        return n - 1u;
+    }
+    var rr = rnd(state) * total;
+    for (var i = 0u; i < n; i = i + 1u) {
+        var f = 1.0;
+        if (has_prev) { f = xaos_at(prev, i); }
+        rr = rr - field(i, 0u) * f;
         if (rr <= 0.0) { return i; }
     }
     return n - 1u;
@@ -304,8 +328,12 @@ fn cs_chaos(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let scale = params.cam2.z;
     let total = burn_in + plot_iters;
+    var prev = 0u;
+    var has_prev = false;
     for (var i = 0u; i < total; i = i + 1u) {
-        let t = pick(&state);
+        let t = pick(has_prev, prev, &state);
+        prev = t;
+        has_prev = true;
         let np = apply_tx(t, vec2(x, y), &state);
         let cs = field(t, 91u);
         color = color * (1.0 - cs) + field(t, 1u) * cs;

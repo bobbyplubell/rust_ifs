@@ -112,10 +112,12 @@ pub fn iterate(
     let mut x = rng.range(-1.0, 1.0);
     let mut y = rng.range(-1.0, 1.0);
     let mut color = rng.f64();
+    let mut prev: Option<usize> = None;
 
     let total = samples + burn_in;
     for i in 0..total {
-        let t = genome.pick(&mut rng);
+        let t = genome.pick(prev, &mut rng);
+        prev = Some(t);
         genome.transforms[t].apply(&mut x, &mut y, &mut color, &mut rng);
 
         // Reseed if the trajectory escaped to infinity / NaN.

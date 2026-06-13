@@ -2,11 +2,6 @@
   "title": "Electric Sheep, reborn in your browser",
   "sheep": [
     {
-      "name": "Sheep #3",
-      "file": "genomes/seed_3.json",
-      "seed": 3
-    },
-    {
       "name": "Sheep #5",
       "file": "genomes/seed_5.json",
       "seed": 5
@@ -22,9 +17,14 @@
       "seed": 11
     },
     {
-      "name": "Sheep #31",
-      "file": "genomes/seed_31.json",
-      "seed": 31
+      "name": "Sheep #41",
+      "file": "genomes/seed_41.json",
+      "seed": 41
+    },
+    {
+      "name": "Sheep #53",
+      "file": "genomes/seed_53.json",
+      "seed": 53
     },
     {
       "name": "Sheep #79",

@@ -176,13 +176,16 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
         banned: window.__sheepStats.banned,
         pool: window.__sheepStats.pool,
       }));
-      if (stats.frauds > 0 && stats.banned.includes(voter)) { caught = true; break; }
+      // Success = the forger is banned in p1's view — whether p1's own
+      // auditor convicted or a fraud proof arrived from another peer (both
+      // are the protocol working; the peers race).
+      if (stats.banned.includes(voter)) { caught = true; break; }
       console.log(`[${ts()}] fraud poll: audits=${stats.audits} frauds=${stats.frauds} ` +
         `pool=${JSON.stringify(stats.pool)}`);
       await new Promise((r) => setTimeout(r, 3000));
     }
-    check('auditor catches forged vote and bans the key', caught,
-      `audits run: ${stats.audits}, frauds: ${stats.frauds}`);
+    check('forged vote convicted and key banned (any peer)', caught,
+      `p1 audits: ${stats.audits}, p1 frauds: ${stats.frauds}`);
   } catch (err) {
     check('auditor catches forged vote and bans the key', false, err.message);
   }
