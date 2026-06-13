@@ -31,7 +31,7 @@
     <span id="info">loading…</span>
     <span id="sheep-id" class="id"></span>
     <span id="samples" class="id"></span>
-    <button id="contribute" class="on">contributing ✓</button>
+    <button id="contribute">contribute</button>
     <button id="dl">genome ↓</button>
     <a id="back" href="index.html">← flock</a>
   </div>
@@ -245,15 +245,17 @@
     }
 
     let pullCursor = 0;
-    function startContributeLoop() {
+    function startLoop() {
       const step = async () => {
+        // ALWAYS pull community-accumulated frames (verified) so the loop shows
+        // whatever the swarm has rendered — whether or not you contribute.
+        if ((pullCursor = (pullCursor + 1) % 10) === 0) {
+          net.requestRender(id, leastCoveredFrame());
+        }
+        // Render + publish tiles only when the user has opted in (manual).
         if (contributing && pool.running < pool.size) {
           const f = leastCoveredFrame();
           await contributeBatch(f, nextFreeIdx(f)).catch(console.error);
-          // Periodically pull a community-accumulated frame too (verified).
-          if ((pullCursor = (pullCursor + 1) % 8) === 0) {
-            net.requestRender(id, leastCoveredFrame());
-          }
         }
         setTimeout(step, 200);
       };
@@ -456,7 +458,7 @@
         URL.revokeObjectURL(a.href);
       };
 
-      startContributeLoop();
+      startLoop();
       loop.start();
     }
 

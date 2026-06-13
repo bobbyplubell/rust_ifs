@@ -39,7 +39,12 @@ const AUTO_CONTRIBUTE = !!(params.get('stress') || params.get('autocontribute'))
 
 // Frame every card shows. The flock is a still gallery of frame 0; the
 // fullscreen view (sheep.html) animates the whole loop.
-const CARD_FRAME = 0;
+const CARD_FRAME = 0;              // the frame each flock card displays
+const N_FRAMES = BATCH_SPEC.nFrames;
+// Contribution targets frame 0 until it has at least this many tiles (so the
+// thumbnail still looks decent), then spreads tiles across RANDOM frames to
+// build the whole community animation — not just the first frame.
+const FRAME0_MIN = 8;
 // Cell count of one batch/frame histogram at BATCH_SPEC (BigUint64Array length).
 const HIST_CELLS = BATCH_SPEC.width * BATCH_SPEC.ss * BATCH_SPEC.height * BATCH_SPEC.ss * 4;
 // Quick low-sample placeholder so a card is never blank before batches land.
@@ -152,7 +157,9 @@ async function main() {
 
   shownGen = gen();
   setInterval(() => {
-    updateStatus();
+    refreshTallies();   // apply batched tally changes in one pass
+    updateStatus();     // shows the activity pulse from batchActivity
+    batchActivity = 0;  // reset the per-tick pulse after showing it
     if (gen() !== shownGen) {
       shownGen = gen();
       scheduleRebuild(); // generation closed: survivors chosen, children born
@@ -255,6 +262,10 @@ function addCard(record) {
     tonemapPending: false, repaintQueued: false, paintedPreview: false,
     pledged: false,
   };
+  // Per-frame idx coverage for the WHOLE loop (so contribution can spread
+  // across frames). frame 0's set IS entry.covered (display accumulation), so
+  // the two never drift.
+  entry.frameCov = new Map([[CARD_FRAME, entry.covered]]);
   cards.set(record.id, entry);
   flockVisibility.observe(card);
 
@@ -352,14 +363,16 @@ function mergeHist(acc, add) {
 // returning visitor's card starts at the coverage they last had (and so peers'
 // earlier gossip is reflected). Then paint the placeholder/repaint.
 async function bootstrapCard(entry) {
-  const have = (await store.batchesForSheep(entry.record.id))
-    .filter((b) => b.frame === CARD_FRAME);
-  for (const b of have) {
-    if (entry.covered.has(b.idx)) continue;
+  for (const b of await store.batchesForSheep(entry.record.id)) {
     if (banned.has(b.contributor)) continue;
-    const reply = await pool.submit(renderBatchMsg(entry.record, CARD_FRAME, b.idx)).done;
-    if (reply.type !== 'batch-done') continue;
-    mergeBatchInto(entry, b.idx, new BigUint64Array(reply.hist));
+    if (b.frame === CARD_FRAME) {
+      if (entry.covered.has(b.idx)) continue;
+      const reply = await pool.submit(renderBatchMsg(entry.record, CARD_FRAME, b.idx)).done;
+      if (reply.type !== 'batch-done') continue;
+      mergeBatchInto(entry, b.idx, new BigUint64Array(reply.hist));
+    } else {
+      coveredFor(entry, b.frame).add(b.idx); // track other frames' coverage
+    }
   }
   if (entry.covered.size) repaint(entry);
   else paintPreview(entry);
@@ -420,16 +433,25 @@ function repaint(entry) {
 // the card visibly sharpens as the community contributes. Always rebuild (the
 // tally changed) and refresh the tally label.
 async function onBatch(rec) {
-  scheduleRebuild();
+  batchActivity++;
+  // Batches change tallies, not flock MEMBERSHIP — membership only changes at a
+  // generation close (or a new release, via onSheep). So we do NOT rebuild the
+  // flock per-batch (that was the gallery churn); only a retroactive batch for
+  // an already-closed generation can rewrite lineage.
+  if (rec.gen < gen()) scheduleRebuild();
   const entry = cards.get(rec.sheepId);
-  if (entry) {
-    updateTally(rec.sheepId);
-    if (rec.frame === CARD_FRAME && !entry.covered.has(rec.idx) && !banned.has(rec.contributor)) {
-      const reply = await pool.submit(renderBatchMsg(entry.record, CARD_FRAME, rec.idx)).done;
-      if (reply.type === 'batch-done' && mergeBatchInto(entry, rec.idx, new BigUint64Array(reply.hist))) {
-        repaint(entry);
-      }
+  if (!entry || banned.has(rec.contributor)) return;
+  markTally(rec.sheepId);
+  const cov = coveredFor(entry, rec.frame);
+  if (cov.has(rec.idx)) return;
+  if (rec.frame === CARD_FRAME) {
+    // The displayed frame: render it locally and merge so the card sharpens.
+    const reply = await pool.submit(renderBatchMsg(entry.record, CARD_FRAME, rec.idx)).done;
+    if (reply.type === 'batch-done' && mergeBatchInto(entry, rec.idx, new BigUint64Array(reply.hist))) {
+      repaint(entry);
     }
+  } else {
+    cov.add(rec.idx); // other frames: just track coverage (shown in fullscreen)
   }
 }
 
@@ -558,39 +580,59 @@ async function contributeStep(force = false) {
   contribCursor = (contribCursor + 1) % pickable.length;
   for (let n = 0; n < pickable.length; n++) {
     const entry = pickable[(contribCursor + n) % pickable.length];
-    const idx = nextFreeIdx(entry);
-    const sheepId = await contributeBatch(entry, idx);
+    const sheepId = await contributeBatch(entry);
     if (sheepId) return sheepId;
   }
   return null;
 }
 
-// Lowest frame-0 idx this peer hasn't merged/seen yet for a card.
-function nextFreeIdx(entry) {
+// The idx set this peer has rendered/seen for a given frame of a card. Frame 0
+// is entry.covered (the displayed accumulation); others are tracked so we don't
+// re-render a tile and so we can pick the next free idx.
+function coveredFor(entry, frame) {
+  let s = entry.frameCov.get(frame);
+  if (!s) { s = new Set(); entry.frameCov.set(frame, s); }
+  return s;
+}
+
+// Which frame to contribute to next: frame 0 until it has a baseline of tiles
+// (the thumbnail must look decent), then a uniformly random frame across the
+// whole loop so the full animation gets built.
+function pickFrame(entry) {
+  return entry.covered.size < FRAME0_MIN ? CARD_FRAME : Math.floor(Math.random() * N_FRAMES);
+}
+
+function nextFreeIdx(entry, frame) {
+  const cov = coveredFor(entry, frame);
   let i = 0;
-  while (entry.covered.has(i)) i++;
+  while (cov.has(i)) i++;
   return i;
 }
 
-// Render frame-0 batch (entry, idx), merge it, publish the contribution record,
-// re-tonemap. Returns the sheepId on a fresh contribution, else null.
-async function contributeBatch(entry, idx) {
-  if (entry.covered.has(idx)) return null;
-  // Mark covered up-front so concurrent steps don't pick the same idx.
-  entry.covered.add(idx);
+// Render one tile for the chosen frame, publish the contribution record
+// (earning a vote), and — only for the displayed frame 0 — merge it into the
+// card's accumulation and re-tonemap. Returns the sheepId, or null.
+async function contributeBatch(entry) {
+  const frame = pickFrame(entry);
+  const idx = nextFreeIdx(entry, frame);
+  const cov = coveredFor(entry, frame);
+  if (cov.has(idx)) return null;
+  cov.add(idx); // reserve up-front so concurrent steps don't collide
   let reply;
   try {
-    reply = await pool.submit(renderBatchMsg(entry.record, CARD_FRAME, idx)).done;
-  } catch (e) { entry.covered.delete(idx); throw e; }
-  if (reply.type !== 'batch-done') { entry.covered.delete(idx); return null; }
+    reply = await pool.submit(renderBatchMsg(entry.record, frame, idx)).done;
+  } catch (e) { cov.delete(idx); throw e; }
+  if (reply.type !== 'batch-done') { cov.delete(idx); return null; }
 
-  if (!entry.acc0) entry.acc0 = new BigUint64Array(HIST_CELLS);
-  mergeHist(entry.acc0, new BigUint64Array(reply.hist));
-  repaint(entry);
+  if (frame === CARD_FRAME) {
+    if (!entry.acc0) entry.acc0 = new BigUint64Array(HIST_CELLS);
+    mergeHist(entry.acc0, new BigUint64Array(reply.hist));
+    repaint(entry);
+  }
 
   const g = gen();
   const record = {
-    sheepId: entry.record.id, frame: CARD_FRAME, idx, hash: reply.hash,
+    sheepId: entry.record.id, frame, idx, hash: reply.hash,
     spp: BATCH_SPP, contributor: me.pubHex, gen: g,
   };
   record.sig = await sign(me.pair, batchSignBytes(record));
@@ -618,10 +660,24 @@ function stopReplay(_entry) { /* cards are stills; nothing to release */ }
 
 // ---- tally ------------------------------------------------------------------
 
+// Update a card's tally IN PLACE — keep the old number visible until the new
+// one resolves (no '…' flash). Display is decoupled from the firehose of
+// incoming batches: onBatch just marks the tally dirty and the 1 Hz UI tick
+// refreshes it, so the gallery never churns per-batch.
+const tallyDirty = new Set();
+let batchActivity = 0; // batches seen since the last tick (the "live" pulse)
+const markTally = (sheepId) => tallyDirty.add(sheepId);
+
+function refreshTallies() {
+  if (!tallyDirty.size) return;
+  const ids = [...tallyDirty];
+  tallyDirty.clear();
+  for (const id of ids) updateTally(id);
+}
+
 function updateTally(sheepId) {
   const entry = cards.get(sheepId);
   if (!entry) return;
-  entry.tallyEl.textContent = '…';
   net.tally(sheepId, gen()).then((n) => {
     if (!cards.has(sheepId)) return;
     entry.tallyEl.textContent = n > 0 ? `${n} ♥` : '';
@@ -712,10 +768,11 @@ function updateStatus() {
   const mm = String(Math.floor(msLeft / 60_000));
   const ss = String(Math.floor((msLeft % 60_000) / 1000)).padStart(2, '0');
   const a = auditor?.stats ?? { audits: 0, frauds: 0 };
+  const pulse = batchActivity ? ` · ⟳ ${batchActivity} tiles/s` : '';
   $('#status').textContent =
     `gen ${gen() - GENESIS_GEN} closes in ${mm}:${ss} · ` +
     `you are ${handle(me.pubHex)} · ${net.peerCount()} peers · ` +
-    `${a.audits} audits${a.frauds ? `, ${a.frauds} frauds!` : ''}`;
+    `${a.audits} audits${a.frauds ? `, ${a.frauds} frauds!` : ''}${pulse}`;
 }
 
 function showError(err) {
@@ -739,13 +796,13 @@ function installDebugHooks() {
 
 function installStressHooks() {
   window.__sheepAct = {
-    // Render+publish ONE batch (frame 0, next free idx) for a random living
-    // card; resolves with the sheepId or null.
+    // Render+publish ONE tile (frame-0-first, then random frame) for a random
+    // living card; resolves with the sheepId or null.
     async contributeRandom() {
       const list = [...cards.values()];
       if (!list.length) return null;
       const entry = list[Math.floor(Math.random() * list.length)];
-      return contributeBatch(entry, nextFreeIdx(entry));
+      return contributeBatch(entry);
     },
     // Breed two random living sheep, release the child (publishSheep), return
     // the childId or null.
