@@ -59,7 +59,11 @@ const node = await createLibp2p({
   services: {
     identify: identify(),
     relay: circuitRelayServer({
-      reservations: { maxReservations: 256 },
+      // A reservation is what makes a browser dialable for inbound WebRTC, so
+      // this caps how many peers can be fully connectable at once. 4096 is a
+      // ceiling for a launch crowd; it costs nothing until that many peers
+      // actually connect (RAM on the relay host is the real limit by then).
+      reservations: { maxReservations: 4096 },
     }),
     pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }),
   },
