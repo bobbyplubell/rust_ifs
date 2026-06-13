@@ -1,0 +1,5 @@
+# TLS for the relay domain; transparently upgrades + proxies WebSocket
+# (libp2p /wss) to the relay's internal plain-ws listener.
+{$RELAY_DOMAIN} {
+	reverse_proxy relay:4001
+}
