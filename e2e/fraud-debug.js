@@ -64,7 +64,7 @@ if (!process.env.NOINJECT) await page.evaluate(async (unused) => {
   const voter = hex(new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey)));
   const chunkHashes = Array.from({ length: PROOF_SPEC.nFrames }, (_, i) =>
     (i % 10).toString().repeat(64));
-  const record = { sheepId, gen: gen(), voter, tier: 'std', chunkHashes };
+  const record = { sheepId, gen: gen(), voter, tier: 'std', sumHash: 'ab'.repeat(32), chunkHashes };
   record.sig = hex(new Uint8Array(
     await crypto.subtle.sign({ name: 'Ed25519' }, pair.privateKey, voteSignBytes(record))));
   record.key = voteKey(record);

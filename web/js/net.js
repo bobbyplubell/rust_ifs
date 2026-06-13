@@ -50,7 +50,7 @@ export const HEX64 = /^[0-9a-f]{64}$/;
 export const sheepSignBytes = (r) =>
   utf8(`sheep|${r.id}|${(r.parents || []).join(',')}|${r.gen}|${r.author}|${r.chunkHashes.join(',')}`);
 export const voteSignBytes = (v) =>
-  utf8(`vote|${v.sheepId}|${v.gen}|${v.voter}|${v.tier}|${v.chunkHashes.join(',')}`);
+  utf8(`vote|${v.sheepId}|${v.gen}|${v.voter}|${v.tier}|${v.sumHash}|${v.chunkHashes.join(',')}`);
 
 export const voteKey = (v) => `${v.voter}:${v.sheepId}:${v.gen}`;
 
@@ -66,7 +66,7 @@ export const fraudSignBytes = (f) =>
   utf8(`fraud|${f.voteKey}|${f.frame}|${f.expected}|${f.reporter}`);
 
 /** BroadcastChannel bus name — bumped on wire-format breaks. */
-export const CHANNEL = 'sheep-net-v8';
+export const CHANNEL = 'sheep-net-v9';
 
 export class BroadcastTransport {
   constructor(channel = CHANNEL) {
@@ -107,10 +107,10 @@ export class Net {
    * @param onSheep/onVote/onFraud callbacks fired when a NEW record is accepted
    */
   constructor({ transport, store, pubHex, checkSheepId, checkFrameHash,
-                lookupSheep, onSheep, onVote, onFraud }) {
+                lookupSheep, onSheep, onVote, onFraud, onSumData }) {
     Object.assign(this, {
       transport, store, pubHex, checkSheepId, checkFrameHash, lookupSheep,
-      onSheep, onVote, onFraud,
+      onSheep, onVote, onFraud, onSumData,
     });
     this.peers = new Map(); // pubHex -> last inv timestamp
   }
@@ -146,6 +146,10 @@ export class Net {
     }
   }
 
+  requestSum(voteKey) {
+    this.transport.send({ kind: 'want-sum', from: this.pubHex, voteKey });
+  }
+
   async publishFraud(record) {
     record.key = fraudKey(record);
     if (await this.store.addFraud(record)) {
@@ -161,6 +165,22 @@ export class Net {
       case 'sheep': return this._ingestSheep(msg.record);
       case 'vote': return this._ingestVote(msg.record);
       case 'fraud': return this._ingestFraud(msg.record);
+      // Cross-peer accumulation: anyone may ask for the summed histogram
+      // behind a vote; holders reply addressed. The requester verifies the
+      // bytes against the vote's signed sumHash, so holders need no trust.
+      case 'want-sum': {
+        if (!msg.voteKey || msg.from === this.pubHex) return;
+        const buf = await this.store.getSum(msg.voteKey);
+        if (buf) {
+          this.transport.send({ kind: 'sum-data', to: msg.from, voteKey: msg.voteKey, buf });
+        }
+        return;
+      }
+      case 'sum-data': {
+        if (msg.to !== this.pubHex || !msg.voteKey || !msg.buf) return;
+        this.onSumData?.(msg.voteKey, msg.buf);
+        return;
+      }
       case 'inv': return this._onInv(msg);
       case 'data': {
         if (msg.to !== this.pubHex) return;
@@ -190,6 +210,7 @@ export class Net {
 
   async _ingestVote(v) {
     if (!v || !HEX64.test(v.sheepId) || !HEX64.test(v.voter) || !Number.isInteger(v.gen)) return;
+    if (!HEX64.test(v.sumHash ?? '')) return; // commitment to the summed histogram
     const tier = PROOF_TIERS[v.tier];
     if (!tier) return;
     if (!Array.isArray(v.chunkHashes) || v.chunkHashes.length !== tier.nFrames) return;

@@ -49,6 +49,7 @@
     import { sha256Hex, utf8 } from './js/hash.js';
     import { GpuFlame } from './js/gpu.js';
     import { provenance } from './js/names.js';
+    import { PROOF_TIERS } from './js/net.js';
 
     const $ = (s) => document.querySelector(s);
     const params = new URLSearchParams(location.search);
@@ -248,6 +249,48 @@
       }
       $('#sheep-id').textContent = id;
       $('#info').textContent = provenance(record).how;
+
+      // Instant first paint: the flock card's already-rendered pixels.
+      try {
+        const pv = localStorage.getItem(`sheep-preview-${id}`);
+        if (pv) {
+          localStorage.removeItem(`sheep-preview-${id}`);
+          const img = new Image();
+          img.onload = () => {
+            if (!still) {
+              cv.width = img.width;
+              cv.height = img.height;
+              ctx.drawImage(img, 0, 0);
+            }
+          };
+          img.src = pv;
+        }
+      } catch { /* no preview: black until first chunks land */ }
+
+      // Next-fastest result: any verified summed proof histograms this peer
+      // already holds (its own votes) — accumulated render at proof res.
+      (async () => {
+        const store = await openStore();
+        const spec = PROOF_TIERS.std;
+        const cells = spec.width * spec.ss * spec.height * spec.ss * 4;
+        let acc = null;
+        for (const v of await store.allVotes()) {
+          if (v.sheepId !== id) continue;
+          const buf = await store.getSum(v.key);
+          if (!buf || buf.byteLength !== cells * 8) continue;
+          if (!acc) acc = new Float64Array(cells);
+          const inc = new Float64Array(buf);
+          for (let k = 0; k < cells; k++) acc[k] += inc[k];
+        }
+        if (acc && !still) {
+          const m = await pool.submit({
+            type: 'tonemap-hist', hist: acc.buffer, genomeJson: record.genome,
+            width: spec.width, height: spec.height, ss: spec.ss,
+          }).done;
+          if (m.type === 'done' && !still) paint(m);
+        }
+      })().catch(console.error);
+
       if (!quality) quality = await benchQuality();
       markQuality();
       for (const b of document.querySelectorAll('#quality button')) {

@@ -23,9 +23,23 @@ const pool = new WorkerPool();
 // protocol PROOF_SPEC, which vote renders must match exactly.
 const VIEW_SPEC = { width: 256, height: 256, ss: 2, nChunks: 32, samplesPerChunk: 120_000 };
 
+// Attention = resolution: cards re-render deeper as votes accumulate. Tally
+// is shared state every peer agrees on, so every peer independently spends
+// its own CPU on the flock's favorites — the swarm's love is visible as
+// fidelity, with no pixels exchanged.
+const BOOST_STEPS = [1, 1.6, 2.4, 3.5]; // x samplesPerChunk at tiers 0..3
+const boostTier = (tally) => (tally >= 6 ? 3 : tally >= 3 ? 2 : tally >= 1 ? 1 : 0);
+const boostedSpec = (tier) => ({
+  ...VIEW_SPEC,
+  samplesPerChunk: Math.round(VIEW_SPEC.samplesPerChunk * BOOST_STEPS[tier]),
+});
+
 const cards = new Map();   // sheepId -> {record, canvas, tallyEl, voteBtn, card}
 const tallies = new Map(); // sheepId -> Set of vote keys
 const voteWeights = new Map(); // vote key -> tier weight
+const voteRecords = new Map(); // vote key -> full record (for sumHash verification)
+const sumRequested = new Set(); // vote keys we've asked the swarm for
+let sumsReceived = 0;
 const selected = [];       // up to two sheepIds picked as parents
 
 let me, store, net, auditor, baked = [];
@@ -70,9 +84,11 @@ async function main() {
     onSheep: () => scheduleRebuild(),
     onVote: (v) => {
       bumpTally(v);
+      requestSums(v.sheepId);
       if (v.gen < gen()) scheduleRebuild(); // late vote can rewrite a closed gen
     },
     onFraud: () => scheduleRebuild(), // a discredited voter changes tallies
+    onSumData: (voteKey, buf) => mergeSum(voteKey, buf).catch(console.error),
   });
 
   auditor = new Auditor({
@@ -98,6 +114,7 @@ async function main() {
     get audits() { return auditor.stats.audits; },
     get frauds() { return auditor.stats.frauds; },
     get banned() { return [...bannedVoters]; },
+    get sums() { return sumsReceived; },
     get pool() {
       return { queued: pool.queue.length, running: pool.running, chunks: pool.chunksRendered };
     },
@@ -168,6 +185,13 @@ function addCard(record) {
   label.title = `${prov.how}\n${record.id}`;
   label.href = `sheep.html?id=${record.id}${PEER_NS !== '0' ? `&peer=${PEER_NS}` : ''}`;
   label.target = '_blank';
+  // Hand the already-rendered card pixels to the fullscreen page for an
+  // instant first paint (it refines from there).
+  label.addEventListener('click', () => {
+    try {
+      localStorage.setItem(`sheep-preview-${record.id}`, canvas.toDataURL('image/png'));
+    } catch { /* quota: fullscreen just starts from black */ }
+  });
   const tallyEl = document.createElement('span');
   tallyEl.className = 'tally';
   const spinBtn = document.createElement('button');
@@ -191,7 +215,9 @@ function addCard(record) {
   spinBtn.addEventListener('click', () => toggleSpin(entry).catch(showError));
   voteBtn.addEventListener('click', () => vote(entry).catch(showError));
 
+  entry.boostTier = 0;
   drawProgressively(canvas, record.genome, `view|${record.id}`).catch(showError);
+  requestSums(record.id);
 }
 
 // Render a genome onto a canvas through the pool, painting as chunks land.
@@ -278,6 +304,11 @@ async function renderLoopProof(canvas, genomeJson, challengeHex, onProgress, spe
   const { nFrames } = spec;
   const frames = new Array(nFrames);
   const hashes = new Array(nFrames);
+  // Element-wise sum of all frame histograms: the voter's whole proof as ONE
+  // accumulation buffer — committed via sumHash and serveable to peers for
+  // cross-peer accumulated rendering.
+  const cells = spec.width * spec.ss * spec.height * spec.ss * 4;
+  const sum = new Float64Array(cells);
   let done = 0;
   const jobs = [];
   for (let i = 0; i < nFrames; i++) {
@@ -285,10 +316,12 @@ async function renderLoopProof(canvas, genomeJson, challengeHex, onProgress, spe
       type: 'proof-frame', genomeJson, challengeHex, idx: i,
       width: spec.width, height: spec.height, ss: spec.ss,
       samplesPerFrame: spec.samplesPerFrame,
-      nFrames, temporal: spec.temporal,
+      nFrames, temporal: spec.temporal, wantHist: true,
     }).done.then((m) => {
       if (m.type !== 'done') throw new Error('proof cancelled');
       hashes[m.idx] = m.hash;
+      const hist = new Float64Array(m.hist);
+      for (let k = 0; k < cells; k++) sum[k] += hist[k];
       frames[m.idx] = new ImageData(new Uint8ClampedArray(m.rgba), m.width, m.height);
       if (canvas.width !== m.width) { canvas.width = m.width; canvas.height = m.height; }
       ctx.putImageData(frames[m.idx], 0, 0);
@@ -301,7 +334,74 @@ async function renderLoopProof(canvas, genomeJson, challengeHex, onProgress, spe
     console.error('loop proof failed:', err?.message || err);
     return null;
   }
-  return { hashes, frames };
+  // Same byte layout Rust hashes: cells [r,g,b,count] as f64 little-endian.
+  const sumHash = await sha256Hex(new Uint8Array(sum.buffer));
+  return { hashes, frames, sum, sumHash };
+}
+
+// ---- cross-peer accumulation --------------------------------------------------
+//
+// Votes commit to the voter's summed proof histogram (sumHash). Peers fetch
+// those histograms from whoever holds them, verify against the signed
+// commitment, and ADD them: the displayed render's true sample count grows
+// with every reachable voter. No pixels cross the network — histograms are
+// pre-tonemap accumulation state, content-addressed by the votes themselves.
+
+function requestSums(sheepId) {
+  const entry = cards.get(sheepId);
+  if (!entry) return;
+  const g = gen();
+  for (const k of tallies.get(sheepId) ?? []) {
+    if (!k.endsWith(`:${g}`)) continue;
+    const v = voteRecords.get(k);
+    if (!v || v.voter === me.pubHex || sumRequested.has(k)) continue;
+    if ((entry.sumCount ?? 0) >= 16) break; // bound memory
+    sumRequested.add(k);
+    net.requestSum(k);
+  }
+}
+
+async function mergeSum(voteKey, buf) {
+  const v = voteRecords.get(voteKey);
+  if (!v || mergedSums.has(voteKey)) return;
+  const entry = cards.get(v.sheepId);
+  if (!entry) return;
+  const spec = PROOF_TIERS[v.tier];
+  const cells = spec.width * spec.ss * spec.height * spec.ss * 4;
+  if (!(buf instanceof ArrayBuffer) || buf.byteLength !== cells * 8) return;
+  // Verify the bytes against the vote's signed commitment.
+  if ((await sha256Hex(new Uint8Array(buf))) !== v.sumHash) return;
+  mergedSums.add(voteKey);
+  sumsReceived++;
+
+  if (!entry.sumAccum) {
+    entry.sumAccum = new Float64Array(cells);
+    entry.sumCount = 0;
+  }
+  const inc = new Float64Array(buf);
+  for (let k = 0; k < cells; k++) entry.sumAccum[k] += inc[k];
+  entry.sumCount++;
+  paintAccum(entry, spec).catch(console.error);
+}
+
+const mergedSums = new Set();
+
+async function paintAccum(entry, spec) {
+  if (entry.votePending || entry.replay || !entry.sumAccum) return;
+  // Copy: the worker takes ownership of the transferred buffer.
+  const hist = entry.sumAccum.slice().buffer;
+  const m = await pool.submit({
+    type: 'tonemap-hist', hist, genomeJson: entry.record.genome,
+    width: spec.width, height: spec.height, ss: spec.ss,
+  }, {}).done;
+  if (m.type !== 'done' || entry.votePending || entry.replay) return;
+  if (entry.canvas.width !== m.width) {
+    entry.canvas.width = m.width;
+    entry.canvas.height = m.height;
+  }
+  entry.canvas.getContext('2d').putImageData(
+    new ImageData(new Uint8ClampedArray(m.rgba), m.width, m.height), 0, 0);
+  entry.tallyEl.title = `${entry.sumCount} voters' render work accumulated`;
 }
 
 // Replay a completed proof loop on a card — the reward for voting: your
@@ -360,18 +460,29 @@ async function vote(entry) {
   }
 
   const record = {
-    sheepId: entry.record.id, gen: g, voter: me.pubHex, tier, chunkHashes: res.hashes,
+    sheepId: entry.record.id, gen: g, voter: me.pubHex, tier,
+    sumHash: res.sumHash, chunkHashes: res.hashes,
   };
   record.sig = await sign(me.pair, voteSignBytes(record));
   await net.publishVote(record);
+  // Keep the summed histogram: peers can fetch it (verified against sumHash)
+  // and add our 41M samples to their own view of this sheep.
+  await store.putSum(record.key, res.sum.buffer);
+  const spec = PROOF_TIERS[tier];
+  const cells = res.sum.length;
+  if (!entry.sumAccum) { entry.sumAccum = new Float64Array(cells); entry.sumCount = 0; }
+  for (let k = 0; k < cells; k++) entry.sumAccum[k] += res.sum[k];
+  entry.sumCount++;
   entry.voteBtn.textContent = 'voted ✓';
   startReplay(entry, res.frames);
+  requestSums(entry.record.id);
 }
 
 function bumpTally(v, quiet) {
   if (!tallies.has(v.sheepId)) tallies.set(v.sheepId, new Set());
   tallies.get(v.sheepId).add(v.key);
   voteWeights.set(v.key, voteWeight(v));
+  voteRecords.set(v.key, v);
   if (!quiet) updateTally(v.sheepId);
 }
 
@@ -393,6 +504,15 @@ function updateTally(sheepId) {
     }
   }
   entry.tallyEl.textContent = now ? `${now} ♥` : '';
+  // Re-render deeper when the tally crosses a boost step (skip while a proof
+  // is rendering or the card is replaying the user's own proof loop).
+  const tier = boostTier(now);
+  if (tier > (entry.boostTier ?? 0) && !entry.votePending && !entry.replay
+      && !(entry.sumCount > 0)) {
+    entry.boostTier = tier;
+    drawProgressively(entry.canvas, entry.record.genome, `view|${sheepId}`,
+      undefined, boostedSpec(tier)).catch(showError);
+  }
   if (mine) {
     if (!entry.votePending) entry.voteBtn.textContent = 'voted ✓';
     entry.voteBtn.disabled = true;
@@ -467,9 +587,13 @@ async function breedSelected() {
     record.sig = await sign(me.pair, sheepSignBytes(record));
     await net.publishSheep(record);
 
-    const voteRec = { sheepId: childId, gen: rg, voter: me.pubHex, tier: 'std', chunkHashes };
+    const voteRec = {
+      sheepId: childId, gen: rg, voter: me.pubHex, tier: 'std',
+      sumHash: res.sumHash, chunkHashes,
+    };
     voteRec.sig = await sign(me.pair, voteSignBytes(voteRec));
     await net.publishVote(voteRec);
+    await store.putSum(voteRec.key, res.sum.buffer);
 
     release.textContent = 'released ✓ (and voted)';
     scheduleRebuild();

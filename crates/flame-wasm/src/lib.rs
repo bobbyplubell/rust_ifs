@@ -82,6 +82,29 @@ pub fn render_frame(
     }
 }
 
+/// Tone-map a raw histogram (cells [r,g,b,count] f64 row-major at `w*ss x
+/// h*ss`) — used to display cross-peer ACCUMULATED renders: verified summed
+/// histograms from many voters' proofs, tonemapped locally.
+#[wasm_bindgen]
+pub fn tonemap_hist(
+    hist: &[f64],
+    genome_json: &str,
+    width: u32,
+    height: u32,
+    ss: u32,
+) -> Result<Vec<u8>, JsValue> {
+    let genome = parse_genome_unvalidated(genome_json)?;
+    let (w, h, s) = (width as usize, height as usize, ss as usize);
+    if hist.len() != w * s * h * s * 4 {
+        return Err(JsValue::from_str("hist length does not match dimensions"));
+    }
+    let mut accum = Accum::new(w * s, h * s);
+    for (cell, src) in accum.data.iter_mut().zip(hist.chunks_exact(4)) {
+        cell.copy_from_slice(src);
+    }
+    Ok(tonemap(&accum, &genome, w, h, s))
+}
+
 // ---- genetics: canonical JSON, sheep_id, breeding ---------------------------
 
 fn parse_genome(json: &str, what: &str) -> Result<Genome, JsValue> {
@@ -268,13 +291,15 @@ impl ChunkedRender {
     }
 }
 
-/// One frame of a protocol-v3 loop proof: hash (the proof unit) plus the
-/// tone-mapped RGBA of that frame, so rendering your proof doubles as
-/// watching the loop (and the frames can be cached for replay).
+/// One frame of a loop proof: hash (the proof unit), the tone-mapped RGBA
+/// (rendering your proof doubles as watching the loop), and the raw
+/// accumulation histogram (cells [r,g,b,count] f64, row-major) so frame
+/// histograms can be summed into a cross-peer accumulated render.
 #[wasm_bindgen]
 pub struct ProofFrame {
     hash: String,
     rgba: Vec<u8>,
+    hist: Vec<f64>,
 }
 
 #[wasm_bindgen]
@@ -286,6 +311,10 @@ impl ProofFrame {
     #[wasm_bindgen(getter)]
     pub fn rgba(&self) -> Vec<u8> {
         self.rgba.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn hist(&self) -> Vec<f64> {
+        self.hist.clone()
     }
 }
 
@@ -309,7 +338,8 @@ pub fn proof_frame(
     );
     let hash = chunked::chunk_hash_hex(&accum);
     let rgba = tonemap(&accum, &genome, width as usize, height as usize, ss as usize);
-    Ok(ProofFrame { hash, rgba })
+    let hist = accum.data.iter().flatten().copied().collect();
+    Ok(ProofFrame { hash, rgba, hist })
 }
 
 /// Audit one loop-proof frame: recompute its hash only (no pixels kept).

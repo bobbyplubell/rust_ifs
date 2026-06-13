@@ -39,6 +39,7 @@ import init, {
   render_frame,
   proof_frame,
   audit_frame,
+  tonemap_hist,
 } from '../pkg/flame_wasm.js';
 
 // Job ids cancelled by the main thread. Checked between chunks; once a job
@@ -68,6 +69,7 @@ self.onmessage = async (event) => {
       case 'frame':      handleFrame(msg); break;
       case 'proof-frame': handleProofFrame(msg); break;
       case 'audit-frame': handleAuditFrame(msg); break;
+      case 'tonemap-hist': handleTonemapHist(msg); break;
       default:
         throw new Error(`unknown message type: ${msg.type}`);
     }
@@ -161,10 +163,28 @@ function handleProofFrame(msg) {
   if (cancelled.has(msg.jobId)) return;
   const rgba = pf.rgba.buffer;
   const hash = pf.hash;
+  // Raw frame histogram for cross-peer accumulation (summed by the caller).
+  const hist = msg.wantHist ? pf.hist.buffer : null;
   pf.free();
+  const reply = {
+    type: 'done', jobId: msg.jobId, idx: msg.idx, hash, rgba,
+    width: msg.width, height: msg.height, hist,
+  };
+  self.postMessage(reply, hist ? [rgba, hist] : [rgba]);
+}
+
+// Tone-map a (summed) histogram: the display path for cross-peer accumulated
+// renders. {type:'tonemap-hist', jobId, hist (ArrayBuffer f64), genomeJson,
+// width, height, ss}
+function handleTonemapHist(msg) {
+  const rgba = tonemap_hist(
+    new Float64Array(msg.hist), msg.genomeJson, msg.width, msg.height, msg.ss,
+  );
+  if (cancelled.has(msg.jobId)) return;
+  const buf = rgba.buffer;
   self.postMessage(
-    { type: 'done', jobId: msg.jobId, idx: msg.idx, hash, rgba, width: msg.width, height: msg.height },
-    [rgba],
+    { type: 'done', jobId: msg.jobId, rgba: buf, width: msg.width, height: msg.height },
+    [buf],
   );
 }
 

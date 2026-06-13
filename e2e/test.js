@@ -111,6 +111,12 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
   await tally2.filter({ hasText: '♥' }).waitFor({ timeout: 30_000 });
   check('p2 sees p1 vote in tally', true, await tally2.textContent());
 
+  // Cross-peer accumulation: p2 fetches p1's summed proof histogram, verifies
+  // it against the vote's signed sumHash, and adds those 41M samples to its
+  // own display of the sheep.
+  await p2.waitForFunction(() => window.__sheepStats.sums >= 1, undefined, { timeout: 60_000 });
+  check('p2 accumulated p1 render work (verified sum)', true);
+
   // Breed: select two sheep in p2, wait for the canonical child, release it,
   // and require the new card to appear in p1.
   await p2.locator('.card canvas').nth(0).click();
@@ -147,7 +153,11 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
       const voter = hex(new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey)));
       const chunkHashes = Array.from({ length: PROOF_SPEC.nFrames }, (_, i) =>
         (i % 10).toString().repeat(64)); // garbage, but well-formed
-      const record = { sheepId, gen: gen(), voter, tier: 'std', chunkHashes };
+      const record = {
+        sheepId, gen: gen(), voter, tier: 'std',
+        sumHash: 'ab'.repeat(32), // garbage commitment, well-formed
+        chunkHashes,
+      };
       record.sig = hex(new Uint8Array(
         await crypto.subtle.sign({ name: 'Ed25519' }, pair.privateKey, voteSignBytes(record))));
       record.key = voteKey(record);
@@ -195,10 +205,14 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
   await page.waitForFunction(() =>
     document.querySelectorAll('#rows tr').length >= 2 &&
     document.body.textContent.includes('♥'), undefined, { timeout: 60_000 });
-  const text = await page.textContent('body');
-  check('swarm page shows weighted contributions', text.includes('♥') && /B pts|M pts/.test(text));
-  check('swarm page shows the banned forger', text.includes('banned (fraud)'));
-  check('swarm page shows totals', /votes proving/.test(text), '');
+  // Scope to rendered content — body textContent includes the page's own
+  // inline script source, which made the 'banned' check vacuously true.
+  const rowsText = await page.textContent('#rows');
+  const totalsText = await page.textContent('#totals');
+  check('swarm page shows weighted contributions',
+    rowsText.includes('♥') && /B pts|M pts/.test(rowsText));
+  check('swarm page shows the banned forger', rowsText.includes('banned (fraud)'));
+  check('swarm page shows totals', /votes proving/.test(totalsText), '');
   await page.close();
 }
 

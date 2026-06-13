@@ -7,11 +7,12 @@ import { PEER_NS } from './identity.js';
 
 export async function openStore() {
   const db = await new Promise((resolve, reject) => {
-    const req = indexedDB.open(`sheep-store-v8-${PEER_NS}`, 1);
+    const req = indexedDB.open(`sheep-store-v9-${PEER_NS}`, 1);
     req.onupgradeneeded = () => {
       req.result.createObjectStore('sheep', { keyPath: 'id' });
       req.result.createObjectStore('votes', { keyPath: 'key' });
       req.result.createObjectStore('fraud', { keyPath: 'key' });
+      req.result.createObjectStore('sums'); // voteKey -> summed histogram ArrayBuffer
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -39,7 +40,25 @@ export async function openStore() {
     });
   }
 
+  function kvPut(storeName, key, value) {
+    return new Promise((resolve, reject) => {
+      const req = db.transaction(storeName, 'readwrite').objectStore(storeName).put(value, key);
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  }
+
+  function kvGet(storeName, key) {
+    return new Promise((resolve, reject) => {
+      const req = db.transaction(storeName).objectStore(storeName).get(key);
+      req.onsuccess = () => resolve(req.result ?? null);
+      req.onerror = () => reject(req.error);
+    });
+  }
+
   return {
+    putSum: (voteKey, buf) => kvPut('sums', voteKey, buf),
+    getSum: (voteKey) => kvGet('sums', voteKey),
     addSheep: (rec) => addIfAbsent('sheep', rec),
     addVote: (rec) => addIfAbsent('votes', rec),
     addFraud: (rec) => addIfAbsent('fraud', rec),
