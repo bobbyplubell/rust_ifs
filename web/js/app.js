@@ -17,7 +17,7 @@ import { openStore } from './store.js';
 import {
   Net, BroadcastTransport, CompositeTransport, gen, GEN_MS, GENESIS_GEN,
   BATCH_SPEC, BATCH_SPP, batchKey, batchSignBytes, sheepSignBytes, fraudSignBytes,
-  BREED_MIN_TILES,
+  BREED_MIN_TILES, PROTOCOL_VERSION,
 } from './net.js';
 import { computeFlock, breedChallenge } from './gens.js';
 import { handle, provenance } from './names.js';
@@ -520,6 +520,7 @@ async function verifyRender(lookupSheep, { sheepId, frame, hist, batchKeys }) {
       // The contributor signed a hash that doesn't match the true render:
       // provable fraud. Publish it (bans them everywhere).
       await net.publishFraud({
+        v: PROTOCOL_VERSION,
         batchKey: b.key ?? batchKey(b), expected: reply.hash, reporter: me.pubHex,
         sig: await sign(me.pair, batchFraudBytes(b, reply.hash)),
       });
@@ -536,7 +537,7 @@ async function verifyRender(lookupSheep, { sheepId, frame, hist, batchKeys }) {
 
 // Sign-bytes for a fraud proof against batch `b` with the true hash.
 const batchFraudBytes = (b, expected) =>
-  fraudSignBytes({ batchKey: b.key ?? batchKey(b), expected, reporter: me.pubHex });
+  fraudSignBytes({ v: PROTOCOL_VERSION, batchKey: b.key ?? batchKey(b), expected, reporter: me.pubHex });
 
 function shuffle(a) {
   for (let i = a.length - 1; i > 0; i--) {
@@ -647,6 +648,7 @@ async function contributeBatch(entry) {
 
   const g = gen();
   const record = {
+    v: PROTOCOL_VERSION,
     sheepId: entry.record.id, frame, idx, hash: reply.hash,
     spp: BATCH_SPP, contributor: me.pubHex, gen: g,
   };
@@ -779,6 +781,7 @@ async function breedSelected() {
     // contributed to like any sheep. The release is a signed sheep record.
     const rg = gen();
     const record = {
+      v: PROTOCOL_VERSION,
       id: childId, genome: childJson, parents: [aId, bId], gen: rg,
       origin: 'release', author: me.pubHex,
     };
@@ -855,6 +858,7 @@ function installStressHooks() {
       }).done;
       if (bred.type !== 'breed-done' || cards.has(bred.childId)) return null;
       const record = {
+        v: PROTOCOL_VERSION,
         id: bred.childId, genome: bred.childJson, parents: [x, y], gen: g,
         origin: 'release', author: me.pubHex,
       };

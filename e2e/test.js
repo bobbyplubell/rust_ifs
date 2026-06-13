@@ -169,11 +169,12 @@ let firstId; // a baked sheep id, reused by the swarm section's peer=1 store
   await page.waitForFunction(() => !!window.__sheepAct);
 
   const forger = await page.evaluate(async (sid) => {
-    const { batchSignBytes, batchKey, gen, CHANNEL } = await import('./js/net.js');
+    const { batchSignBytes, batchKey, gen, CHANNEL, PROTOCOL_VERSION } = await import('./js/net.js');
     const { hex } = await import('./js/hash.js');
     const pair = await crypto.subtle.generateKey({ name: 'Ed25519' }, false, ['sign', 'verify']);
     const contributor = hex(new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey)));
     const record = {
+      v: PROTOCOL_VERSION,
       sheepId: sid, frame: 0, idx: 99, hash: 'de'.repeat(32), // plausible but WRONG hash
       spp: 640000, contributor, gen: gen(),
     };

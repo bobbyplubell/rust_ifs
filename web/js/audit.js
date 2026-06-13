@@ -9,7 +9,7 @@
 // net.js _ingestFraud). On a confirmed proof every contribution from the
 // discredited key is excluded from tallies everywhere it reaches.
 
-import { BATCH_SPEC, BATCH_SPP, batchKey, fraudSignBytes } from './net.js';
+import { BATCH_SPEC, BATCH_SPP, batchKey, fraudSignBytes, PROTOCOL_VERSION } from './net.js';
 
 export class Auditor {
   /**
@@ -80,6 +80,7 @@ export class Auditor {
     if (reply.hash !== b.hash) {
       this.stats.frauds++;
       const fraud = {
+        v: PROTOCOL_VERSION,
         batchKey: key, expected: reply.hash, reporter: this.identity.pubHex,
       };
       fraud.sig = await this.sign(this.identity.pair, fraudSignBytes(fraud));

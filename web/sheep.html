@@ -72,7 +72,7 @@
     import { provenance } from './js/names.js';
     import {
       Net, BroadcastTransport, CompositeTransport, gen,
-      BATCH_SPEC, BATCH_SPP, batchKey, batchSignBytes, fraudSignBytes,
+      BATCH_SPEC, BATCH_SPP, batchKey, batchSignBytes, fraudSignBytes, PROTOCOL_VERSION,
     } from './js/net.js';
     import { FrameLoop } from './js/loop.js';
     import { RELAYS } from './config.js';
@@ -279,6 +279,7 @@
 
       const g = gen();
       const rec = {
+        v: PROTOCOL_VERSION,
         sheepId: id, frame: f, idx, hash: reply.hash, spp: BATCH_SPP,
         contributor: me.pubHex, gen: g,
       };
@@ -341,6 +342,7 @@
         if (reply.type !== 'batch-done') return false;
         if (reply.hash !== b.hash) {
           const f = {
+            v: PROTOCOL_VERSION,
             batchKey: b.key ?? batchKey(b), expected: reply.hash, reporter: me.pubHex,
           };
           f.sig = await sign(me.pair, fraudSignBytes(f));

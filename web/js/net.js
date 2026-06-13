@@ -66,9 +66,17 @@ export const HEX64 = /^[0-9a-f]{64}$/;
 // primitive. Each accepted, distinct, verified batch from a non-banned key is
 // one vote for batch.sheepId in batch.gen.
 
+/** Protocol version, carried in (and signed into) every record. A client can
+ *  verify any version's signature (the version is part of the signed bytes) and
+ *  then decide whether it understands that version — so future clients can
+ *  tolerate or bridge old/new records instead of silently failing. v1 accepts
+ *  only its own; widen ACCEPTED_VERSIONS to add forward compatibility. */
+export const PROTOCOL_VERSION = 1;
+export const ACCEPTED_VERSIONS = new Set([1]);
+
 export const batchKey = (b) => `${b.sheepId}:${b.frame}:${b.idx}`;
 export const batchSignBytes = (b) =>
-  utf8('batch|' + [b.sheepId, b.frame, b.idx, b.hash, b.spp, b.gen].join('|'));
+  utf8('batch|' + [b.v, b.sheepId, b.frame, b.idx, b.hash, b.spp, b.gen].join('|'));
 /** v1: one batch, one vote. Kept as a function so weighting can change later. */
 export const voteValue = (_b) => 1;
 
@@ -79,7 +87,7 @@ export const voteValue = (_b) => 1;
 // (pair/mutant/immigrant) and seeds are unsigned and recomputable from public
 // data, so every peer reconstructs identical records.
 export const sheepSignBytes = (r) =>
-  utf8(`sheep|${r.id}|${(r.parents || []).join(',')}|${r.gen}|${r.author}`);
+  utf8(`sheep|${r.v}|${r.id}|${(r.parents || []).join(',')}|${r.gen}|${r.author}`);
 
 // -- fraud proof --------------------------------------------------------------
 //
@@ -87,10 +95,10 @@ export const sheepSignBytes = (r) =>
 // Objectively checkable by re-rendering that one batch. A confirmed proof bans
 // the offending contributor everywhere (all their votes excluded).
 export const fraudSignBytes = (f) =>
-  utf8('fraud|' + [f.batchKey, f.expected, f.reporter].join('|'));
+  utf8('fraud|' + [f.v, f.batchKey, f.expected, f.reporter].join('|'));
 
 /** BroadcastChannel bus name — bumped on wire-format breaks. */
-export const CHANNEL = 'sheep-net-v11';
+export const CHANNEL = 'sheep-net-v12';
 
 export class BroadcastTransport {
   constructor(channel = CHANNEL) {
@@ -268,6 +276,7 @@ export class Net {
 
   async _ingestSheep(r) {
     if (!r || !HEX64.test(r.id) || typeof r.genome !== 'string') return;
+    if (!ACCEPTED_VERSIONS.has(r.v)) return; // unknown protocol version
     if (!Number.isInteger(r.gen)) return;
     const ORIGINS = ['seed', 'release', 'pair', 'mutant', 'immigrant'];
     if (!ORIGINS.includes(r.origin)) return;
@@ -293,6 +302,7 @@ export class Net {
 
   async _ingestBatch(b) {
     if (!b || !HEX64.test(b.sheepId) || !HEX64.test(b.hash)) return;
+    if (!ACCEPTED_VERSIONS.has(b.v)) return; // unknown protocol version
     if (!Number.isInteger(b.frame) || b.frame < 0 || b.frame >= BATCH_SPEC.nFrames) return;
     if (!Number.isInteger(b.idx) || b.idx < 0) return;
     if (!Number.isInteger(b.spp) || b.spp <= 0) return;
@@ -313,6 +323,7 @@ export class Net {
    *  Requires the sheep's genome — if absent, drop; anti-entropy re-offers it. */
   async _ingestFraud(f) {
     if (!f || typeof f.batchKey !== 'string' || !HEX64.test(f.expected ?? '')) return;
+    if (!ACCEPTED_VERSIONS.has(f.v)) return; // unknown protocol version
     if (!HEX64.test(f.reporter ?? '')) return;
     if (!(await this.verify(f.reporter, f.sig, fraudSignBytes(f)))) return;
     const b = await this._batchByKey(f.batchKey);
