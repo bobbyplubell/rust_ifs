@@ -72,11 +72,15 @@
     // tier; quality comes from accumulated samples, not a bigger single job.
     // CPU: small chunks + throttled paint keep the UI responsive. GPU (when
     // present): large batches converge in ~a second, then it idles.
+    // Resolution fixed per tier; quality comes from accumulated samples. ss=1
+    // keeps each tonemap cheap (the worker re-resolves the whole histogram on
+    // every paint) so refinement is visible quickly — density estimation in
+    // the tone map denoises in place of supersampling.
     const PROGRESSIVE = {
-      low:   { width: 512,  height: 512,  ss: 1, samplesPerChunk: 220_000, paintEvery: 3, gpuBatch: 6_000_000,  gpuConverge: 120e6 },
-      med:   { width: 768,  height: 768,  ss: 1, samplesPerChunk: 320_000, paintEvery: 3, gpuBatch: 10_000_000, gpuConverge: 200e6 },
-      high:  { width: 1024, height: 1024, ss: 1, samplesPerChunk: 500_000, paintEvery: 4, gpuBatch: 16_000_000, gpuConverge: 350e6 },
-      ultra: { width: 1024, height: 1024, ss: 2, samplesPerChunk: 700_000, paintEvery: 6, gpuBatch: 24_000_000, gpuConverge: 600e6 },
+      low:   { width: 512,  height: 512,  ss: 1, samplesPerChunk: 250_000, paintEvery: 2 },
+      med:   { width: 768,  height: 768,  ss: 1, samplesPerChunk: 400_000, paintEvery: 3 },
+      high:  { width: 1024, height: 1024, ss: 1, samplesPerChunk: 600_000, paintEvery: 3 },
+      ultra: { width: 1280, height: 1280, ss: 1, samplesPerChunk: 900_000, paintEvery: 4 },
     };
     const SPIN = {
       low:   { budgetMs: 30,  maxS: 32_000_000,  startS: 6_000_000,  sizeCap: 640,  ss: 1, temporal: 4 },
@@ -166,49 +170,21 @@
       stillCtl = null;
     }
 
-    async function renderStill() {
+    // The still always runs on the CPU accumulator (in a worker), so it can
+    // never lag the main thread or fight the browser's compositor for the GPU.
+    // The GPU is reserved for spin, where a continuous render is the point.
+    function renderStill() {
       stopStill();
       showSamples(0);
       const spec = PROGRESSIVE[quality];
       const ctl = { stop: false, job: null };
       stillCtl = ctl;
-      if (gpu) await stillGpu(ctl, spec); else stillCpu(ctl, spec);
+      stillCpu(ctl, spec);
     }
 
-    // GPU: re-dispatch into ONE histogram (accumulate) with a fresh seed each
-    // batch; converges in ~a second, then idles so it isn't pegging the GPU on
-    // a static image. Falls back to CPU on device loss.
-    async function stillGpu(ctl, spec) {
-      const cvgpu = $('#cvgpu');
-      try {
-        const px = Math.min(window.innerWidth, window.innerHeight) * (window.devicePixelRatio || 1);
-        const size = Math.min(spec.width, Math.max(384, Math.round(px / 8) * 8));
-        cvgpu.width = size; cvgpu.height = size;
-        gpu.configure(cvgpu);
-        useCanvas('gpu');
-        let total = 0;
-        for (let k = 0; !ctl.stop; k++) {
-          await gpu.frame(record.genome, 0, {
-            width: size, height: size, ss: spec.ss, samples: spec.gpuBatch,
-            seed: (7 + k * 0x9e3779b9) >>> 0, accumulate: k > 0,
-          });
-          rendered = true;
-          total += spec.gpuBatch;
-          showSamples(total);
-          if (total >= spec.gpuConverge) break; // clean enough — leave it up
-          await new Promise(requestAnimationFrame);
-        }
-      } catch (err) {
-        console.warn('gpu still failed, falling back to cpu:', err);
-        gpu = null;
-        useCanvas('cpu');
-        if (!ctl.stop) stillCpu(ctl, spec);
-      }
-    }
-
-    // CPU: small fresh-seeded chunks accumulate into one histogram in the
-    // worker; it paints a throttled tonemap each few chunks and keeps refining
-    // until cancelled. Responsive (chunks yield) and unbounded in quality.
+    // Small fresh-seeded chunks accumulate into one histogram in the worker;
+    // it paints a throttled tonemap every few chunks and keeps refining until
+    // cancelled. Responsive (chunks yield) and unbounded in quality.
     function stillCpu(ctl, spec) {
       useCanvas('cpu');
       sha256Hex(utf8(`view|${id}`)).then((challengeHex) => {
@@ -382,7 +358,7 @@
             toggleSpin().catch(console.error); // stop -> resumes still
             toggleSpin().catch(console.error); // start fresh spin
           } else {
-            renderStill().catch(console.error);
+            renderStill();
           }
         };
       }
@@ -394,10 +370,7 @@
         a.click();
         URL.revokeObjectURL(a.href);
       };
-      // Give WebGPU a moment to come up so the still uses the fast accumulating
-      // path on capable machines; otherwise start the CPU still immediately.
-      await Promise.race([gpuReady, new Promise((r) => setTimeout(r, 2500))]);
-      await renderStill();
+      renderStill();
     }
 
     main().catch((e) => { $('#info').textContent = 'error: ' + (e.message || e); console.error(e); });

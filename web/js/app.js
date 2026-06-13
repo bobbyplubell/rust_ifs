@@ -55,11 +55,20 @@ async function main() {
 
   // Tabs always talk via BroadcastChannel; the internet swarm joins in when
   // relays are configured (libp2p bundle loaded lazily, failure non-fatal).
+  // Relays come from config.js, but a `?relay=<multiaddr>` URL param (or a
+  // `relays` localStorage entry, comma-separated) overrides/augments them —
+  // handy for pointing at a locally-run relay without editing config.js.
+  const relayOverride = [
+    ...(new URLSearchParams(location.search).get('relay') ? [new URLSearchParams(location.search).get('relay')] : []),
+    ...((localStorage.getItem('relays') || '').split(',').map((s) => s.trim()).filter(Boolean)),
+  ];
+  const relays = relayOverride.length ? relayOverride : RELAYS;
   const transports = [new BroadcastTransport()];
-  if (RELAYS.length) {
+  if (relays.length) {
     try {
       const { createLibp2pTransport } = await import('./vendor/libp2p.js');
-      transports.push(await createLibp2pTransport({ relays: RELAYS }));
+      transports.push(await createLibp2pTransport({ relays }));
+      console.log('libp2p transport up; relays:', relays);
     } catch (err) {
       console.error('libp2p transport unavailable:', err);
     }
