@@ -7,9 +7,11 @@
   <link rel="stylesheet" href="style.css" />
   <style>
     main { max-width: 68ch; padding-bottom: 48px; }
-    h2 { font-size: 15px; margin: 28px 0 6px; color: #b9b9d6; }
+    h2 { font-size: 15px; margin: 30px 0 6px; color: #b9b9d6; }
     p { color: #9d9db2; }
     em { color: #c8b06a; font-style: normal; }
+    ol { color: #9d9db2; padding-left: 20px; }
+    li { margin: 4px 0; }
   </style>
 </head>
 <body>
@@ -17,75 +19,88 @@
     <h1>what is this</h1>
   </header>
   <main>
+    <h2>what is this</h2>
     <p>
       A revival of <a href="https://electricsheep.org/">Electric Sheep</a>:
       abstract creatures called <em>sheep</em> — each one a
-      <a href="https://flam3.com/flame_draves.pdf">fractal flame</a>, invented
-      by Scott Draves — live, breed, and die by popular vote. This version has
-      no server. The site is static files; everything else happens in the
-      browsers of the people watching.
+      <a href="https://flam3.com/flame_draves.pdf">fractal flame</a> invented by
+      Scott Draves — that the people watching <em>render together</em>, vote on,
+      and breed. There is no server. The site is just static files; every sheep
+      is built, judged, and bred in the browsers of whoever's here. The more
+      attention a sheep gets, the more rendering it receives, and the more
+      beautiful it becomes — for everyone at once.
     </p>
 
-    <h2>rendered, not served</h2>
+    <h2>how do I play</h2>
+    <ol>
+      <li><em>Watch.</em> The flock shows whatever the swarm has rendered so
+        far. Hover a card to preview its animation; click it for the
+        full-screen loop.</li>
+      <li><em>Contribute.</em> Press <em>contribute</em> on a sheep you like.
+        Your browser renders <em>tiles</em> into it — each tile sharpens the
+        sheep for everyone <em>and</em> is a vote for it. Work and taste are the
+        same act.</li>
+      <li><em>Breed.</em> Pick two living sheep to see the exact child they'd
+        produce. To release it you must first have contributed tiles to
+        <em>both</em> parents — your stake in the cross.</li>
+      <li><em>Selection.</em> Every 5 minutes a generation closes: the
+        most-rendered sheep survive and breed into the next, alongside mutant
+        clones and a fresh random immigrant so the gene pool never stagnates.</li>
+    </ol>
+
+    <h2>how does it work</h2>
     <p>
-      No images are ever transmitted. A sheep is ~3&nbsp;KB of genome JSON; your
-      browser renders it with a Rust renderer compiled to WebAssembly. The
-      renderer is <em>deterministic</em>: the same genome and seed produce
-      byte-identical pixels on every machine. That one property is the
-      foundation for everything below.
+      The renderer (Rust → WebAssembly) is <em>deterministic</em>: a genome
+      plus a seed produce byte-identical pixels on every machine. That single
+      property is the foundation for everything.
+    </p>
+    <p>
+      A flame is drawn by the chaos game, whose points scatter across the whole
+      image — so you can't split the work by region. Instead the work is split
+      into <em>tiles</em>: deterministic batches of sample points, each keyed by
+      the sheep and a frame of its animation loop. Anyone who renders a tile
+      gets the identical result, and tiles <em>sum</em> — the histograms are
+      integer, so merging everyone's tiles is exact and order-independent. The
+      shared object isn't a ledger of votes; it's the <em>sheep itself</em>, a
+      growing pile of tiles that any peer can extend. Each tile a sheep holds is
+      one unit of both its quality and its vote count — they're the same number.
+    </p>
+    <p>
+      Because the pixels are <em>derivable</em>, nothing has to be trusted.
+      Before any shared render is shown it's verified against the deterministic
+      re-render (and a fractal-flame genome — a few dozen numbers — physically
+      can't encode an arbitrary picture, so there's no way to smuggle a forged
+      image onto the screen). A peer that signs a bad tile is caught by anyone
+      re-rendering it and is banned everywhere. Generations, survivors, and
+      children are <em>recomputed</em> identically by every browser from the
+      same signed facts — there's no vote server, and no consensus round, to
+      trust.
     </p>
 
-    <h2>proof of sheep</h2>
+    <h2>the original electric sheep</h2>
     <p>
-      Voting costs a render — specifically, <em>one full loop of the sheep's
-      animation</em>. Your browser renders all 64 frames of the loop under a
-      challenge derived from your key and the current generation, and signs
-      the hash of each frame's work. The frames you just proved replay as an
-      animation on the card: the work is the ballot, the art is the work, and
-      the receipt is a dancing sheep. Anyone can later re-render any one frame
-      (1/64th of the work) and catch a forged vote — your browser quietly does
-      this to other peers' votes in the background, and a confirmed forgery
-      becomes a fraud proof everyone can check, discrediting that key's votes
-      everywhere. There is no vote server to trust. You can watch the
-      machinery agree with itself on the
-      <a href="determinism.html">determinism page</a>.
-      Votes also allocate beauty: every peer re-renders well-loved sheep at
-      higher quality — since no pixels are ever shared, the flock's favorites
-      sharpen on every screen at once, each machine doing its own deeper
-      render of the same deterministic genome.
+      Scott Draves launched Electric Sheep in 1999 as a screensaver that, when
+      your computer idled, joined a distributed <em>render farm</em>: thousands
+      of machines collectively rendering short fractal-flame animations and
+      sending the finished clips to a central server. Viewers voted with the
+      arrow keys; popular sheep were bred by genetic crossover and mutation into
+      new ones. It was one of the first large-scale collaborative, evolving
+      artworks — a flock with no single author.
     </p>
-
-    <h2>generations</h2>
     <p>
-      Every 5 minutes a generation closes. The top sheep by net votes survive;
-      they pair up and their children are born. Death is in your hands too:
-      the ✕ button is a vote <em>against</em> — it costs the same render proof
-      as a vote for (you must watch a sheep to condemn it), and any sheep
-      voted net-negative is culled at the close. Each active generation also
-      births two high-rate <em>mutant</em> clones of the top survivors and one
-      <em>immigrant</em> — a fresh random genome derived from nothing but the
-      generation number — so the gene pool never stagnates. Nobody computes
-      any of this for you — every browser derives the same survivors,
-      mutants, immigrants and children from the same votes, because breeding
-      is deterministic too. That's also why the breeding preview is honest:
-      pick any two living sheep and you see <em>the exact child</em> they
-      would have this generation, before it's born. Releasing a sheep you
-      bred costs a render proof, which doubles as your vote for it.
-    </p>
-
-    <h2>the swarm</h2>
-    <p>
-      Sheep and votes travel peer-to-peer as signed, immutable facts; every
-      visitor stores what they've seen and forwards it to peers who missed it.
-      The current build networks across browser tabs (open
-      <a href="index.html?peer=2">?peer=2</a> beside the flock and watch them
-      sync); the same protocol rides js-libp2p between strangers next.
+      This version keeps the soul — community rendering, voting, genetic
+      breeding — and removes the center. There's no server and no central
+      farm: rendering happens peer-to-peer, the rendering work <em>is</em> the
+      vote and is cryptographically verifiable, and the sheep travel as signed
+      facts that every browser stores and forwards. The original trusted a
+      server to render and tally honestly; here, every pixel and every vote is
+      something you can check yourself.
     </p>
 
     <p>
-      Code: <code>wasm-sheep</code> — Rust → WASM renderer, vanilla JS,
-      no frameworks, no build step, no server.
-      Fractal flames by <a href="https://flam3.com/">Scott Draves</a>.
+      Code: <code>wasm-sheep</code> — Rust → WASM renderer, vanilla JS, no
+      frameworks, no build step, no server. Fractal flames by
+      <a href="https://flam3.com/">Scott Draves</a>.
     </p>
   </main>
   <footer>
