@@ -32,10 +32,15 @@ em { color: #c8b06a; font-style: normal; }
 }
 
 .meta {
-  display: flex; gap: 8px; align-items: baseline;
+  display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: baseline;
   padding: 4px 1px; font-size: 12px; color: #8d8da4;
 }
+/* Name (+ backing count, pushed right) takes the first row; the buttons wrap to
+   their own row so they can never overflow a narrow (~200px) card into its
+   neighbour. white-space:nowrap keeps "back ▲" on one line. */
+.meta > a { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
 .meta .tally { color: #c8b06a; margin-left: auto; }
+.meta button { white-space: nowrap; }
 
 /* per-card tile totals (you vs swarm) — quiet line under the meta row. */
 .card .tiles { padding: 0 1px 2px; font-size: 11px; color: #62627a; }
