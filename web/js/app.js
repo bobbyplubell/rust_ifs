@@ -211,6 +211,21 @@ async function main() {
     updateStatus();     // shows the activity pulse + credit balance
     batchActivity = 0;  // reset the per-tick pulse after showing it
   }, 1000);
+  // A backgrounded or slept tab has its timers throttled/frozen, so the 1 Hz
+  // gen-advance tick above stops firing — and the displayed flock freezes at an
+  // OLD generation (showing immigrants from a fresh-blood window that has since
+  // slid past). That's the "overnight client shows different sheep" bug: same
+  // code, same facts, but a stale snapshot. On becoming visible again, force a
+  // catch-up to the CURRENT generation so every client at gen G shows the same
+  // flock.
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && gen() !== shownGen) {
+      shownGen = gen();
+      voteSeqByGen.clear();
+      creditsDirty = true;
+      scheduleRebuild();
+    }
+  });
   updateStatus();
 }
 
