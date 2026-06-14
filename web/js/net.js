@@ -17,10 +17,12 @@
 //   {kind:'fraud',   record}                       confirmed-on-receipt fraud proof
 //   {kind:'inv',     from, d}                       per-(kind,gen) digests
 //   {kind:'cov',     from, c}                       per-sheep batch-key-set digests
-//   {kind:'bucket',  to, what, gen, keys}           keys for one mismatched bucket
-//   {kind:'covreq',  to, sheepId}                   ask for a sheep's batch keys
-//   {kind:'covkeys', to, sheepId, keys}             reply: that sheep's batch keys
-//   {kind:'want-items', to, what, keys}             pull specific records
+//   {kind:'bucket',  from, to, what, gen, keys}     keys for one mismatched bucket
+//   {kind:'covreq',  from, to, sheepId}             ask for a sheep's batch keys
+//   {kind:'covkeys', from, to, sheepId, keys}       reply: that sheep's batch keys
+//   {kind:'want-items', from, to, what, keys}       pull specific records
+// (from is REQUIRED on every addressed reply — handlers answer `to: msg.from`;
+//  omitting it routes the fill to `undefined` and the payload is silently dropped.)
 //   {kind:'data',    to, sheep, batches, fraud}     anti-entropy fill, addressed
 //   {kind:'want-render', from, sheepId, frame}      ask for a frame's merged hist
 //   {kind:'render-data', to, sheepId, frame, buf, batchKeys}  the heavy hist (addressed)
@@ -601,7 +603,7 @@ export class Net {
         if (sent >= 24) return; // bound per-inv repair work
         if (digests[kind][g] !== (msg.d[kind] ?? {})[g]) {
           this._send({
-            kind: 'bucket', to: msg.from, what: kind, gen: Number(g),
+            kind: 'bucket', from: this.pubHex, to: msg.from, what: kind, gen: Number(g),
             keys: keys[kind].get(Number(g)) ?? [],
           });
           sent++;
@@ -621,7 +623,7 @@ export class Net {
     for (const sheepId of sheepIds) {
       if (sent >= 24) return;
       if (covDigests[sheepId] !== msg.c[sheepId]) {
-        this._send({ kind: 'covreq', to: msg.from, sheepId });
+        this._send({ kind: 'covreq', from: this.pubHex, to: msg.from, sheepId });
         sent++;
       }
     }
@@ -630,7 +632,7 @@ export class Net {
   async _onCovReq(msg) {
     if (msg.to !== this.pubHex || !msg.sheepId) return;
     const keys = (await this.store.batchesForSheep(msg.sheepId)).map((b) => b.key ?? batchKey(b));
-    this._send({ kind: 'covkeys', to: msg.from, sheepId: msg.sheepId, keys });
+    this._send({ kind: 'covkeys', from: this.pubHex, to: msg.from, sheepId: msg.sheepId, keys });
   }
 
   async _onCovKeys(msg) {
@@ -638,7 +640,7 @@ export class Net {
     const mine = new Set((await this.store.batchesForSheep(msg.sheepId)).map((b) => b.key ?? batchKey(b)));
     const want = msg.keys.filter((k) => !mine.has(k));
     if (want.length) {
-      this._send({ kind: 'want-items', to: msg.from, what: 'batches', keys: want });
+      this._send({ kind: 'want-items', from: this.pubHex, to: msg.from, what: 'batches', keys: want });
     }
   }
 
@@ -655,7 +657,7 @@ export class Net {
     // Request records we lack (they answer with 'data').
     const want = [...theirs].filter((k) => !mine.has(k));
     if (want.length) {
-      this._send({ kind: 'want-items', to: msg.from, what: msg.what, keys: want });
+      this._send({ kind: 'want-items', from: this.pubHex, to: msg.from, what: msg.what, keys: want });
     }
   }
 
