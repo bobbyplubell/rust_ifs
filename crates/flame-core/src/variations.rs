@@ -188,7 +188,22 @@ impl Variation {
         // Precompute the common scalars.
         let r2 = x * x + y * y;
         let r = r2.sqrt();
-        let theta = fmath::atan2(x, y); // angle from +y
+        // `theta` (angle from +y, atan2(x, y)) is needed by fewer than half the
+        // variations; the unconditional atan2 was pure overhead for the common
+        // ones (Linear, Spherical, …). Compute it lazily, memoized so a variation
+        // that reads it more than once still pays for one atan2 — and the value is
+        // bit-identical to the eager version wherever it is used.
+        let mut theta_memo: Option<f64> = None;
+        let mut theta = || -> f64 {
+            match theta_memo {
+                Some(t) => t,
+                None => {
+                    let t = fmath::atan2(x, y); // angle from +y
+                    theta_memo = Some(t);
+                    t
+                }
+            }
+        };
         // Guard against division by zero on the degenerate origin point.
         let inv_r = if r > 1e-12 { 1.0 / r } else { 0.0 };
 
@@ -204,21 +219,37 @@ impl Variation {
                 (x * s - y * c, x * c + y * s)
             }
             Variation::Horseshoe => (inv_r * (x - y) * (x + y), inv_r * 2.0 * x * y),
-            Variation::Polar => (theta / PI, r - 1.0),
-            Variation::Handkerchief => (r * fmath::sin(theta + r), r * fmath::cos(theta - r)),
-            Variation::Heart => (r * fmath::sin(theta * r), -r * fmath::cos(theta * r)),
+            Variation::Polar => (theta() / PI, r - 1.0),
+            Variation::Handkerchief => {
+                let theta = theta();
+                (r * fmath::sin(theta + r), r * fmath::cos(theta - r))
+            }
+            Variation::Heart => {
+                let theta = theta();
+                (r * fmath::sin(theta * r), -r * fmath::cos(theta * r))
+            }
             Variation::Disc => {
-                let t = theta / PI;
+                let t = theta() / PI;
                 let (s, c) = fmath::sincos(PI * r);
                 (t * s, t * c)
             }
-            Variation::Spiral => (
-                inv_r * (fmath::cos(theta) + fmath::sin(r)),
-                inv_r * (fmath::sin(theta) - fmath::cos(r)),
-            ),
-            Variation::Hyperbolic => (fmath::sin(theta) * inv_r, r * fmath::cos(theta)),
-            Variation::Diamond => (fmath::sin(theta) * fmath::cos(r), fmath::cos(theta) * fmath::sin(r)),
+            Variation::Spiral => {
+                let theta = theta();
+                (
+                    inv_r * (fmath::cos(theta) + fmath::sin(r)),
+                    inv_r * (fmath::sin(theta) - fmath::cos(r)),
+                )
+            }
+            Variation::Hyperbolic => {
+                let theta = theta();
+                (fmath::sin(theta) * inv_r, r * fmath::cos(theta))
+            }
+            Variation::Diamond => {
+                let theta = theta();
+                (fmath::sin(theta) * fmath::cos(r), fmath::cos(theta) * fmath::sin(r))
+            }
             Variation::Ex => {
+                let theta = theta();
                 let p0 = fmath::sin(theta + r);
                 let p1 = fmath::cos(theta - r);
                 let (p0, p1) = (p0 * p0 * p0, p1 * p1 * p1);
@@ -227,7 +258,7 @@ impl Variation {
             Variation::Julia => {
                 let sqrt_r = r.sqrt();
                 let omega = if rng.chance(0.5) { 0.0 } else { PI };
-                let a = theta / 2.0 + omega;
+                let a = theta() / 2.0 + omega;
                 (sqrt_r * fmath::cos(a), sqrt_r * fmath::sin(a))
             }
             Variation::Exponential => {
@@ -236,7 +267,7 @@ impl Variation {
                 (e * c, e * s)
             }
             Variation::Power => {
-                let (s, c) = fmath::sincos(theta);
+                let (s, c) = fmath::sincos(theta());
                 let m = fmath::pow(r, s);
                 (m * c, m * s)
             }
@@ -286,6 +317,7 @@ impl Variation {
                 let low = pvals[pval::BLOB_LOW];
                 let high = pvals[pval::BLOB_HIGH];
                 let waves = pvals[pval::BLOB_WAVES];
+                let theta = theta();
                 let pr = r * (low + 0.5 * (high - low) * (fmath::sin(waves * theta) + 1.0));
                 let (s, c) = fmath::sincos(theta);
                 (pr * c, pr * s) // paper V23: (cos, sin)
@@ -302,6 +334,7 @@ impl Variation {
                 // Paper V25: t = theta + p2 - p1*trunc(2*theta*p2 / p1).
                 let p1 = PI * (pvals[pval::FAN2_X] * pvals[pval::FAN2_X]) + 1e-10;
                 let p2 = pvals[pval::FAN2_Y];
+                let theta = theta();
                 let t = theta + p2 - p1 * (2.0 * theta * p2 / p1).trunc();
                 let a = if t > p1 * 0.5 { theta - p1 * 0.5 } else { theta + p1 * 0.5 };
                 let (s, c) = fmath::sincos(a);
@@ -310,7 +343,7 @@ impl Variation {
             Variation::Rings2 => {
                 let p = pvals[pval::RINGS2_VAL] * pvals[pval::RINGS2_VAL] + 1e-10;
                 let t = r - 2.0 * p * ((r + p) / (2.0 * p)).trunc() + r * (1.0 - p);
-                let (s, c) = fmath::sincos(theta);
+                let (s, c) = fmath::sincos(theta());
                 (t * s, t * c)
             }
             Variation::Pdj => {
@@ -344,12 +377,13 @@ impl Variation {
             Variation::Rings => {
                 let c2 = affine.c * affine.c + 1e-10;
                 let t = (r + c2).rem_euclid(2.0 * c2) - c2 + r * (1.0 - c2);
-                let (s, c) = fmath::sincos(theta);
+                let (s, c) = fmath::sincos(theta());
                 (t * c, t * s) // paper V21: (cos, sin)
             }
             Variation::Fan => {
                 let t = PI * (affine.c * affine.c) + 1e-10;
                 let half = t * 0.5;
+                let theta = theta();
                 let a = if (theta + affine.f).rem_euclid(t) > half {
                     theta - half
                 } else {
