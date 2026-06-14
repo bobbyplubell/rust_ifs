@@ -12,6 +12,7 @@ import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { identify } from '@libp2p/identify';
 import { bootstrap } from '@libp2p/bootstrap';
 import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
+import { multiaddr } from '@multiformats/multiaddr';
 import { TOPIC, DISCOVERY_TOPIC, RELAY_TOPIC, enc, dec } from './common.js';
 
 // Public STUN servers (used unless the caller passes its own). STUN is a cheap,
@@ -125,6 +126,23 @@ export async function createLibp2pTransport({ relays, stun }) {
       dialPeer(p.id);
     }
   }, 6000 + Math.floor(Math.random() * 2000));
+
+  // Reconnect watchdog: browsers drop the relay link on sleep / network change /
+  // long idle, and libp2p's own recovery can stall (background timers throttle).
+  // Re-dial any bootstrap relay we've lost — periodically and immediately when
+  // the tab regains focus — so the swarm reconnects after a break.
+  const ensureRelays = () => {
+    for (const r of relays) {
+      const id = r.split('/p2p/').pop();
+      if (!id) continue;
+      if (node.getConnections().some((c) => c.remotePeer.toString() === id)) continue;
+      node.dial(multiaddr(r)).catch(() => { /* will retry next tick */ });
+    }
+  };
+  setInterval(ensureRelays, 10_000);
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) ensureRelays(); });
+  }
 
   let handler = null;
   node.services.pubsub.addEventListener('message', (evt) => {
