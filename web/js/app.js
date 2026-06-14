@@ -197,6 +197,7 @@ async function main() {
   // keeps its pool free instead of constantly contributing).
   if (!params.get('nocontribute')) startContributeLoop();
 
+  startVersionPoll();
   shownGen = gen();
   setInterval(() => {
     if (gen() !== shownGen) {
@@ -211,6 +212,33 @@ async function main() {
     batchActivity = 0;  // reset the per-tick pulse after showing it
   }, 1000);
   updateStatus();
+}
+
+// ---- auto-update on new deploy ----------------------------------------------
+//
+// The on-screen flock is a deterministic function of (wall-clock generation,
+// synced facts, AND this JS code version): two clients on DIFFERENT bundles
+// compute DIFFERENT flocks from the same facts and diverge. A tab left open for
+// days never reloads, so it silently falls behind newer deploys. Poll the build
+// stamp and reload once when it changes, so long-running clients converge on the
+// latest code with everyone else.
+const VERSION_POLL_MS = 5 * 60_000; // re-check the deployed build every 5 min
+const VERSION_SETTLE_MS = 60_000;   // let the page settle before the first poll
+function startVersionPoll() {
+  // buildVersion (set via versionReady at load) is the version THIS page is
+  // running. It's fixed for the life of the tab, so after a reload it equals the
+  // freshly deployed build → fetched === loaded → no further reload. That's the
+  // loop guard: we reload exactly once per deploy.
+  setTimeout(() => setInterval(async () => {
+    const loaded = buildVersion;
+    if (!loaded) return; // never reloaded with an unknown loaded version
+    const fetched = await fetch('version.txt', { cache: 'no-store' })
+      .then((r) => (r.ok ? r.text() : '')).then((t) => t.trim()).catch(() => '');
+    if (fetched && loaded && fetched !== loaded) {
+      console.log('new build ' + fetched + ' (was ' + loaded + ') — reloading to stay in sync');
+      location.reload();
+    }
+  }, VERSION_POLL_MS), VERSION_SETTLE_MS);
 }
 
 // ---- generation engine glue --------------------------------------------------

@@ -100,6 +100,10 @@
 
     let me, store, net, record = null, banned = new Set();
 
+    // Build stamp this page loaded with (set once, at first successful
+    // version.txt fetch below). Fixed for the life of the tab — see startVersionPoll.
+    let loadedVersion = '';
+
     // Per-frame state. acc: raw histogram (only for the LRU working set);
     // covered: idx values merged into acc; bitmap: last tonemapped ImageBitmap
     // (cheap, always kept); preview: placeholder ImageBitmap before any batches.
@@ -469,6 +473,30 @@
       return null;
     }
 
+    // ---- auto-update on new deploy --------------------------------------------
+    //
+    // The animated loop is a deterministic function of (wall-clock generation,
+    // synced facts, AND this JS code version): a tab left open for days never
+    // reloads and silently falls behind newer deploys, diverging from freshly-
+    // loaded clients. Poll the build stamp and reload once when it changes.
+    const VERSION_POLL_MS = 5 * 60_000; // re-check the deployed build every 5 min
+    const VERSION_SETTLE_MS = 60_000;   // let the page settle before the first poll
+    function startVersionPoll() {
+      // loadedVersion (set at startup) is the build THIS page is running; fixed
+      // for the tab's life, so after a reload it equals the freshly deployed
+      // build → fetched === loaded → no further reload. Reloads once per deploy.
+      setTimeout(() => setInterval(async () => {
+        const loaded = loadedVersion;
+        if (!loaded) return; // unknown loaded version → never reload
+        const fetched = await fetch('version.txt', { cache: 'no-store' })
+          .then((r) => (r.ok ? r.text() : '')).then((t) => t.trim()).catch(() => '');
+        if (fetched && loaded && fetched !== loaded) {
+          console.log('new build ' + fetched + ' (was ' + loaded + ') — reloading to stay in sync');
+          location.reload();
+        }
+      }, VERSION_POLL_MS), VERSION_SETTLE_MS);
+    }
+
     // ---- boot -----------------------------------------------------------------
 
     async function main() {
@@ -483,6 +511,14 @@
       }
       $('#sheep-id').textContent = id;
       $('#info').textContent = provenance(record).how;
+
+      // Record the build this page loaded with, then poll for new deploys.
+      // (The libp2p cache-bust below also captures this, but it's gated on
+      // having relays; fetch it here so the auto-reload works regardless.)
+      fetch('version.txt', { cache: 'no-store' })
+        .then((r) => (r.ok ? r.text() : '')).then((t) => { if (t.trim() && !loadedVersion) loadedVersion = t.trim(); })
+        .catch(() => {});
+      startVersionPoll();
 
       // Bind resolution to THIS sheep's render spec (keyed to its birth gen),
       // so a future higher-res spec for new sheep renders correctly here.
@@ -529,6 +565,7 @@
             // GitHub Pages caches the 620 KB bundle 10 min, so a fix wouldn't
             // reach a returning peer without this.
             const ver = await fetch('version.txt', { cache: 'no-store' }).then((r) => (r.ok ? r.text() : '')).then((t) => t.trim()).catch(() => '');
+            if (ver && !loadedVersion) loadedVersion = ver; // capture the build this page loaded with
             const { createLibp2pTransport } = await import(`./js/vendor/libp2p.js${ver ? `?v=${ver}` : ''}`);
             const lp = await createLibp2pTransport({ relays });
             transport.add(lp);
