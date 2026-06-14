@@ -74,7 +74,9 @@ let buildVersion = '';
 // Pages serves the 620 KB bundle with a 10-min cache, so without busting a
 // connectivity fix can't reach a returning peer until that cache expires — the
 // "I deployed but it didn't take effect" trap.
-const versionReady = fetch('version.txt')
+// no-store: version.txt must be read FRESH, or its own 10-min cache hands back a
+// stale build id and we'd cache-bust the bundle to the wrong (old) version.
+const versionReady = fetch('version.txt', { cache: 'no-store' })
   .then((r) => (r.ok ? r.text() : '')).then((t) => (buildVersion = t.trim())).catch(() => '');
 let shownGen = -1;
 let lastPrune = 0;          // throttle render-cache eviction (Date.now() ms)

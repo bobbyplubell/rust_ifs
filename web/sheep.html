@@ -522,7 +522,7 @@
             // Cache-bust the bundle against the build stamp (see app.js note):
             // GitHub Pages caches the 620 KB bundle 10 min, so a fix wouldn't
             // reach a returning peer without this.
-            const ver = await fetch('version.txt').then((r) => (r.ok ? r.text() : '')).then((t) => t.trim()).catch(() => '');
+            const ver = await fetch('version.txt', { cache: 'no-store' }).then((r) => (r.ok ? r.text() : '')).then((t) => t.trim()).catch(() => '');
             const { createLibp2pTransport } = await import(`./js/vendor/libp2p.js${ver ? `?v=${ver}` : ''}`);
             const lp = await createLibp2pTransport({ relays });
             transport.add(lp);
