@@ -801,8 +801,25 @@ function pickFrame(entry) {
   return entry.covered.size < FRAME0_MIN ? CARD_FRAME : leastCoveredFrame(entry);
 }
 
+// idx is just a sample-batch SEED (chunk_seed = sha256(challenge ‖ le32(idx))),
+// so ANY distinct u32 is a valid, independently-verifiable batch — tiles needn't
+// be contiguous. Pick a RANDOM free idx from a large space rather than the
+// lowest: the lowest-first scan only avoids duplicate work when coverage is
+// SHARED (synced). Two peers contributing while unsynced both grind 0,1,2,… and
+// render byte-identical duplicate tiles — so the slower peer's work is mostly a
+// dupe of the faster one's, and the union after they finally sync is ~max(A,B)
+// instead of ~A+B. Random picks make blind concurrent work disjoint (two subsets
+// of a few thousand in a 16M space collide ~never), so unsynced peers' tiles
+// ADD UP. Synced peers still skip covered idxs, so no double-work within a shared
+// set either. Falls back to a dense scan only if a region ever saturates (it
+// won't at <1% density). No protocol/golden impact: idx N still renders the same.
+const IDX_SPACE = 1 << 24;
 function nextFreeIdx(entry, frame) {
   const cov = coveredFor(entry, frame);
+  for (let t = 0; t < 64; t++) {
+    const i = Math.floor(Math.random() * IDX_SPACE);
+    if (!cov.has(i)) return i;
+  }
   let i = 0;
   while (cov.has(i)) i++;
   return i;
