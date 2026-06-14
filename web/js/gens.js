@@ -225,7 +225,13 @@ export async function computeFlock({
       const taken = new Set(survivors.map((r) => r.id));
       const fill = [...living.values()]
         .filter((r) => !taken.has(r.id) && !condemned.has(r.id))
-        .sort((a, b) => b.gen - a.gen || (a.id < b.id ? -1 : 1))
+        // Prefer ESTABLISHED sheep (curated genesis + bred) over random
+        // immigrants for the spare slots: a fresh-blood tick must never churn
+        // the curated flock out — immigrants only take slots nothing else wants.
+        // Then newest-first among equals (deterministic).
+        .sort((a, b) =>
+          ((a.origin === 'immigrant' ? 1 : 0) - (b.origin === 'immigrant' ? 1 : 0))
+          || b.gen - a.gen || (a.id < b.id ? -1 : 1))
         .slice(0, SURVIVORS_K - survivors.length);
       survivors.push(...fill);
     }
