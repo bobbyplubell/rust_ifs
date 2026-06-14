@@ -24,6 +24,7 @@ import { circuitRelayServer } from '@libp2p/circuit-relay-v2';
 import { noise } from '@chainsafe/libp2p-noise';
 import { yamux } from '@chainsafe/libp2p-yamux';
 import { gossipsub } from '@chainsafe/libp2p-gossipsub';
+import { createPeerScoreParams } from '@chainsafe/libp2p-gossipsub/score';
 import { identify } from '@libp2p/identify';
 import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
 import { multiaddr } from '@multiformats/multiaddr';
@@ -88,6 +89,23 @@ const node = await createLibp2p({
     pubsub: gossipsub({
       allowPublishToZeroTopicPeers: true,
       D: 64, Dlo: 32, Dhi: 128, Dscore: 48, Dout: 16,
+      // Neutralize the peer-score penalties that would evict live subscribers
+      // from the mesh. This relay sits behind Caddy, so EVERY peer appears to
+      // come from one IP (the proxy) — the default IP-colocation penalty (-5
+      // over 10 peers) would then tank them all at once. And churny browser
+      // reconnects rack up the behavioural penalty (-10, quadratic). gossipsub
+      // refuses to GRAFT a negative-score peer, so either penalty leaves the
+      // relay with subscribers>0 but mesh=0 — connected, yet forwarding to no
+      // one, so every browser shows 0 peers (a restart only resets it until the
+      // scores re-accumulate). A backbone hub holds no authority and trusts no
+      // peer's data anyway (everything is signed + verified downstream), so
+      // adversarial scoring is pure downside here: zero both weights. With no
+      // per-topic score params set, every other score component is already 0,
+      // so scores stay ≥ 0 and subscribers are always graftable.
+      scoreParams: createPeerScoreParams({
+        IPColocationFactorWeight: 0,
+        behaviourPenaltyWeight: 0,
+      }),
     }),
   },
 });
