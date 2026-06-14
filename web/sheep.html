@@ -107,7 +107,17 @@
     let HIST_CELLS = W * SS * H * SS * 4;
     const LOOP_MS = 14_000;
     const HIST_LRU_CAP = 8;     // frames holding raw histograms (the working set)
-    let PREVIEW = { width: W, height: H, samples: 200_000, seed: 7 };
+    // Seed previews are low-res, low-sample PLACEHOLDERS: rendered fast for
+    // EVERY frame so the whole loop animates within a second, then replaced in
+    // place by the sharp full-res bitmaps as batches refine / arrive from the
+    // swarm. Cap the long edge (the canvas scales it up on draw) and keep the
+    // sample count low — real quality comes from the actual render, not these.
+    const PREV_DIM = 256;
+    const previewSpec = (w, h) => {
+      const s = Math.min(1, PREV_DIM / Math.max(w, h));
+      return { width: Math.max(1, Math.round(w * s)), height: Math.max(1, Math.round(h * s)), samples: 100_000, seed: 7 };
+    };
+    let PREVIEW = previewSpec(W, H);
 
     const pool = new WorkerPool(Number(params.get('workers')) || undefined);
     const cv = $('#cv');
@@ -266,40 +276,20 @@
         || frames[0].bitmap || frames[0].preview || null,
     });
 
-    // ---- loading status + boomerang-while-loading ----------------------------
+    // ---- loading status -------------------------------------------------------
     //
-    // A frame has REAL rendered content once it holds a tonemapped `bitmap`
-    // (built from accumulated batches) — as opposed to just a quick `preview`.
-    // While frames are still filling in, the FrameLoop boomerangs over the
-    // CONTIGUOUS span of ready frames starting at 0, so playback is always
-    // moving with whatever the swarm has delivered rather than stalling on
-    // un-filled frames; the span widens as frames land. Once every frame is
-    // ready we clear the range and resume the normal full forward loop.
+    // The full forward loop ALWAYS plays: every frame draws its sharp `bitmap`
+    // if it has one, else its low-res `preview` placeholder (see the loop's
+    // getFrame), so the animation is smooth from the first second and each frame
+    // upgrades IN PLACE as its batches refine or arrive from the swarm. No
+    // boomerang, no range gating — the status line just reports how many frames
+    // have sharpened past the placeholder.
     const frameReady = (f) => !!frames[f].bitmap;
-    function readyCount() {
-      let n = 0;
-      for (let f = 0; f < N_FRAMES; f++) if (frameReady(f)) n++;
-      return n;
-    }
-    // Largest hi such that frames 0..hi are all ready (the contiguous span we
-    // can boomerang smoothly over without hitting a gap).
-    function contiguousReadyHi() {
-      let hi = -1;
-      while (hi + 1 < N_FRAMES && frameReady(hi + 1)) hi++;
-      return hi;
-    }
     function updateLoadingStatus() {
-      const ready = readyCount();
-      const hi = contiguousReadyHi();
-      if (ready >= N_FRAMES) {
-        loop.setRange(null);                 // all in → normal forward loop
-        $('#loading').textContent = 'frames ready';
-      } else {
-        // Boomerang across the contiguous span [0..hi] (needs ≥2 frames to
-        // move; a single ready frame just holds until a neighbour lands).
-        loop.setRange(0, hi);
-        $('#loading').textContent = `frames ${ready}/${N_FRAMES} ready`;
-      }
+      let ready = 0;
+      for (let f = 0; f < N_FRAMES; f++) if (frameReady(f)) ready++;
+      $('#loading').textContent = ready >= N_FRAMES
+        ? 'frames sharp' : `sharpening ${ready}/${N_FRAMES}`;
     }
     setInterval(updateLoadingStatus, 500);
 
@@ -726,7 +716,7 @@
       const spec = specForGen(record.gen);
       W = spec.width; H = spec.height; SS = spec.ss; N_FRAMES = spec.nFrames;
       HIST_CELLS = specCells(spec);
-      PREVIEW = { width: W, height: H, samples: 200_000, seed: 7 };
+      PREVIEW = previewSpec(W, H);
       cv.width = W; cv.height = H;
 
       // Instant first paint of frame 0: the flock card's already-rendered pixels.
@@ -839,8 +829,16 @@
         }
         showSamples();
 
-        // (2) Preview EVERYTHING first (placeholder only where not yet sharp).
-        for (let f = 0; f < N_FRAMES; f++) makePreview(f).catch(console.error);
+        // (2) Preview EVERY frame up front — cheap low-res placeholders, nearest
+        // the playhead first so the on-screen region animates immediately. The
+        // full loop plays preview-or-sharp from the first second; no gating.
+        const cur0 = loop.currentFrame();
+        const previewOrder = Array.from({ length: N_FRAMES }, (_, f) => f).sort((a, b) => {
+          const da = Math.min(Math.abs(a - cur0), N_FRAMES - Math.abs(a - cur0));
+          const db = Math.min(Math.abs(b - cur0), N_FRAMES - Math.abs(b - cur0));
+          return da - db;
+        });
+        for (const f of previewOrder) makePreview(f).catch(console.error);
 
         // (3) Bounded parallel refine, playback-proximity first. Order the
         // covered frames by distance from the current playhead so the visible

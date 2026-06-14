@@ -2,14 +2,15 @@
 //
 // A single requestAnimationFrame ticker draws an N-frame loop onto a canvas,
 // cross-fading adjacent frames so playback is smooth even at a low frame count
-// (64 frames over 14 s is ~4.6 fps — pure stepping without the cross-fade) and
+// (128 frames over 14 s is ~9 fps — pure stepping without the cross-fade) and
 // regardless of when, or whether, each frame is ready.
 //
 // The player NEVER renders. It only draws whatever `getFrame(i)` returns *right
 // now* — an ImageBitmap / canvas, or null if that frame isn't ready yet. So the
-// renderer and the display are fully decoupled: frames can pop in, upgrade in
-// quality, or be missing, and the loop keeps playing smoothly. rAF also
-// auto-throttles when the tab is backgrounded.
+// renderer and the display are fully decoupled: the FULL forward loop always
+// plays, and each frame can pop in or UPGRADE IN PLACE (a fuzzy low-res preview
+// → a sharp full-res render) without ever stalling or restricting playback. rAF
+// also auto-throttles when the tab is backgrounded.
 export class FrameLoop {
   constructor(canvas, { nFrames, loopMs = 14_000, getFrame }) {
     this.cv = canvas;
@@ -18,33 +19,14 @@ export class FrameLoop {
     this.loopMs = loopMs;
     this.getFrame = getFrame;
     this.running = false;
-    // Boomerang range: while the swarm is still filling frames in, playback
-    // ping-pongs over the CONTIGUOUS span [lo..hi] of frames that actually have
-    // rendered content, so it's always moving instead of stalling on gaps. Set
-    // to null (the default) for the normal full forward 0..n loop. setRange()
-    // updates this live as more frames become ready, and clearing it (null)
-    // resumes the full loop once everything's in.
-    this.range = null;
     this._raf = (t) => this._tick(t);
   }
 
-  // Drive boomerang playback over a contiguous ready span. Pass null/undefined
-  // (or the full 0..n-1 span) to resume the normal forward loop.
-  setRange(lo, hi) {
-    if (lo == null || hi == null || hi <= lo || (lo === 0 && hi >= this.n - 1)) {
-      this.range = null;
-    } else {
-      this.range = { lo, hi };
-    }
-  }
-
-  // The integer frame index currently on screen (respecting the boomerang
-  // range), for callers that want to prioritize work near the playhead. Pure
-  // read of the same clock the ticker draws from — no side effects.
+  // The integer frame index currently on screen, for callers that want to
+  // prioritize work near the playhead. Pure read of the same clock the ticker
+  // draws from — no side effects.
   currentFrame(now = performance.now()) {
-    const pos = this._position(now);
-    const hi = this.range ? this.range.hi : this.n - 1;
-    return Math.min(Math.floor(pos), hi);
+    return Math.min(Math.floor(this._position(now)), this.n - 1);
   }
 
   start() {
@@ -53,18 +35,9 @@ export class FrameLoop {
 
   stop() { this.running = false; }
 
-  // The (fractional) frame position to draw at time `now`. Normally a forward
-  // sweep over 0..n; in boomerang mode a triangle wave over [lo..hi] so the
-  // span is traversed forward then reverse with no jump-cut at the ends.
+  // The (fractional) frame position to draw at time `now`: a forward sweep over 0..n.
   _position(now) {
-    const t = (now % this.loopMs) / this.loopMs; // 0..1 phase of the loop
-    if (this.range) {
-      const { lo, hi } = this.range;
-      const span = hi - lo;                       // # of steps one-way
-      const tri = 1 - Math.abs(1 - 2 * t);        // 0→1→0 triangle wave
-      return lo + tri * span;
-    }
-    return t * this.n;
+    return ((now % this.loopMs) / this.loopMs) * this.n;
   }
 
   _tick(now) {
@@ -72,16 +45,12 @@ export class FrameLoop {
     const { cv, ctx, n } = this;
     if (cv.width && cv.height) {
       const pos = this._position(now);
-      // Clamp the upper neighbour to the active span so the cross-fade never
-      // reaches past the ready frames (or wraps) while boomeranging.
-      const hi = this.range ? this.range.hi : n - 1;
-      const i = Math.min(Math.floor(pos), hi);
+      const i = Math.min(Math.floor(pos), n - 1);
       // Ease the cross-fade with smoothstep instead of a linear ramp: at any
-      // frame count (64, 128, …) the discrete keyframes blend with a soft S-curve
-      // so the transition reads as continuous motion rather than a stepped
-      // dissolve — the fix for "N frames still isn't smooth enough".
+      // frame count the discrete keyframes blend with a soft S-curve so the
+      // transition reads as continuous motion rather than a stepped dissolve.
       const frac = smoothstep(pos - Math.floor(pos));
-      const next = this.range ? Math.min(i + 1, hi) : (i + 1) % n;
+      const next = (i + 1) % n;
       const a = this.getFrame(i) || null;
       const b = this.getFrame(next) || a; // hold on a if the next isn't ready
       if (a) {
@@ -100,8 +69,7 @@ export class FrameLoop {
 
 // Smoothstep: 0→0, 1→1, with zero slope at both ends — eases the cross-fade so
 // adjacent keyframes blend on an S-curve, killing the stepped look of a linear
-// dissolve. Pure function of the sub-frame fraction, so boomerang mode (which
-// only changes WHICH frames are picked, not the fraction) keeps working.
+// dissolve.
 function smoothstep(t) {
   return t * t * (3 - 2 * t);
 }
