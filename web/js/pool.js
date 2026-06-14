@@ -12,7 +12,18 @@
 
 export class WorkerPool {
   constructor(size) {
-    this.size = size ?? Math.min(4, Math.max(1, (navigator.hardwareConcurrency || 4) - 1));
+    // Rendering is embarrassingly parallel across batches, so more workers =
+    // proportionally faster accumulation. The old flat cap of 4 left cores idle
+    // on capable machines. Raise the cap only where it's safe: gate on
+    // deviceMemory so we don't cook phones / thrash low-RAM laptops (each worker
+    // holds its own wasm instance). deviceMemory is Chromium-only; Firefox/Safari
+    // report undefined -> fall back to the old conservative cap of 4.
+    this.size = size ?? (() => {
+      const cores = navigator.hardwareConcurrency || 4;
+      const mem = navigator.deviceMemory || 4; // GB; undefined -> 4 (conservative)
+      const cap = mem >= 8 ? 8 : 4;            // beefy box -> up to 8, else stay at 4
+      return Math.max(1, Math.min(cap, cores - 1));
+    })();
     this.queue = [];           // jobs waiting for a worker
     this.running = 0;
     this.chunksRendered = 0;   // session-wide chunk counter (progress msgs with a hash)
