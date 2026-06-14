@@ -44,6 +44,7 @@
   <div id="hud">
     <span id="info">loading…</span>
     <span id="sheep-id" class="id"></span>
+    <span id="loading" class="id"></span>
     <span id="samples" class="id"></span>
     <span id="credits" class="id"></span>
     <button id="contribute">contribute</button>
@@ -214,6 +215,43 @@
       getFrame: (i) => frames[i].bitmap || frames[i].preview
         || frames[0].bitmap || frames[0].preview || null,
     });
+
+    // ---- loading status + boomerang-while-loading ----------------------------
+    //
+    // A frame has REAL rendered content once it holds a tonemapped `bitmap`
+    // (built from accumulated batches) — as opposed to just a quick `preview`.
+    // While frames are still filling in, the FrameLoop boomerangs over the
+    // CONTIGUOUS span of ready frames starting at 0, so playback is always
+    // moving with whatever the swarm has delivered rather than stalling on
+    // un-filled frames; the span widens as frames land. Once every frame is
+    // ready we clear the range and resume the normal full forward loop.
+    const frameReady = (f) => !!frames[f].bitmap;
+    function readyCount() {
+      let n = 0;
+      for (let f = 0; f < N_FRAMES; f++) if (frameReady(f)) n++;
+      return n;
+    }
+    // Largest hi such that frames 0..hi are all ready (the contiguous span we
+    // can boomerang smoothly over without hitting a gap).
+    function contiguousReadyHi() {
+      let hi = -1;
+      while (hi + 1 < N_FRAMES && frameReady(hi + 1)) hi++;
+      return hi;
+    }
+    function updateLoadingStatus() {
+      const ready = readyCount();
+      const hi = contiguousReadyHi();
+      if (ready >= N_FRAMES) {
+        loop.setRange(null);                 // all in → normal forward loop
+        $('#loading').textContent = 'frames ready';
+      } else {
+        // Boomerang across the contiguous span [0..hi] (needs ≥2 frames to
+        // move; a single ready frame just holds until a neighbour lands).
+        loop.setRange(0, hi);
+        $('#loading').textContent = `frames ${ready}/${N_FRAMES} ready`;
+      }
+    }
+    setInterval(updateLoadingStatus, 500);
 
     // ---- samples/pixel readout ------------------------------------------------
 
