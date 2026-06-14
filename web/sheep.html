@@ -325,15 +325,24 @@
       updateTilemap();
     }
     function updateTilemap() {
-      let mineTotal = 0, swarmTotal = 0;
+      // Normalize per-frame density RELATIVE to the best-rendered frame so the
+      // grid always spans the full colour range — a single-hue absolute ramp just
+      // read as "all purple". Empty frame = near-black; then a cool→hot heat ramp
+      // (violet → magenta → red → gold) as the frame sharpens. The true counts
+      // live in the hover title and the #tiles readout below.
+      let mineTotal = 0, swarmTotal = 0, maxF = 1;
+      for (let f = 0; f < N_FRAMES; f++) if (swarmCov[f].total > maxF) maxF = swarmCov[f].total;
       for (let f = 0; f < N_FRAMES; f++) {
         const { mine, total } = swarmCov[f];
         mineTotal += mine; swarmTotal += total;
-        // Heat: brightness encodes the COMBINED density (swarm total includes
-        // your own tiles) — dim = few tiles / fuzzy, bright = sharp. No number;
-        // the exact count lives in the hover title.
-        const t = Math.min(1, total / 24);
-        tileCells[f].style.background = `hsl(265 50% ${Math.round(9 + t * 44)}%)`;
+        if (total === 0) {
+          tileCells[f].style.background = '#14141c';
+        } else {
+          const t = total / maxF;
+          const hue = Math.round((262 + t * 143) % 360); // violet → magenta → red → gold
+          const light = Math.round(26 + t * 36);          // 26% → 62%
+          tileCells[f].style.background = `hsl(${hue} 70% ${light}%)`;
+        }
         tileCells[f].title = `frame ${f}: ${total} tiles (you ${mine} · swarm ${total})`;
       }
       // Per-sheep tile totals HUD readout: your tiles vs the whole swarm's for
