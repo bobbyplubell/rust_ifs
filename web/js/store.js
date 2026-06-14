@@ -95,5 +95,25 @@ export async function openStore() {
       kvPut('renders', `${sheepId}:${frame}`, { buf, keys }),
     getRender: (sheepId, frame) => kvGet('renders', `${sheepId}:${frame}`),
     allRenderKeys: () => kvKeys('renders'),
+    // Evict cached renders for sheep NOT in keepIds (a Set of sheepId). The
+    // render cache is heavy histogram buffers (the dominant storage cost) and is
+    // pure, re-derivable, and synced on-demand only (never via anti-entropy) —
+    // so dropping dead, non-Hall-of-Fame sheep's renders reclaims space with no
+    // re-sync churn. Returns the number evicted. (sheepIds are colon-free hex,
+    // and the key is `${sheepId}:${frame}`, so split(':')[0] recovers the id.)
+    pruneRenders: async (keepIds) => {
+      const keys = await kvKeys('renders');
+      const stale = keys.filter((k) => !keepIds.has(String(k).split(':')[0]));
+      if (stale.length) {
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction('renders', 'readwrite');
+          const os = tx.objectStore('renders');
+          for (const k of stale) os.delete(k);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+        });
+      }
+      return stale.length;
+    },
   };
 }

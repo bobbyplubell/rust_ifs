@@ -77,6 +77,7 @@ let buildVersion = '';
 const versionReady = fetch('version.txt')
   .then((r) => (r.ok ? r.text() : '')).then((t) => (buildVersion = t.trim())).catch(() => '');
 let shownGen = -1;
+let lastPrune = 0;          // throttle render-cache eviction (Date.now() ms)
 let banned = new Set();     // contributors with verified fraud proofs (local view)
 
 async function main() {
@@ -232,9 +233,20 @@ async function rebuildFlock() {
   banned = new Set(net?.banned ?? []);
   for (const f of await store.allFraud()) if (f.contributor) banned.add(f.contributor);
 
-  const { living } = await computeFlock({
+  const { living, history } = await computeFlock({
     store, baked, breedFn, mutateFn, randomFn, banned,
   });
+  // Evict the render cache (heavy histogram buffers, the main storage cost) for
+  // sheep that are neither living nor enshrined in the Hall of Fame. Re-derivable
+  // and on-demand-synced, so this is safe; throttled so it doesn't run every
+  // rebuild. Without it the cache grows unbounded (hundreds of MB seen).
+  if (Date.now() - lastPrune > 60_000) {
+    lastPrune = Date.now();
+    const keep = new Set([...living.keys(), ...history.map((h) => h.record.id)]);
+    store.pruneRenders(keep)
+      .then((n) => { if (n) console.log(`pruned ${n} cached renders`); })
+      .catch(() => {});
+  }
   for (const [id, entry] of cards) {
     if (!living.has(id)) {
       stopReplay(entry);
