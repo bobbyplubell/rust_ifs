@@ -48,6 +48,7 @@ const lpDiag = async () => {
         conns: conns.length,
         // 'rtc' = direct browser-to-browser WebRTC, 'ws' = relay link.
         remotes: conns.map((c) => (c.remoteAddr.toString().includes('webrtc') ? 'rtc' : 'ws')),
+        relaysLS: localStorage.getItem('relays'), // gossip-discovered relays
       };
     });
   } catch (e) { return { err: e.message }; }

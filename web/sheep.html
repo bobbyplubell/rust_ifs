@@ -490,13 +490,14 @@
         sid === id ? record : (await store.allSheep()).find((s) => s.id === sid);
 
       // Self-contained Net: same wiring as app.js so this page is a full peer.
-      const relayOverride = [
-        ...(params.get('relay') ? [params.get('relay')] : []),
-        ...((localStorage.getItem('relays') || '').split(',').map((s) => s.trim()).filter(Boolean)),
-      ];
-      // ?stress pages skip the prod relay unless ?relay= is passed (see app.js).
-      const relays = relayOverride.length ? relayOverride
-        : (params.get('stress') ? [] : RELAYS);
+      // Bootstrap relays MERGED with gossip-discovered ones (localStorage);
+      // ?relay= replaces; ?stress takes none unless explicit. (See app.js.)
+      const explicitRelay = params.get('relay');
+      const discoveredRelays = (localStorage.getItem('relays') || '')
+        .split(',').map((s) => s.trim()).filter(Boolean);
+      const relays = explicitRelay ? [explicitRelay]
+        : params.get('stress') ? []
+        : [...new Set([...RELAYS, ...discoveredRelays])];
       const transport = new CompositeTransport([new BroadcastTransport()]);
       // Connect libp2p in the BACKGROUND so boot (and the contribute button)
       // never blocks on the 620 KB bundle + relay handshake.

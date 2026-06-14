@@ -80,18 +80,18 @@ async function main() {
 
   // Tabs always talk via BroadcastChannel; the internet swarm joins in when
   // relays are configured (libp2p bundle loaded lazily, failure non-fatal).
-  // Relays come from config.js, but a `?relay=<multiaddr>` URL param (or a
-  // `relays` localStorage entry, comma-separated) overrides/augments them —
-  // handy for pointing at a locally-run relay without editing config.js.
-  const relayOverride = [
-    ...(params.get('relay') ? [params.get('relay')] : []),
-    ...((localStorage.getItem('relays') || '').split(',').map((s) => s.trim()).filter(Boolean)),
-  ];
-  // ?stress pages (e2e + the docker harness) must NOT touch the production relay
-  // unless one is passed explicitly via ?relay= — otherwise test sheep/votes
-  // would leak into the live swarm.
-  const relays = relayOverride.length ? relayOverride
-    : (params.get('stress') ? [] : RELAYS);
+  // Relay set: the hardcoded bootstrap (config.js) MERGED with relays discovered
+  // via gossip and persisted to localStorage — so the set grows to the whole
+  // community without dropping the bootstrap. `?relay=<multiaddr>` replaces the
+  // lot (for pointing at a local relay); `?stress` pages take NO production relay
+  // unless one is passed explicitly, so e2e/the docker harness can't leak test
+  // sheep+votes into the live swarm.
+  const explicitRelay = params.get('relay');
+  const discoveredRelays = (localStorage.getItem('relays') || '')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  const relays = explicitRelay ? [explicitRelay]
+    : params.get('stress') ? []
+    : [...new Set([...RELAYS, ...discoveredRelays])];
   const transport = new CompositeTransport([new BroadcastTransport()]);
   // Connect libp2p in the BACKGROUND — the 620 KB bundle + relay handshake takes
   // seconds, and blocking boot on it makes the whole page (incl. buttons)

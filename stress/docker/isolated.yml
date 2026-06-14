@@ -1,0 +1,49 @@
+# Isolated-network test: two peers on SEPARATE docker networks (they can't reach
+# each other → no direct WebRTC), both reach the relay. This is the ONLY way to
+# test the relay's DATA FORWARDING (the hard-NAT / cellular path) — the flat
+# harness always forms WebRTC and never exercises forwarding.
+services:
+  relay:
+    build: { context: ../../relay }
+    environment:
+      PORT: 4001
+      ANNOUNCE: /dns4/swarm/tcp/443/tls/ws
+    networks: [net1, net2]
+    expose: ["4001"]
+  swarm:
+    image: caddy:2
+    depends_on: [relay]
+    volumes:
+      - ../../web:/srv:ro
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    networks: [net1, net2]
+    expose: ["443"]
+  peer-a:
+    image: mcr.microsoft.com/playwright:v1.53.0-noble
+    depends_on: [swarm]
+    environment:
+      WEB_URL: https://swarm
+      RELAY_MADDR: ${RELAY_MADDR}
+      MINUTES: "1"
+      SETTLE_MS: "25000"
+      CONTRIB_MS: "4000"
+    volumes: ["./:/work", "../node_modules:/work/node_modules:ro"]
+    working_dir: /work
+    command: ["node", "peer.mjs"]
+    networks: [net1]
+  peer-b:
+    image: mcr.microsoft.com/playwright:v1.53.0-noble
+    depends_on: [swarm]
+    environment:
+      WEB_URL: https://swarm
+      RELAY_MADDR: ${RELAY_MADDR}
+      MINUTES: "1"
+      SETTLE_MS: "25000"
+      CONTRIB_MS: "4000"
+    volumes: ["./:/work", "../node_modules:/work/node_modules:ro"]
+    working_dir: /work
+    command: ["node", "peer.mjs"]
+    networks: [net2]
+networks:
+  net1: {}
+  net2: {}

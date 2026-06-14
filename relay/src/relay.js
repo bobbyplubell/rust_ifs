@@ -26,7 +26,7 @@ import { yamux } from '@chainsafe/libp2p-yamux';
 import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { identify } from '@libp2p/identify';
 import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
-import { TOPIC, DISCOVERY_TOPIC } from './common.js';
+import { TOPIC, DISCOVERY_TOPIC, RELAY_TOPIC } from './common.js';
 
 const port = process.env.PORT || 4001;
 const announce = (process.env.ANNOUNCE || '').split(',').filter(Boolean);
@@ -74,6 +74,22 @@ const node = await createLibp2p({
 // hard-NAT peers (which can reach it over wss but not WebRTC anyone) stay in
 // the swarm. Direct browser-to-browser links offload the rest. (See header.)
 node.services.pubsub.subscribe(TOPIC);
+
+// Trustless relay discovery: gossip our own (self-certifying) public multiaddr
+// so browsers learn about community relays beyond their bootstrap list. Also
+// subscribed, so we forward OTHER relays' ads across the swarm.
+node.services.pubsub.subscribe(RELAY_TOPIC);
+{
+  const selfAddr = announce.length
+    ? `${announce[0]}/p2p/${node.peerId.toString()}`
+    : node.getMultiaddrs().map((a) => a.toString()).find((a) => a.includes('/p2p/'));
+  const advertise = () => {
+    if (!selfAddr) return;
+    node.services.pubsub.publish(RELAY_TOPIC, new TextEncoder().encode(selfAddr)).catch(() => {});
+  };
+  setTimeout(advertise, 3_000);     // initial, once a browser is likely connected
+  setInterval(advertise, 30_000);   // refresh
+}
 
 console.log('relay peer id:', node.peerId.toString());
 for (const addr of node.getMultiaddrs()) console.log('listening:', addr.toString());

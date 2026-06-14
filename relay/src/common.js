@@ -10,5 +10,13 @@ export const TOPIC = 'sheep/v2';
 // Bulk sheep data then flows over those direct links on TOPIC, never the relay.
 export const DISCOVERY_TOPIC = 'sheep/disc/v1';
 
+// Trustless relay discovery: every relay periodically gossips its own public
+// multiaddr (which is self-certifying — it ends in /p2p/<peerid>, so dialing it
+// verifies the relay can't be impersonated). Browsers collect these and persist
+// them, so the set of relays grows from a couple of hardcoded bootstraps to the
+// whole community without anyone vetting operators — a malicious relay can only
+// be a bad pipe (it holds no authority over the signed, verified data).
+export const RELAY_TOPIC = 'sheep/relays/v1';
+
 export const enc = (msg) => new TextEncoder().encode(JSON.stringify(msg));
 export const dec = (bytes) => JSON.parse(new TextDecoder().decode(bytes));

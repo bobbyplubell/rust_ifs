@@ -12,7 +12,7 @@ import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { identify } from '@libp2p/identify';
 import { bootstrap } from '@libp2p/bootstrap';
 import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
-import { TOPIC, DISCOVERY_TOPIC, enc, dec } from './common.js';
+import { TOPIC, DISCOVERY_TOPIC, RELAY_TOPIC, enc, dec } from './common.js';
 
 // Public STUN servers (used unless the caller passes its own). STUN is a cheap,
 // stateless service — it just echoes back the address it sees — so leaning on
@@ -72,6 +72,23 @@ export async function createLibp2pTransport({ relays, stun }) {
   });
 
   node.services.pubsub.subscribe(TOPIC);
+
+  // Trustless relay discovery: collect gossiped relay multiaddrs and persist
+  // them — the app reads localStorage.relays as extra relays on the next load,
+  // so the relay set grows from a couple of bootstraps to the whole community.
+  // Each ad is self-certifying (ends in /p2p/<id>), so a bad one just fails to
+  // dial; no operator vetting needed (relays hold no authority).
+  node.services.pubsub.subscribe(RELAY_TOPIC);
+  node.services.pubsub.addEventListener('message', (evt) => {
+    if (evt.detail.topic !== RELAY_TOPIC) return;
+    try {
+      const maddr = new TextDecoder().decode(evt.detail.data).trim();
+      if (!/\/p2p\/[A-Za-z0-9]+$/.test(maddr)) return;
+      const cur = (localStorage.getItem('relays') || '').split(',').map((s) => s.trim()).filter(Boolean);
+      if (cur.includes(maddr)) return;
+      localStorage.setItem('relays', [...new Set([...cur, maddr])].slice(-12).join(','));
+    } catch { /* ignore malformed ad */ }
+  });
 
   // Dial discovered peers to form the direct browser-to-browser mesh. The relay
   // forwards discovery beacons but NOT data, and libp2p's autodial won't dial
