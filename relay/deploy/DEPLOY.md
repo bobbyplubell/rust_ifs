@@ -32,6 +32,44 @@ committing by appending `?relay=/dns4/.../wss/p2p/<PEER_ID>` to the site URL.
 The site itself must be served over **https** (GitHub Pages is; for a custom
 host use `serve-https.sh`) — `crypto.subtle` and `wss://` both require it.
 
+## Running a COMMUNITY relay (add capacity to an existing swarm)
+
+Anyone can add a relay to an existing swarm — no site change, no permission, no
+coordination with the maintainer. The new relay **dials into the backbone** and
+is then discovered by every browser automatically.
+
+How it works: relays gossip their own address on a relay-discovery topic, and
+(this is the key part) **relays dial each other**. Set `BOOTSTRAP` to any
+existing relay's multiaddr and your relay joins that relay's mesh; it then
+advertises itself, browsers on the swarm hear the ad and dial you, and your
+relay starts carrying its share. The backbone self-assembles as more community
+relays come online — each one only needs to know *one* existing relay.
+
+```bash
+# Same as a normal relay (your own subdomain + cert), PLUS BOOTSTRAP:
+cd <repo>/relay/deploy
+RELAY_DOMAIN=relay.YOURDOMAIN.com \
+BOOTSTRAP=/dns4/relay.proof-of-sheep.com/tcp/443/wss/p2p/12D3KooWMfGMj9QJPdfQopxN18tUbBDpCmxJG6v3EmxMS4EPN4MU \
+docker compose up -d --build
+```
+
+You still need your **own** subdomain + DNS A record + open 80/443 (browsers on
+the https site can only dial `wss://`, so every relay needs its own TLS cert;
+Caddy auto-provisions it). Your relay generates its own peer id on first boot —
+do **not** reuse another relay's key.
+
+That's it. You do **not** edit `web/config.js` — that list is just the *bootstrap*
+relays a fresh browser tries first; community relays are found via gossip. Verify
+you joined:
+```bash
+docker compose logs relay | grep -E "peer id|\[\+\] open"   # should connect out to the bootstrap relay
+```
+
+Why this is safe to let strangers do: the relay holds **no authority**. It
+forwards only signed, independently-verifiable facts and sees only ciphertext,
+so a hostile community relay can withhold or delay data but can never forge a
+sheep, a vote, or a render. More relays = more resilience, never less trust.
+
 ## 4. Full-scale stress test
 Two flavours:
 - **Same-machine protocol scale** (no relay needed): `stress/run.sh` packs

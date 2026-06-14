@@ -26,10 +26,15 @@ import { yamux } from '@chainsafe/libp2p-yamux';
 import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { identify } from '@libp2p/identify';
 import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
+import { multiaddr } from '@multiformats/multiaddr';
 import { TOPIC, DISCOVERY_TOPIC, RELAY_TOPIC } from './common.js';
 
 const port = process.env.PORT || 4001;
 const announce = (process.env.ANNOUNCE || '').split(',').filter(Boolean);
+// Other relays to peer with (comma-separated multiaddrs incl. /p2p/<id>). A
+// community relay sets this to an existing relay to join the backbone; the
+// backbone then self-assembles as relays advertise on RELAY_TOPIC (see below).
+const bootstrap = (process.env.BOOTSTRAP || '').split(',').map((s) => s.trim()).filter(Boolean);
 
 // Persist the peer key: the relay's peer id is baked into every client's
 // config.js, so it must survive restarts (compose mounts /app/keys).
@@ -107,6 +112,45 @@ node.services.pubsub.subscribe(RELAY_TOPIC);
   setTimeout(advertise, 3_000);     // initial, once a browser is likely connected
   setInterval(advertise, 30_000);   // refresh
 }
+
+// ---- Relay backbone: peer with OTHER relays so the swarm is ONE mesh --------
+// Relays only ACCEPT browser connections, so two relays are otherwise bridged
+// only by a browser that happens to be connected to both at once — fragile, and
+// a brand-new community relay (zero browsers) could never get discovered at all
+// (its RELAY_TOPIC ad can't propagate if it's connected to no one). So relays
+// also DIAL each other: a fixed BOOTSTRAP set joins a new relay to an existing
+// one, and we dial any relay we LEARN of on RELAY_TOPIC. The backbone then
+// self-assembles and self-heals as relays advertise — relay ads, peer discovery,
+// and data all flood across every relay, so a browser on ANY relay sees the
+// whole swarm. Relays hold no authority (they forward signed facts they can't
+// forge, see only ciphertext), so peering with an unknown community relay is
+// safe — it can withhold or delay, never corrupt.
+const selfPeerId = node.peerId.toString();
+const knownRelays = new Map(); // peerId -> multiaddr string (ends in /p2p/<id>)
+const learnRelay = (addr) => {
+  if (!/\/p2p\/[A-Za-z0-9]+$/.test(addr)) return;
+  const id = addr.split('/p2p/').pop();
+  if (!id || id === selfPeerId || knownRelays.has(id)) return;
+  knownRelays.set(id, addr);
+  node.dial(multiaddr(addr)).catch(() => { /* unreachable now: the watchdog retries */ });
+};
+for (const r of bootstrap) learnRelay(r);
+// Learn (and dial) relays advertised on RELAY_TOPIC — this is what makes the
+// backbone self-assemble as community relays come online.
+node.services.pubsub.addEventListener('message', (evt) => {
+  if (evt.detail.topic !== RELAY_TOPIC) return;
+  try { learnRelay(new TextDecoder().decode(evt.detail.data).trim()); }
+  catch { /* malformed ad */ }
+});
+// Watchdog: keep a live link to every known relay (re-dial drops / failed dials).
+const dialRelays = () => {
+  for (const [id, addr] of knownRelays) {
+    if (node.getConnections().some((c) => c.remotePeer.toString() === id)) continue;
+    node.dial(multiaddr(addr)).catch(() => { /* will retry next tick */ });
+  }
+};
+setTimeout(dialRelays, 2_000);
+setInterval(dialRelays, 15_000);
 
 console.log('relay peer id:', node.peerId.toString());
 for (const addr of node.getMultiaddrs()) console.log('listening:', addr.toString());

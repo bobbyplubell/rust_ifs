@@ -4,6 +4,13 @@
 #
 #   RELAY_DOMAIN=relay.example.com docker compose up -d --build
 #
+# To join an EXISTING swarm as a community relay, also set BOOTSTRAP to a known
+# relay's multiaddr so this relay dials into the backbone (then it's discovered
+# by browsers automatically — no site change needed):
+#   RELAY_DOMAIN=relay2.example.com \
+#   BOOTSTRAP=/dns4/relay.example.com/tcp/443/wss/p2p/12D3Koo... \
+#   docker compose up -d --build
+#
 # Needs: a DNS A/AAAA record for $RELAY_DOMAIN pointing at this host, and
 # ports 80+443 open (Caddy auto-provisions a Let's Encrypt cert).
 services:
@@ -15,6 +22,9 @@ services:
       PORT: 4001
       # The public address the relay advertises to browsers it introduces.
       ANNOUNCE: /dns4/${RELAY_DOMAIN}/tcp/443/wss
+      # Other relays to peer with (comma-separated multiaddrs). Empty for the
+      # first/only relay; set to an existing relay to join its backbone.
+      BOOTSTRAP: ${BOOTSTRAP:-}
     volumes:
       - relay-keys:/app/keys        # persist the peer id across restarts
     expose:
