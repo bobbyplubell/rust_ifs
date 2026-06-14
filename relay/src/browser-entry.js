@@ -58,6 +58,10 @@ export async function createLibp2pTransport({ relays, stun }) {
     ],
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
+    // Notice a dead relay link fast (sleep / network blip), so it's actually
+    // disconnected and the reconnect watchdog below re-dials it — otherwise a
+    // stale connection lingers and the watchdog thinks we're still connected.
+    connectionMonitor: { abortConnectionOnPingFailure: true },
     peerDiscovery: [
       ...(relays.length ? [bootstrap({ list: relays })] : []),
       // Broadcast our own circuit address on the discovery topic and dial peers

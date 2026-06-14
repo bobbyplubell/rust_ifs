@@ -54,6 +54,12 @@ const node = await createLibp2p({
   transports: [webSockets()],
   connectionEncrypters: [noise()],
   streamMuxers: [yamux()],
+  // Detect + drop DEAD browser links fast. Browsers vanish uncleanly (sleep,
+  // network blip, tab close), and a stale wss isn't noticed for a long time by
+  // default — the dead peers then pile up in the gossip mesh and crowd out the
+  // live ones, so the relay stops forwarding to whoever's actually connected
+  // (the "needs a restart to recover" symptom). Ping every 10s, abort on failure.
+  connectionMonitor: { abortConnectionOnPingFailure: true },
   // Forward the discovery topic only (listenOnly: don't advertise the relay
   // itself — its address is already baked into every client's config).
   peerDiscovery: [pubsubPeerDiscovery({ listenOnly: true, topics: [DISCOVERY_TOPIC] })],
@@ -66,7 +72,14 @@ const node = await createLibp2p({
       // actually connect (RAM on the relay host is the real limit by then).
       reservations: { maxReservations: 4096 },
     }),
-    pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }),
+    // High mesh degree: the relay is a BACKBONE and should mesh with everyone
+    // it's connected to, so a live peer is never crowded out of the mesh (and
+    // thus never starved of forwarded data). Defaults (D=6) are tuned for a
+    // flat p2p swarm, not a hub.
+    pubsub: gossipsub({
+      allowPublishToZeroTopicPeers: true,
+      D: 64, Dlo: 32, Dhi: 128, Dscore: 48, Dout: 16,
+    }),
   },
 });
 
