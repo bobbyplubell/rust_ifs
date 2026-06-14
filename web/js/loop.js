@@ -38,6 +38,15 @@ export class FrameLoop {
     }
   }
 
+  // The integer frame index currently on screen (respecting the boomerang
+  // range), for callers that want to prioritize work near the playhead. Pure
+  // read of the same clock the ticker draws from — no side effects.
+  currentFrame(now = performance.now()) {
+    const pos = this._position(now);
+    const hi = this.range ? this.range.hi : this.n - 1;
+    return Math.min(Math.floor(pos), hi);
+  }
+
   start() {
     if (!this.running) { this.running = true; requestAnimationFrame(this._raf); }
   }

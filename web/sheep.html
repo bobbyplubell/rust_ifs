@@ -205,10 +205,46 @@
       if (fr.repaintQueued) { fr.repaintQueued = false; repaint(f); }
     }
 
+    // Adopt a cached accumulated histogram for frame f (from store.getRender)
+    // and tonemap it directly — FAR cheaper than re-rendering every batch via
+    // ensureAcc. Only adopts if it covers at least as much as we already hold
+    // (the cache `keys` are the exact tiles summed in). Returns true if adopted.
+    async function adoptCachedRender(f) {
+      const fr = frames[f];
+      try {
+        const cached = await store.getRender(id, f);
+        if (!cached || !cached.buf) return false;
+        const keys = Array.isArray(cached.keys) ? cached.keys : [];
+        // Derive the covered idx set from the cache keys (`${id}:${f}:${idx}`).
+        const idxs = [];
+        for (const k of keys) {
+          const idx = Number(String(k).split(':')[2]);
+          if (Number.isInteger(idx)) idxs.push(idx);
+        }
+        // Adopt when the cache covers at least as many tiles as we hold AND we
+        // don't already have a sharp bitmap — tonemapping the cached histogram
+        // is always cheaper than re-rendering its batches. (Strictly fewer
+        // tiles than we hold → skip; re-rendering yields the better frame.)
+        if (idxs.length < fr.covered.size) return false;
+        if (fr.bitmap && idxs.length === fr.covered.size) return false;
+        const acc = new BigUint64Array(cached.buf);
+        if (acc.length !== HIST_CELLS) return false;      // stale spec — ignore
+        fr.acc = acc;
+        fr.covered = new Set(idxs);
+        touchHistLru(f);
+        repaint(f); // fast: tonemap only, no per-batch re-render
+        return true;
+      } catch { return false; }
+    }
+
     // Quick placeholder so the loop is never blank before a frame has batches.
     async function makePreview(f) {
       const fr = frames[f];
-      if (fr.preview || fr.bitmap || fr.covered.size) return;
+      // A preview is a placeholder ONLY where there's no sharp render yet: skip
+      // if the frame already has a real tonemapped bitmap or an existing
+      // preview. (Covered-but-not-yet-tonemapped frames still get a preview so
+      // the whole loop animates immediately, before the parallel refine lands.)
+      if (fr.preview || fr.bitmap) return;
       const m = await pool.submit({
         type: 'frame', genomeJson: record.genome, phase: f / N_FRAMES, ...PREVIEW,
       }).done;
@@ -781,17 +817,62 @@
 
       // Seed each frame from batches we already hold IN THE BACKGROUND —
       // re-rendering existing coverage can be slow; don't block interactivity.
+      //
+      // Three phases, all non-blocking, designed to fill the worker pool:
+      //   1. ONE store scan, bucketed into the per-frame `covered` sets (was
+      //      N_FRAMES scans — one per frame — of the whole batch store).
+      //   2. Preview EVERY not-yet-sharp frame up front (cheap ~200k-sample
+      //      jobs that run on the pool in parallel) so the full fuzzy loop
+      //      animates in ~1-2 s instead of waiting on per-frame re-renders.
+      //   3. Refine the covered frames CONCURRENTLY (bounded window) rather
+      //      than awaiting each serially, prioritized by playback proximity so
+      //      what's on screen sharpens first. Each refine prefers a cached
+      //      accumulated histogram (tonemap-only) over re-rendering all batches.
       (async () => {
-        for (let f = 0; f < N_FRAMES; f++) {
-          const have = (await store.batchesForSheep(id)).filter((b) => b.frame === f);
-          for (const b of have) frames[f].covered.add(b.idx);
-        }
-        // Eagerly tonemap any frames that already have coverage; preview the rest.
-        for (let f = 0; f < N_FRAMES; f++) {
-          if (frames[f].covered.size) { await ensureAcc(f).catch(() => {}); repaint(f); }
-          else makePreview(f).catch(console.error);
+        // (1) Single scan → bucket by frame.
+        const all = await store.batchesForSheep(id);
+        const covered = []; // frames that have ≥1 batch to refine
+        for (const b of all) {
+          if (b.frame < 0 || b.frame >= N_FRAMES || banned.has(b.contributor)) continue;
+          if (!frames[b.frame].covered.size) covered.push(b.frame);
+          frames[b.frame].covered.add(b.idx);
         }
         showSamples();
+
+        // (2) Preview EVERYTHING first (placeholder only where not yet sharp).
+        for (let f = 0; f < N_FRAMES; f++) makePreview(f).catch(console.error);
+
+        // (3) Bounded parallel refine, playback-proximity first. Order the
+        // covered frames by distance from the current playhead so the visible
+        // region sharpens first, but still cover them all. A small in-flight
+        // window keeps the pool busy without queueing thousands of jobs.
+        if (covered.length) {
+          const cur = loop.currentFrame();
+          const order = covered.slice().sort((a, b) => {
+            const da = Math.min(Math.abs(a - cur), N_FRAMES - Math.abs(a - cur));
+            const db = Math.min(Math.abs(b - cur), N_FRAMES - Math.abs(b - cur));
+            return da - db;
+          });
+          const refine = async (f) => {
+            // Prefer a cached accumulated histogram (fast tonemap-only); else
+            // re-render the frame's batches. Either way `repaint` lands a sharp
+            // bitmap and re-seeds the render cache for the next open.
+            if (!(await adoptCachedRender(f))) {
+              await ensureAcc(f).catch(() => {});
+              repaint(f);
+            }
+          };
+          const window = Math.max(2, pool.size || 4);
+          let next = 0;
+          const worker = async () => {
+            while (next < order.length) {
+              const f = order[next++];
+              await refine(f);
+            }
+          };
+          await Promise.all(Array.from({ length: window }, worker));
+          showSamples();
+        }
       })().catch(console.error);
     }
 
