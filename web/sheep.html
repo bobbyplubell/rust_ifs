@@ -120,6 +120,15 @@
     let PREVIEW = previewSpec(W, H);
 
     const pool = new WorkerPool(Number(params.get('workers')) || undefined);
+    // If the wasm renderer can't load (flaky cellular, CSP), show an error in
+    // the overlay instead of a forever-blank canvas.
+    let poolFailed = false;
+    pool.onStatus = (status) => {
+      if (status === 'failed') {
+        poolFailed = true;
+        $('#loading').textContent = 'renderer failed to load — reload';
+      }
+    };
     const cv = $('#cv');
     const ctx = cv.getContext('2d');
 
@@ -286,6 +295,7 @@
     // have sharpened past the placeholder.
     const frameReady = (f) => !!frames[f].bitmap;
     function updateLoadingStatus() {
+      if (poolFailed) return; // keep the persistent renderer-failed message
       let ready = 0;
       for (let f = 0; f < N_FRAMES; f++) if (frameReady(f)) ready++;
       $('#loading').textContent = ready >= N_FRAMES

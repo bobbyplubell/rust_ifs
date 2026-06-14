@@ -31,6 +31,16 @@ const params = new URLSearchParams(location.search);
 // one machine; idle peers don't need 4 workers each).
 const WORKERS_OVERRIDE = Number(params.get('workers')) || null;
 const pool = new WorkerPool(WORKERS_OVERRIDE ?? undefined);
+// Surface renderer load state so a phone whose wasm never loaded over flaky
+// cellular isn't left with silent dead contribute buttons. updateStatus() reads
+// poolStatus and prints a persistent warning when 'failed'.
+let poolStatus = 'loading';
+let poolStatusReason = '';
+pool.onStatus = (status, detail) => {
+  poolStatus = status;
+  if (detail) poolStatusReason = detail;
+  try { updateStatus(); } catch { /* chrome not ready yet */ }
+};
 
 // Contribution is MANUAL: the gallery passively shows what the swarm has
 // rendered so far; rendering work (and the vote it earns) only happens for
@@ -1108,11 +1118,18 @@ function updateStatus() {
   const creds = `${creditsView.available} credits (${toNext} tiles to next)`;
   // Global tile total across ALL sheep: your contributed tiles vs the swarm's.
   const tiles = `${globalTiles.mine}/${globalTiles.total} tiles`;
+  // Persistent, visible warning when the worker pool can't load its wasm —
+  // otherwise contribute buttons and previews silently do nothing.
+  if (poolStatus === 'failed') {
+    $('#status').textContent = '⚠ renderer failed to load — reload to retry';
+    return;
+  }
+  const poolHint = poolStatus === 'loading' ? ' · renderer starting…' : '';
   $('#status').textContent =
     `gen ${gen() - GENESIS_GEN} closes in ${mm}:${ss} · ` +
     `you are ${handle(me.pubHex)} · ${net.peerCount()} peers · ` +
     `${creds} · ${tiles} · ` +
-    `${a.audits} audits${a.frauds ? `, ${a.frauds} frauds!` : ''}${pulse}${credHint}` +
+    `${a.audits} audits${a.frauds ? `, ${a.frauds} frauds!` : ''}${pulse}${credHint}${poolHint}` +
     (buildVersion ? ` · build ${buildVersion}` : '');
 }
 

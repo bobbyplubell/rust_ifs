@@ -29,19 +29,119 @@ export class WorkerPool {
     this.chunksRendered = 0;   // session-wide chunk counter (progress msgs with a hash)
     this.onStats = null;       // assignable: ({size, queued, running, chunks}) => void
     this._nextJobId = 1;
-    this._workers = [];
-    for (let i = 0; i < this.size; i++) this._workers.push(this._spawn(i));
+
+    // Load-robustness: a worker that never finishes its wasm init (flaky
+    // cellular drops the fetch/compile) never posts {type:'ready'}, so the
+    // pool would silently sit dead forever. We arm a per-slot READY timeout and
+    // also treat worker.onerror-before-ready as a load failure, then respawn
+    // with capped exponential backoff. If every slot exhausts its attempts with
+    // none ready, we flip status to 'failed' so the UI can stop being silent.
+    this.status = 'loading';   // 'loading' | 'ready' | 'failed'
+    this.onStatus = null;      // assignable: (status, detail) => void
+    this._readyTimeoutMs = 20_000;
+    this._maxAttempts = 5;     // respawn attempts per slot before giving up
+    this._backoffMs = [500, 1000, 2000, 4000, 8000];
+
+    this._workers = new Array(this.size);
+    for (let i = 0; i < this.size; i++) this._spawn(i);
   }
 
+  // (Re)spawn the worker for a slot index, in place. Wrapped in try/catch
+  // because `new Worker(...)` itself can throw on some mobile browsers / under
+  // a strict CSP — that's a load failure, not a runtime one.
   _spawn(index) {
-    const worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
-    const slot = { index, worker, ready: false, job: null };
+    const prev = this._workers[index];
+    const attempts = prev ? prev.attempts : 0;
+    const slot = { index, worker: null, ready: false, job: null, attempts, readyTimer: null };
+    this._workers[index] = slot;
+
+    let worker;
+    try {
+      worker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+    } catch (err) {
+      // Couldn't even construct the worker — count it as a failed attempt.
+      this._workerFailed(slot, `worker construction failed: ${err?.message || err}`);
+      return slot;
+    }
+    slot.worker = worker;
     worker.onmessage = (event) => this._onMessage(slot, event.data);
     worker.onerror = (event) => {
-      // A worker-level failure kills the current job but not the pool.
-      if (slot.job) this._finish(slot, null, new Error(event.message || 'worker error'));
+      if (slot.job) {
+        // Runtime failure mid-job: kill that job, but the worker (and pool)
+        // survive — unchanged happy-path behavior.
+        this._finish(slot, null, new Error(event.message || 'worker error'));
+      } else if (!slot.ready) {
+        // Failure before the worker ever readied (e.g. wasm fetch/compile
+        // blew up): treat as a load failure and respawn.
+        this._workerFailed(slot, `worker load error: ${event.message || 'unknown'}`);
+      }
     };
+
+    // Arm the ready timeout: a worker that never posts {type:'ready'} is
+    // indistinguishable (to us) from a dead one. _onMessage clears this on ready.
+    slot.readyTimer = setTimeout(() => {
+      slot.readyTimer = null;
+      if (!slot.ready) this._workerFailed(slot, 'worker init timed out');
+    }, this._readyTimeoutMs);
+
     return slot;
+  }
+
+  // Handle a slot that failed to load/init. Re-queue any in-flight job so it
+  // isn't lost, terminate the dead worker, and either respawn with backoff or
+  // give up on this slot. Re-evaluates pool status after.
+  _workerFailed(slot, reason) {
+    if (slot.readyTimer) { clearTimeout(slot.readyTimer); slot.readyTimer = null; }
+
+    // If a job was in flight on this slot, put it back at the front of the
+    // queue so another (or the respawned) worker can pick it up.
+    if (slot.job) {
+      const job = slot.job;
+      slot.job = null;
+      job.slot = null;
+      this.running--;
+      if (!job.settled) this.queue.unshift(job);
+    }
+
+    if (slot.worker) {
+      try { slot.worker.terminate(); } catch { /* already gone */ }
+      slot.worker = null;
+    }
+
+    slot.attempts++;
+    if (slot.attempts < this._maxAttempts) {
+      const delay = this._backoffMs[Math.min(slot.attempts - 1, this._backoffMs.length - 1)];
+      setTimeout(() => {
+        // Only respawn if the slot is still the dead one (defensive).
+        if (this._workers[slot.index] === slot && !slot.ready) this._spawn(slot.index);
+      }, delay);
+    }
+    // else: this slot has given up. _evalStatus decides if the WHOLE pool failed.
+
+    this._evalStatus(reason);
+  }
+
+  // Recompute pool status and fire onStatus on transition.
+  //   ready  — at least one worker is ready
+  //   failed — every slot has exhausted its respawn attempts and none is ready
+  //   loading — otherwise (still trying)
+  _evalStatus(reason) {
+    let next;
+    if (this._workers.some((s) => s && s.ready)) {
+      next = 'ready';
+    } else if (this._workers.every((s) => s && s.attempts >= this._maxAttempts && !s.ready)) {
+      next = 'failed';
+    } else {
+      next = 'loading';
+    }
+    if (next === this.status) return;
+    // 'ready' is sticky: once any worker has loaded, the pool stays usable even
+    // if some sibling slots later give up.
+    if (this.status === 'ready' && next !== 'ready') return;
+    this.status = next;
+    if (this.onStatus) {
+      this.onStatus(next, next === 'failed' ? (reason || 'renderer failed to load') : reason);
+    }
   }
 
   /** Submit a message to the pool. jobId is assigned here. */
@@ -100,7 +200,9 @@ export class WorkerPool {
 
   _onMessage(slot, msg) {
     if (msg.type === 'ready') {
+      if (slot.readyTimer) { clearTimeout(slot.readyTimer); slot.readyTimer = null; }
       slot.ready = true;
+      this._evalStatus();
       this._pump();
       return;
     }
