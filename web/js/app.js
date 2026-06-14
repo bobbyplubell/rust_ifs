@@ -66,6 +66,11 @@ const cards = new Map();
 const selected = [];       // up to two sheepIds picked as parents
 
 let me, store, net, auditor, baked = [];
+
+// Build stamp (written by the deploy workflow), so you can tell which build is
+// live. Absent in local dev → shows nothing.
+let buildVersion = '';
+fetch('version.txt').then((r) => (r.ok ? r.text() : '')).then((t) => { buildVersion = t.trim(); }).catch(() => {});
 let shownGen = -1;
 let banned = new Set();     // contributors with verified fraud proofs (local view)
 
@@ -938,7 +943,8 @@ function updateStatus() {
     `gen ${gen() - GENESIS_GEN} closes in ${mm}:${ss} · ` +
     `you are ${handle(me.pubHex)} · ${net.peerCount()} peers · ` +
     `${creds} · ` +
-    `${a.audits} audits${a.frauds ? `, ${a.frauds} frauds!` : ''}${pulse}${credHint}`;
+    `${a.audits} audits${a.frauds ? `, ${a.frauds} frauds!` : ''}${pulse}${credHint}` +
+    (buildVersion ? ` · build ${buildVersion}` : '');
 }
 
 function showError(err) {

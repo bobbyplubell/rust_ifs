@@ -42,6 +42,12 @@ fn main() {
         "sheep-id" => cmd_sheep_id(&opts),
         "breed" => cmd_breed(&opts),
         "chunk-hashes" => cmd_chunk_hashes(&opts),
+        "challenge" => {
+            // Print challenge_from_seed(--seed) as hex — the per-sheep challenge
+            // that chunk-hashes / determinism.html use.
+            let seed: u64 = get(&opts, "seed", 0);
+            println!("{}", flame_core::chunked::to_hex(&flame_core::chunked::challenge_from_seed(seed)));
+        }
         "frame-hashes" => cmd_frame_hashes(&opts),
         "-h" | "--help" | "help" => usage(),
         other => {

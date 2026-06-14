@@ -1,0 +1,36 @@
+name: CI
+
+# Determinism + stack checks. The render goldens are the heart of it: if a code
+# change alters render output without the goldens being regenerated, these fail
+# — so a determinism regression can never land silently.
+on:
+  push:
+    branches: [master]
+  pull_request: {}
+
+jobs:
+  rust-determinism:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # golden_determinism + render_batch_is_deterministic_and_golden assert the
+      # native render hashes against committed constants (chunked.rs).
+      - name: cargo test (native render goldens)
+        run: cargo test -p flame-core --lib
+
+  e2e:
+    runs-on: ubuntu-latest
+    # Playwright image ships the browsers; matches e2e/run.sh.
+    container: mcr.microsoft.com/playwright:v1.53.0-noble
+    steps:
+      - uses: actions/checkout@v4
+      # Full stack in real Chromium, including:
+      #  - render_batch browser == native golden
+      #  - render_chunk browser == native expected-hashes.txt
+      #  - sync / verify gate / fraud / generation engine / vote-credit economy
+      - name: e2e (browser determinism + stack)
+        working-directory: e2e
+        run: |
+          npm install --no-audit --no-fund
+          node test.js

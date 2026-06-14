@@ -63,9 +63,48 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
     const b = w.render_batch(g, id, 2, 5, 64, 64, 1, 50000);
     return { a: a.hash, b: b.hash, cells: a.hist.length };
   });
-  const GOLDEN = 'fdd630454bbe7cc3475daf9d9e3ef55bc2b183d93ac7698b9b32cd0a6d37ac15';
+  const GOLDEN = '1635d61a57b67bd3e33f06d980c3f178f9a3c127b7978c61e8d50346c093bc73';
   check('render_batch byte-identical browser vs native', out.a === GOLDEN && out.a === out.b,
     `${out.a.slice(0, 16)}… (golden ${GOLDEN.slice(0, 16)}…), cells=${out.cells}`);
+  await page.close();
+}
+
+// ---- 1b. chunk-hash goldens: browser render_chunk == native expected-hashes -
+// Proves the determinism.html guarantee in CI: every baked sheep's accumulated
+// chunk hashes (browser/wasm) must equal genomes/expected-hashes.txt (native CLI).
+{
+  section('chunk-hash goldens (browser == native)');
+  const page = await ctx.newPage();
+  page.on('console', (m) => { if (m.type() === 'error') console.log('console.error:', m.text()); });
+  await page.goto(`${base}/about.html`);
+  const result = await page.evaluate(async () => {
+    const w = await import('./pkg/flame_wasm.js');
+    await w.default();
+    const expected = new Map();
+    const txt = await (await fetch('genomes/expected-hashes.txt')).text();
+    for (const line of txt.trim().split('\n')) {
+      const [file, idx, hash] = line.trim().split(/\s+/);
+      if (hash) expected.set(`${file}:${idx}`, hash);
+    }
+    const manifest = await (await fetch('genomes/manifest.json')).json();
+    const S = { width: 128, height: 128, ss: 1, nChunks: 8, samplesPerChunk: 50_000 };
+    let checked = 0, mismatch = 0;
+    for (const sheep of manifest.sheep) {
+      const genomeJson = await (await fetch(sheep.file)).text();
+      const challengeHex = w.challenge_from_seed(sheep.seed);
+      const r = new w.ChunkedRender(genomeJson, S.width, S.height, S.ss, S.samplesPerChunk, S.nChunks, challengeHex);
+      try {
+        for (let i = 0; i < S.nChunks; i++) {
+          checked++;
+          if (r.render_chunk(i) !== expected.get(`${sheep.file}:${i}`)) mismatch++;
+        }
+      } finally { r.free(); }
+    }
+    return { checked, mismatch };
+  });
+  check('browser render_chunk matches native expected-hashes',
+    result.checked === 48 && result.mismatch === 0,
+    `checked=${result.checked}, mismatch=${result.mismatch}`);
   await page.close();
 }
 

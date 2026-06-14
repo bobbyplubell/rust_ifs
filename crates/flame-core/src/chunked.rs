@@ -333,44 +333,44 @@ mod tests {
         (
             2,
             [
-                "5979cc6a24803b0af73de497be2c6eeb03bb24e1b8aeb641b41384a43678a812",
-                "b1f9000c6f13c6fd4102be07dd1975e652034032210ec7bc959cce4f9bb50800",
-                "92be531a310633f7afe9351977e1c8655cf5d402ec29c6a95ff4335f4d26fb67",
-                "134e7c3b4d51fc572d11bb327000735a7c0f7d3aba9a8105d0a0d5c0143bfcf3",
-                "5e0463a75b2ec787b5b2300f2ead86d25f990b43b23ba8f12c7f4e08fd88e7db",
-                "9a9c3412645913803c18ed5864d520140bafbc728c9a4da56f68b3a8d2d3dc01",
-                "1beeda6a895cee6536ff6a43f63c2158965210e74cc0328199361567e8a1c08f",
-                "8109eae43e3cf10493b1ec202c3feef460e5f6a531418f72adb86b291daeb90a",
+                "02c15ce80a46a06a9ae280e20a2d65da4e32fb6df72469662a8ad7585f0c7c4b",
+                "13a7278a93dcc8f599dd12fe55b860f6fcba8bd0ed5ab1fdeea8e627ad47a934",
+                "8f965ffcd121cfc0f19a2d5273aed533ecea635ae1b725714f600956338939e0",
+                "1dec812183612b2e0b4660924c74cb7b66a7d7fc82c5d56f3cb1531cf35fc623",
+                "135ab69ab6b5e35078c3cca9bfefbe4e6086611ce4dc04f6e78ba8475deead61",
+                "3d834d789a0bb1cfe9a078624665663d8dd211bfc7f8350959376b48b366775f",
+                "e6127c9176c605aa83d5106e79aaef0d3ae673f8a1ff008661e1f337343bb921",
+                "ba0295e310452d469193831c94d6da8451f897dfbdd03cd75981d12ecf4ac155",
             ],
-            "186b6aebd646639a5bd1ca48e0e57acd16645c47d10869de5fe2b7387b9b0d9a",
+            "7e54dd56fcc9c7a4e1f2570028a70c6623138dcdacbece4007d36e1e3ecef678",
         ),
         (
             3,
             [
-                "f9b8f9e195a328b848f6aba2ccd60d8a89eb6a932761f07ca8a7a03471a3fe2d",
-                "87c95776e4a8a3c0e3b4b6722df231715e4d9e0a98a42d8182025bc6b568000c",
-                "049ebf91b8b72cca8fad7367e927372c7ae5f9b0a0639c870b11ba068d37e713",
-                "258b12087b461649c36b0981165152ce3f68fa7c6466e31c6e15d03e698fa552",
-                "53e8fdb6633e93dc5040ee544f25769368d698ca61c3eba1a294d27dc2acad12",
-                "a3ff4d66311d4ac3874528b804bd2990711a33d407b580d85079287de84a5795",
-                "7b98110e2b2ea3f24806ef870270c55fd192dd092b81f0754206be18883914d3",
-                "8b3787771d27ab9bf8c3881b52847e57fda85b977fe27fb619dadbc891335f1b",
+                "0030d48ece6bc4b8d625d2769bb40551c64b33190e0e0f196d7af3fc89d857c8",
+                "960dda54ec3b22596dbadcaf33a38f5287b6a5e1ce8339b0f4c20e8cc7c9b491",
+                "694b96568d06b7362f7e8b22fe005fc21228a9997a5a9ea9f708f56172d1df7f",
+                "d75117a417c2431b28efadefd7a02ce4fbd6e14771a74ad528c7978c8e9ee0e1",
+                "af435f36b9642be76b257435c589d5cc0417eccdee591cd1d56565219a2c445d",
+                "8b8bc0ee415649a4e024e261244395165032d3fc2a40fe3f6db64c75ae1c0cd8",
+                "95b5ba3b482755887c5b240905058b0184048dd824aa91214eb4c6b305e3cfab",
+                "930478fb4a66e25abf9f5e179c105e9bb51802d3fdec5fda79ca31a1cb9570e3",
             ],
-            "feb029fd736b8d590499b361806ea99e6744e34ae9a01d77f6e7c8dbc96d9719",
+            "82761af3d58e1f5c817cdb5f7c44c7f12f890bdddff9d2a2d2b4e224c4fb09d8",
         ),
         (
             7,
             [
-                "e1a4ab2cf5ae737f74eb3a44993f7cdf4acecef801f4542b74b27f259fdf02d5",
-                "cb5866f4c81ba7ce2b0e3a4c1c400280cf2c7ae42090d6b7f202274ed2799e21",
-                "daeb5de304f5a8ad99ebb6fdbec3bb710d3a6e904492bd96fb94116b9cb115f0",
-                "423a94cf377064284f7f1afd2903713e7b92bd68ae95b423275dfbe936dd3239",
-                "23204d8114c695bc95b1e47eef96e9c8240eb552132ef28f2c93af381cf76aaa",
-                "d8ccdf83926de5c2ad60d3da7846e19255cf87fe05acfbbdbafbc8024085469d",
-                "4ea710eebf57d36a6057688dbd88e35db9bd42e34073698a2808213fbe795a1f",
-                "afbbefd2135320b23385a8e7b8d7da2a0480e7a31493ba03fda7c6718abe1d81",
+                "b2ec82e9c05309b9ad26d36a60c51acdcc4187efbaddb757025aa5dfe12887f1",
+                "7ec5ed9d5f5d5ccf3822d871ce9fa41c5bef9115e68c951cf826e7fa8fb283e7",
+                "f3a6f3cb25aa9688b8acd5aefc38ff1faeae00278a683449bb48ae42ecfbe0d1",
+                "3a9f4120de3db7ae428da5246ad1f2bba83bf037b4ff78fc01f7c0f40c5cec8d",
+                "c49493d4a56ba61b5977663f1daea4e0312487b028da509087a455bdeb550dfb",
+                "d11236dcbab27180773b9e41afdb6d9a18ee6111ef4c3564f872705f4c047d0a",
+                "1c23211be511ec5d1c92532ab230f59950b8d4a40f5e1552486fbdf6e874b368",
+                "6c47bc636c5f511dbd907339dbcbe37faf5b11d2ae277ecf80955625fde5dff1",
             ],
-            "7b34f6d0c108516cecb7be52a6bde6913c175ee4750ef3510d0746c5f9627368",
+            "434ae957c1548356fd03d2bb13a35f7322465d5aa5109813ca4434c26bf38d7e",
         ),
     ];
 
@@ -471,7 +471,7 @@ mod tests {
     /// sheep_id is the canonical id of a fixed genome; frame=2, idx=5, 64x64,
     /// ss=1, spp=50_000.
     const BATCH_GOLDEN: &str =
-        "fdd630454bbe7cc3475daf9d9e3ef55bc2b183d93ac7698b9b32cd0a6d37ac15";
+        "1635d61a57b67bd3e33f06d980c3f178f9a3c127b7978c61e8d50346c093bc73";
 
     #[test]
     fn render_batch_is_deterministic_and_golden() {

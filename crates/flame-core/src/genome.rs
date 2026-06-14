@@ -155,12 +155,16 @@ impl Transform {
         variations[shape.index()] = rng.range(0.6, 1.1);
         variations[Variation::Linear.index()] += rng.range(0.1, 0.45);
         if rng.chance(0.3) {
-            let extra = rng.below(Variation::ALL.len());
+            // Accent from the curated shape pool, NOT any variation — the open
+            // pool let strongly-spreading maps (exponential &c.) leak in and
+            // scatter the attractor into thin "fog".
+            let extra = Self::SHAPE_POOL[rng.below(Self::SHAPE_POOL.len())].index();
             variations[extra] += rng.range(0.05, 0.3);
         }
-        // Mild contraction bias so trajectories settle instead of scattering.
+        // Contraction bias so trajectories FOLD inward (dense, solid) instead of
+        // scattering thin. 0.5–0.8: firmly contractive but not collapsed.
         let mut affine = Affine::random(rng);
-        let s = rng.range(0.55, 0.95);
+        let s = rng.range(0.5, 0.8);
         affine.a *= s;
         affine.b *= s;
         affine.d *= s;
@@ -318,7 +322,55 @@ impl Genome {
     /// A random genome with `n` transforms. Priors are tuned for the classic
     /// solid-object look: dominant-shape transforms, occasional rotational
     /// symmetry, flam3's gamma-4 tone curve.
+    ///
+    /// Quality-filtered: random IFS are high-variance — many come out as thin,
+    /// sparse "fog". We generate up to MAX_TRIES candidates and keep the first
+    /// whose framed attractor is dense enough (a cheap deterministic coverage
+    /// probe), else the densest seen — so immigrants are reliably solid. Fully
+    /// deterministic (the rng advances per try, the probe seed is fixed), so
+    /// every peer derives the identical sheep.
     pub fn random(rng: &mut Rng, n: usize) -> Genome {
+        const MAX_TRIES: usize = 28;
+        const MIN_COVERAGE: f64 = 0.30;
+        let mut best = Self::random_once(rng, n);
+        let mut best_cov = best.coverage();
+        for _ in 1..MAX_TRIES {
+            if best_cov >= MIN_COVERAGE {
+                break;
+            }
+            let g = Self::random_once(rng, n);
+            let cov = g.coverage();
+            if cov > best_cov {
+                best = g;
+                best_cov = cov;
+            }
+        }
+        best
+    }
+
+    /// Fraction of a coarse grid that the chaos game fills *densely* — a cheap,
+    /// deterministic "solid vs thin fog" score in [0, 1]. We count only
+    /// WELL-POPULATED cells (>= MIN_HITS), not merely-touched ones: a thin arc
+    /// crosses many cells but populates few densely, so it scores low; a solid
+    /// flame fills a 2-D region and scores high.
+    pub fn coverage(&self) -> f64 {
+        const PROBE: u64 = 0x00C0_FFEE;
+        const N: u64 = 60_000;
+        const G: usize = 48;
+        const MIN_HITS: u32 = 6; // ~0.25x the uniform-spread average (60k/2304)
+        let mut hits = vec![0u32; G * G];
+        let (cx, cy, s) = (self.camera.center_x, self.camera.center_y, self.camera.scale);
+        crate::render::iterate(self, N, 30, PROBE, |x, y, _| {
+            let gx = (0.5 + (x - cx) * s) * G as f64;
+            let gy = (0.5 + (y - cy) * s) * G as f64;
+            if gx >= 0.0 && gx < G as f64 && gy >= 0.0 && gy < G as f64 {
+                hits[gy as usize * G + gx as usize] += 1;
+            }
+        });
+        hits.iter().filter(|&&h| h >= MIN_HITS).count() as f64 / (G * G) as f64
+    }
+
+    fn random_once(rng: &mut Rng, n: usize) -> Genome {
         let mut transforms: Vec<Transform> = (0..n).map(|_| Transform::random(rng)).collect();
 
         // Symmetry per the paper (sec. 7): each symmetry transform gets

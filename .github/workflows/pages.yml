@@ -28,6 +28,8 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      - name: Stamp build version
+        run: printf '%s · %s UTC' "$(echo "$GITHUB_SHA" | cut -c1-7)" "$(date -u '+%Y-%m-%d %H:%M')" > web/version.txt
       - uses: actions/configure-pages@v5
         with:
           enablement: true     # turn Pages on (Actions build type) if not already
