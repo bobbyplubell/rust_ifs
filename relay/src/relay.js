@@ -1,15 +1,16 @@
 // The swarm's one piece of infrastructure: a libp2p node that
 //   1. accepts WebSocket connections from browsers (they can't accept inbound),
 //   2. acts as a circuit-relay-v2 server so browsers can WebRTC to each other,
-//   3. runs gossipsub but does NOT subscribe to the data topic. It still relays
-//      SUBSCRIBE control messages (so peers discover each other) and the circuit
-//      signaling that lets them form DIRECT WebRTC links — but it is NOT a data
-//      hop. Sheep data gossips browser-to-browser over WebRTC, so the relay
-//      never becomes a bandwidth bottleneck as the swarm grows.
-//      Tradeoff: a peer that can't establish WebRTC to anyone is isolated —
-//      there's no data fallback through the relay. For a public deployment
-//      behind hard NATs, add a TURN server rather than re-subscribing the relay.
-// It holds NO authority: it forwards signed facts it cannot forge.
+//   3. introduces peers (forwards the discovery topic) so they form DIRECT
+//      WebRTC links — most sheep data flows browser-to-browser over those,
+//   4. ALSO subscribes to the data topic, so it's a gossip BACKBONE/FALLBACK:
+//      a peer that can't establish WebRTC to anyone (hard NAT / cellular CGNAT,
+//      which can still reach the relay over wss) stays in the swarm by gossiping
+//      with the relay. Direct links offload the well-connected majority, so the
+//      relay carries the tail, not everything. (Hybrid: inclusivity over the
+//      pure discovery-only design — needed for a public launch reaching phones.)
+// It holds NO authority: it forwards signed facts it cannot forge, sees only
+// ciphertext, and can withhold but never corrupt.
 //
 // Env: PORT (ws listen, default 4001), ANNOUNCE (comma-separated public
 // multiaddrs to advertise, e.g. /dns4/relay.example.com/tcp/443/wss).
@@ -25,7 +26,7 @@ import { yamux } from '@chainsafe/libp2p-yamux';
 import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { identify } from '@libp2p/identify';
 import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
-import { DISCOVERY_TOPIC } from './common.js';
+import { TOPIC, DISCOVERY_TOPIC } from './common.js';
 
 const port = process.env.PORT || 4001;
 const announce = (process.env.ANNOUNCE || '').split(',').filter(Boolean);
@@ -69,8 +70,10 @@ const node = await createLibp2p({
   },
 });
 
-// NOTE: intentionally NOT subscribed to TOPIC — discovery/signaling only, see
-// the header. node.services.pubsub.subscribe(TOPIC) would make it a data hop.
+// Subscribe to the data topic: the relay is a gossip backbone/fallback so
+// hard-NAT peers (which can reach it over wss but not WebRTC anyone) stay in
+// the swarm. Direct browser-to-browser links offload the rest. (See header.)
+node.services.pubsub.subscribe(TOPIC);
 
 console.log('relay peer id:', node.peerId.toString());
 for (const addr of node.getMultiaddrs()) console.log('listening:', addr.toString());
