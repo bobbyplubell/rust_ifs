@@ -34,3 +34,14 @@ jobs:
         run: |
           npm install --no-audit --no-fund
           node test.js
+
+  connectivity:
+    runs-on: ubuntu-latest
+    # Real relay (libp2p) + Caddy (wss) + headless-Chromium peers, all in docker —
+    # so this runs on a docker-capable runner, NOT inside the Playwright container.
+    # Guards the recurring P2P connectivity regressions (0 peers / clear-data /
+    # relay mesh=0) before a deploy. See e2e/connectivity/README.md.
+    steps:
+      - uses: actions/checkout@v4
+      - name: connectivity integration test
+        run: ./e2e/connectivity/run.sh

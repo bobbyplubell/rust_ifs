@@ -1,0 +1,9 @@
+{
+  "name": "sheep-connectivity-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Docker integration test that catches P2P connectivity regressions before deploy.",
+  "dependencies": {
+    "playwright": "1.53.0"
+  }
+}
