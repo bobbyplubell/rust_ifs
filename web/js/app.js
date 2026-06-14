@@ -116,20 +116,36 @@ async function main() {
   // unresponsive until it lands. Anti-entropy's running inv timer carries the
   // link into sync the moment it joins.
   if (relays.length) {
+    console.log('[net] starting libp2p; relays:', relays);
     (async () => {
       try {
-        await versionReady;
-        const bust = buildVersion ? `?v=${buildVersion}` : '';
-        const { createLibp2pTransport } = await import(`./vendor/libp2p.js${bust}`);
+        // Don't let the version.txt cache-bust hint BLOCK the transport: if that
+        // fetch stalls, proceed without it rather than hang the swarm at 0 peers.
+        await Promise.race([versionReady, new Promise((r) => setTimeout(r, 3000))]);
+        console.log('[net] version:', buildVersion || '(none/timeout)');
+        // Encode the bust (it can contain spaces / "·") and retry UNVERSIONED if
+        // the versioned specifier ever fails to import — the query is only a
+        // cache hint, never worth a dead transport.
+        const bust = buildVersion ? `?v=${encodeURIComponent(buildVersion)}` : '';
+        let mod;
+        try {
+          mod = await import(`./vendor/libp2p.js${bust}`);
+        } catch (e) {
+          console.warn('[net] versioned bundle import failed; retrying unversioned:', e);
+          mod = await import('./vendor/libp2p.js');
+        }
+        console.log('[net] bundle imported; creating transport…');
         const stun = (params.get('stun') || '').split(',').map((s) => s.trim()).filter(Boolean);
-        const lp = await createLibp2pTransport({ relays, stun });
+        const lp = await mod.createLibp2pTransport({ relays, stun });
         transport.add(lp);
         window.__libp2p = lp.node; // diagnostics: connection/discovery inspection
-        console.log('libp2p transport up; relays:', relays);
+        console.log('[net] libp2p transport UP; relays:', relays);
       } catch (err) {
-        console.error('libp2p transport unavailable:', err);
+        console.error('[net] libp2p transport FAILED:', err);
       }
     })();
+  } else {
+    console.warn('[net] no relays configured — local-only (BroadcastChannel)');
   }
 
   // Resolve a sheep's genome from the live flock (cards hold every living
