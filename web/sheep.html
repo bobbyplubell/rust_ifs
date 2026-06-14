@@ -494,17 +494,25 @@
         ...(params.get('relay') ? [params.get('relay')] : []),
         ...((localStorage.getItem('relays') || '').split(',').map((s) => s.trim()).filter(Boolean)),
       ];
-      const relays = relayOverride.length ? relayOverride : RELAYS;
-      const transports = [new BroadcastTransport()];
+      // ?stress pages skip the prod relay unless ?relay= is passed (see app.js).
+      const relays = relayOverride.length ? relayOverride
+        : (params.get('stress') ? [] : RELAYS);
+      const transport = new CompositeTransport([new BroadcastTransport()]);
+      // Connect libp2p in the BACKGROUND so boot (and the contribute button)
+      // never blocks on the 620 KB bundle + relay handshake.
       if (relays.length) {
-        try {
-          const { createLibp2pTransport } = await import('./js/vendor/libp2p.js');
-          transports.push(await createLibp2pTransport({ relays }));
-        } catch (err) { console.error('libp2p transport unavailable:', err); }
+        (async () => {
+          try {
+            const { createLibp2pTransport } = await import('./js/vendor/libp2p.js');
+            const lp = await createLibp2pTransport({ relays });
+            transport.add(lp);
+            window.__libp2p = lp.node;
+          } catch (err) { console.error('libp2p transport unavailable:', err); }
+        })();
       }
 
       net = new Net({
-        transport: new CompositeTransport(transports),
+        transport,
         store,
         identity: { pubHex: me.pubHex, pair: me.pair },
         sign, verify,
@@ -523,18 +531,8 @@
       await net.start();
       banned = net.banned;
 
-      // Seed each frame from batches we already hold, then make previews.
-      for (let f = 0; f < N_FRAMES; f++) {
-        const have = (await store.batchesForSheep(id)).filter((b) => b.frame === f);
-        for (const b of have) frames[f].covered.add(b.idx);
-      }
-      // Eagerly tonemap any frames that already have coverage; preview the rest.
-      for (let f = 0; f < N_FRAMES; f++) {
-        if (frames[f].covered.size) { await ensureAcc(f); repaint(f); }
-        else makePreview(f).catch(console.error);
-      }
-      showSamples();
-
+      // Make the page interactive IMMEDIATELY — the contribute toggle and the
+      // playback loop must not wait on frame re-seeding (below) or the relay.
       $('#contribute').onclick = () => {
         contributing = !contributing;
         $('#contribute').classList.toggle('on', contributing);
@@ -547,9 +545,23 @@
         a.click();
         URL.revokeObjectURL(a.href);
       };
-
       startLoop();
       loop.start();
+
+      // Seed each frame from batches we already hold IN THE BACKGROUND —
+      // re-rendering existing coverage can be slow; don't block interactivity.
+      (async () => {
+        for (let f = 0; f < N_FRAMES; f++) {
+          const have = (await store.batchesForSheep(id)).filter((b) => b.frame === f);
+          for (const b of have) frames[f].covered.add(b.idx);
+        }
+        // Eagerly tonemap any frames that already have coverage; preview the rest.
+        for (let f = 0; f < N_FRAMES; f++) {
+          if (frames[f].covered.size) { await ensureAcc(f).catch(() => {}); repaint(f); }
+          else makePreview(f).catch(console.error);
+        }
+        showSamples();
+      })().catch(console.error);
     }
 
     main().catch((e) => { $('#info').textContent = 'error: ' + (e.message || e); console.error(e); });

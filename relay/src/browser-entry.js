@@ -61,7 +61,9 @@ export async function createLibp2pTransport({ relays, stun }) {
       ...(relays.length ? [bootstrap({ list: relays })] : []),
       // Broadcast our own circuit address on the discovery topic and dial peers
       // we hear about — this is what forms the direct browser-to-browser mesh.
-      pubsubPeerDiscovery({ interval: 5_000, topics: [DISCOVERY_TOPIC] }),
+      // 2s beacon: time-to-first-connection (and thus first sync) is gated by
+      // this, so keep it brisk for small swarms.
+      pubsubPeerDiscovery({ interval: 2_000, topics: [DISCOVERY_TOPIC] }),
     ],
     services: {
       identify: identify(),

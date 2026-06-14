@@ -82,19 +82,29 @@ async function main() {
     ...(params.get('relay') ? [params.get('relay')] : []),
     ...((localStorage.getItem('relays') || '').split(',').map((s) => s.trim()).filter(Boolean)),
   ];
-  const relays = relayOverride.length ? relayOverride : RELAYS;
-  const transports = [new BroadcastTransport()];
+  // ?stress pages (e2e + the docker harness) must NOT touch the production relay
+  // unless one is passed explicitly via ?relay= — otherwise test sheep/votes
+  // would leak into the live swarm.
+  const relays = relayOverride.length ? relayOverride
+    : (params.get('stress') ? [] : RELAYS);
+  const transport = new CompositeTransport([new BroadcastTransport()]);
+  // Connect libp2p in the BACKGROUND — the 620 KB bundle + relay handshake takes
+  // seconds, and blocking boot on it makes the whole page (incl. buttons)
+  // unresponsive until it lands. Anti-entropy's running inv timer carries the
+  // link into sync the moment it joins.
   if (relays.length) {
-    try {
-      const { createLibp2pTransport } = await import('./vendor/libp2p.js');
-      const stun = (params.get('stun') || '').split(',').map((s) => s.trim()).filter(Boolean);
-      const lp = await createLibp2pTransport({ relays, stun });
-      transports.push(lp);
-      window.__libp2p = lp.node; // diagnostics: connection/discovery inspection
-      console.log('libp2p transport up; relays:', relays);
-    } catch (err) {
-      console.error('libp2p transport unavailable:', err);
-    }
+    (async () => {
+      try {
+        const { createLibp2pTransport } = await import('./vendor/libp2p.js');
+        const stun = (params.get('stun') || '').split(',').map((s) => s.trim()).filter(Boolean);
+        const lp = await createLibp2pTransport({ relays, stun });
+        transport.add(lp);
+        window.__libp2p = lp.node; // diagnostics: connection/discovery inspection
+        console.log('libp2p transport up; relays:', relays);
+      } catch (err) {
+        console.error('libp2p transport unavailable:', err);
+      }
+    })();
   }
 
   // Resolve a sheep's genome from the live flock (cards hold every living
@@ -106,7 +116,7 @@ async function main() {
     ?? (await store.allSheep()).find((s) => s.id === id);
 
   net = new Net({
-    transport: new CompositeTransport(transports),
+    transport,
     store,
     identity: { pubHex: me.pubHex, pair: me.pair },
     sign,

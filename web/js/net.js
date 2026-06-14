@@ -197,12 +197,21 @@ export class BroadcastTransport {
 export class CompositeTransport {
   constructor(transports) {
     this.transports = transports;
+    this._handler = null;
   }
   send(msg) {
     for (const t of this.transports) t.send(msg);
   }
   onMessage(fn) {
+    this._handler = fn;
     for (const t of this.transports) t.onMessage(fn);
+  }
+  /** Attach a transport AFTER start (e.g. libp2p once it has connected, so page
+   *  boot never blocks on the relay). Anti-entropy's running inv timer carries
+   *  the new link into sync on its next tick. */
+  add(transport) {
+    this.transports.push(transport);
+    if (this._handler) transport.onMessage(this._handler);
   }
 }
 
@@ -272,12 +281,13 @@ export class Net {
     });
     this._dirty = true;
     await this._sendInv();
-    // Jittered interval: hundreds of peers must not beacon in lockstep.
+    // Jittered interval: hundreds of peers must not beacon in lockstep. Kept
+    // brisk (2.5–5s) so a freshly-connected peer starts syncing within seconds.
     const tick = () => {
       this._invTimer = setTimeout(() => {
         this._sendInv().catch(console.error);
         tick();
-      }, 4000 + Math.random() * 3000);
+      }, 2500 + Math.random() * 2500);
     };
     tick();
   }
