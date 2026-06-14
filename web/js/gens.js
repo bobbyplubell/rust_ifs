@@ -175,8 +175,24 @@ export async function computeFlock({
   // derived from the same replay, no stored state.
   const history = [];
 
-  // Only generations with activity change anything — skip the quiet ones.
-  const eventGens = [...new Set([...byGen.keys(), ...tallyByGen.keys()])]
+  // Fresh blood: even with NO votes, a deterministic immigrant joins every
+  // FRESH_BLOOD_EVERY generations so the flock keeps evolving on its own. The
+  // immigrant is derived from the generation NUMBER alone, so every peer —
+  // including one with an empty store — computes the identical flock with zero
+  // sync (a reset client shows a living flock immediately, no catch-up needed).
+  // Only a recent window is replayed: older auto-immigrants are long gone to
+  // population pressure, so this keeps cold-start replay bounded as gens climb.
+  const FRESH_BLOOD_EVERY = 6;    // ~30 min between automatic immigrants
+  const FRESH_BLOOD_WINDOW = 96;  // replay ~8h of ticks (older ones are dead)
+  const heartbeatGens = new Set();
+  if (randomFn) {
+    const from = Math.max(0, current - FRESH_BLOOD_WINDOW);
+    const first = Math.ceil(from / FRESH_BLOOD_EVERY) * FRESH_BLOOD_EVERY;
+    for (let g = first; g < current; g += FRESH_BLOOD_EVERY) heartbeatGens.add(g);
+  }
+
+  // Generations that change the flock: a vote, a submission, or a fresh-blood tick.
+  const eventGens = [...new Set([...byGen.keys(), ...tallyByGen.keys(), ...heartbeatGens])]
     .filter((g) => g < current)
     .sort((a, b) => a - b);
 
@@ -196,7 +212,9 @@ export async function computeFlock({
     // or breed this close — death is in the voters' hands too.
     const condemned = new Set(
       [...living.values()].filter((r) => (tally.get(r.id) || 0) < 0).map((r) => r.id));
-    if (!voted.length && !condemned.size) continue; // quiet gen: carry over unchanged
+    const heartbeat = heartbeatGens.has(g);
+    const selection = voted.length > 0 || condemned.size > 0;
+    if (!selection && !heartbeat) continue; // truly quiet gen: carry over unchanged
 
     // Voted sheep take survivor slots first — niched, so near-clones share
     // their votes' worth. Remaining slots (of K) fill from the unvoted living,
@@ -212,9 +230,14 @@ export async function computeFlock({
       survivors.push(...fill);
     }
 
+    // Crosses + mutants are SELECTION-driven: they only happen when the swarm
+    // actually voted or culled this gen. A pure fresh-blood tick skips them and
+    // just adds an immigrant below — time alone shouldn't breed the flock into
+    // itself, only inject new blood.
+    const children = [];
+    if (selection) {
     // Births: cyclic pairing of survivors; pair (a,b) sorted+deduped so the
     // child set is order-independent.
-    const children = [];
     const seenPairs = new Set();
     for (let i = 0; i < survivors.length && survivors.length >= 2; i++) {
       const a = survivors[i];
@@ -256,7 +279,12 @@ export async function computeFlock({
         });
       }
     }
-    if (randomFn) {
+    }
+    // Fresh blood: a deterministic immigrant (derived from the gen number alone,
+    // so every peer — even one with an empty store — derives the identical one)
+    // joins on any active OR fresh-blood-tick gen. This is what evolves the flock
+    // with no votes and lets a reset client show a living flock without syncing.
+    if (randomFn && (selection || heartbeat)) {
       for (let i = 0; i < IMMIGRANTS_PER_GEN; i++) {
         const challengeHex = await sha256Hex(utf8(`immigrant|${g}|${i}`));
         let child = childCache.get(challengeHex);

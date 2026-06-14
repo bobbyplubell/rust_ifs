@@ -587,13 +587,18 @@ export class Net {
     this.peers.set(msg.from, Date.now());
     const { keys, digests } = await this._buckets();
     let sent = 0;
-    for (const kind of ['sheep', 'batches', 'fraud', 'votes']) {
+    // Order matters: sheep + votes DEFINE the flock and are tiny; batches are
+    // bulky render data and sync redundantly via cov anyway. With a global cap,
+    // putting batches last means a busy peer's many batch buckets can never
+    // starve out the vote/sheep buckets — the bug that left a peer stuck on the
+    // genesis flock because the votes that evolved it were never offered.
+    for (const kind of ['sheep', 'votes', 'fraud', 'batches']) {
       const gens = new Set([
         ...Object.keys(digests[kind]),
         ...Object.keys(msg.d[kind] ?? {}),
       ]);
       for (const g of gens) {
-        if (sent >= 16) return; // bound per-inv repair work
+        if (sent >= 24) return; // bound per-inv repair work
         if (digests[kind][g] !== (msg.d[kind] ?? {})[g]) {
           this._send({
             kind: 'bucket', to: msg.from, what: kind, gen: Number(g),

@@ -364,8 +364,11 @@ let firstId; // a baked sheep id, reused by the swarm section's peer=1 store
   check('gen close with batch work breeds children',
     result.contribSurvives && result.born >= 3 && result.size >= 7,
     `living=${result.size}, born=${result.born}, survives=${result.contribSurvives}`);
+  // Selection-driven mutants stay pinned at MUTANTS_PER_GEN; immigrants are now
+  // >= 1 because fresh-blood ticks also inject deterministic immigrants on quiet
+  // gens in the replay window (so the flock evolves with no votes).
   check('mutants + immigrant derived from batch tallies',
-    result.mutants === 2 && result.immigrants === 1,
+    result.mutants === 2 && result.immigrants >= 1,
     `mutants=${result.mutants}, immigrants=${result.immigrants}`);
 
   // Breeding gate: a released child is admitted only if its author contributed
