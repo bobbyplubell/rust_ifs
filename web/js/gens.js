@@ -10,7 +10,7 @@
 
 import {
   gen, SURVIVORS_K, AUTHOR_GEN_CAP, MUTANTS_PER_GEN, IMMIGRANTS_PER_GEN, BREED_MIN_TILES,
-  computeBacking,
+  computeBacking, creditsFromTiles,
 } from './net.js';
 import { sha256Hex, utf8 } from './hash.js';
 
@@ -149,7 +149,10 @@ export async function computeFlock({
       votesByGen.get(v.gen).push(v);
     }
     for (const [g, votes] of votesByGen) {
-      tallyByGen.set(g, computeBacking(votes, earnedByGen.get(g) || new Map()));
+      const rawTiles = earnedByGen.get(g) || new Map();
+      const credits = new Map();
+      for (const [c, n] of rawTiles) credits.set(c, creditsFromTiles(n));
+      tallyByGen.set(g, computeBacking(votes, credits));
     }
   }
 

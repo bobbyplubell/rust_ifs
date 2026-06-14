@@ -266,8 +266,8 @@ function addCard(record) {
   tallyEl.className = 'tally';
   const contribBtn = document.createElement('button');
   contribBtn.textContent = 'contribute';
-  contribBtn.title = 'pledge idle CPU to this sheep — every batch you render ' +
-    'sharpens it for everyone AND earns you one credit to spend on selection';
+  contribBtn.title = 'pledge idle CPU to this sheep — every batch sharpens it ' +
+    'for everyone; every 128 tiles earns you one credit to spend on selection';
   const backBtn = document.createElement('button');
   backBtn.className = 'back';
   backBtn.textContent = 'back ▲';
@@ -776,7 +776,7 @@ function updateTally(sheepId) { markTally(sheepId); }
 // Earn one credit per batch you render this gen; spend credits to BACK sheep.
 // Credits are use-it-or-lose-it (reset every generation). The balance is cached
 // and recomputed only when your own render/vote activity changes it.
-let creditsView = { earned: 0, spent: 0, available: 0 };
+let creditsView = { tiles: 0, earned: 0, spent: 0, available: 0, perCredit: 128 };
 let creditsDirty = true;
 const voteSeqByGen = new Map(); // gen -> next seq for my votes (collision-free)
 
@@ -920,11 +920,14 @@ function updateStatus() {
   const ss = String(Math.floor((msLeft % 60_000) / 1000)).padStart(2, '0');
   const a = auditor?.stats ?? { audits: 0, frauds: 0 };
   const pulse = batchActivity ? ` · ⟳ ${batchActivity} tiles/s` : '';
-  const credHint = Date.now() < noCreditsUntil ? ' · ⚠ render to earn credits' : '';
+  const credHint = Date.now() < noCreditsUntil ? ' · ⚠ render more to earn a credit' : '';
+  const per = creditsView.perCredit || 128;
+  const toNext = per - (creditsView.tiles % per);
+  const creds = `${creditsView.available} credits (${toNext} tiles to next)`;
   $('#status').textContent =
     `gen ${gen() - GENESIS_GEN} closes in ${mm}:${ss} · ` +
     `you are ${handle(me.pubHex)} · ${net.peerCount()} peers · ` +
-    `${creditsView.available} credits · ` +
+    `${creds} · ` +
     `${a.audits} audits${a.frauds ? `, ${a.frauds} frauds!` : ''}${pulse}${credHint}`;
 }
 
@@ -1007,6 +1010,19 @@ function installStressHooks() {
     // Read hooks for tests/harness.
     backing: async (sheepId) => (await net.tallies(gen())).get(sheepId) || 0,
     credits: () => net.credits(gen()),
+    // Publish a vote record directly, BYPASSING the credit gate — for testing the
+    // wire/anti-entropy path of the new record kind. Safe: an uncredited vote has
+    // no selection effect (computeBacking caps spend at earned credits), so this
+    // can't actually buy influence; it just injects a record to watch it sync.
+    async castVote(sheepId) {
+      const g = gen();
+      const seq = await net.voteCount(g, me.pubHex);
+      const record = { v: PROTOCOL_VERSION, from: me.pubHex, gen: g, sheepId, n: 1, seq };
+      record.sig = await sign(me.pair, voteSignBytes(record));
+      await net.publishVote(record);
+      return record.key;
+    },
+    hasVoteFor: async (sheepId) => (await store.allVotes()).some((v) => v.sheepId === sheepId),
   };
 
   window.__sheepDump = async () => {

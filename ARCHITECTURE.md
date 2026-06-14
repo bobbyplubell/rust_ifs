@@ -264,9 +264,10 @@ sheep's coverage and tally. The heavy pixels move on demand:
 
 The **vote-credit economy** decouples render work from selection:
 
-- **Credits** earned by a key in generation `g` = its count of distinct verified
-  batches with `gen = g` (non-banned). Fungible and **use-it-or-lose-it** — they
-  expire at gen close, no stockpiling.
+- **Credits** earned by a key in generation `g` = `floor(distinct verified
+  batches with gen = g / TILES_PER_CREDIT)`, non-banned. `TILES_PER_CREDIT = 128`,
+  so a vote costs real work (≈ one breeding gate). Fungible and
+  **use-it-or-lose-it** — they expire at gen close, no stockpiling.
 - **Votes** are signed `vote` records (`{from, gen, sheepId, n, seq}`, back-only,
   flat) that spend credits to back a sheep. Ingest checks only well-formedness +
   signature; the credit BUDGET is enforced by deterministic recompute, exactly

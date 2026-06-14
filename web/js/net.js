@@ -113,6 +113,12 @@ export const voteValue = (_b) => 1;
 // voter's spend is capped at the credits they earned that gen; over-budget
 // votes are dropped in canonical (seq) order so every peer agrees. Credits =
 // audited CPU work, so influence can't be faked or Sybil-farmed for free.
+/** Tiles of audited render work that mint one spendable credit. Voting is meant
+ *  to cost real CPU — one credit ≈ one breeding gate's worth of work — so a vote
+ *  is scarce and meaningful, not a free click. */
+export const TILES_PER_CREDIT = 128;
+export const creditsFromTiles = (tiles) => Math.floor(tiles / TILES_PER_CREDIT);
+
 export const voteKey = (v) => `vote:${v.gen}:${v.from}:${v.seq}`;
 export const voteSignBytes = (v) =>
   utf8('vote|' + [v.v, v.from, v.gen, v.sheepId, v.n, v.seq].join('|'));
@@ -682,18 +688,20 @@ export class Net {
     return n;
   }
 
-  /** Credits earned per voter in a generation = their distinct verified batches
-   *  that gen (non-banned). The currency that funds votes. */
+  /** Credits earned per voter in a generation = floor(distinct verified batches
+   *  that gen / TILES_PER_CREDIT), non-banned. The currency that funds votes. */
   async _earnedCredits(g) {
-    const earned = new Map();
+    const tiles = new Map();
     const seen = new Set();
     for (const b of await this.store.allBatches()) {
       if (b.gen !== g || this.banned.has(b.contributor)) continue;
       const k = b.key ?? batchKey(b);
       if (seen.has(k)) continue;
       seen.add(k);
-      earned.set(b.contributor, (earned.get(b.contributor) || 0) + voteValue(b));
+      tiles.set(b.contributor, (tiles.get(b.contributor) || 0) + 1);
     }
+    const earned = new Map();
+    for (const [c, n] of tiles) earned.set(c, creditsFromTiles(n));
     return earned;
   }
 
@@ -706,14 +714,26 @@ export class Net {
     return computeBacking(votes, earned);
   }
 
-  /** The local user's credit position this generation. */
+  /** The local user's credit position this generation (incl. raw tiles so the UI
+   *  can show progress toward the next credit). */
   async credits(g) {
-    const earned = (await this._earnedCredits(g)).get(this.pubHex) || 0;
+    let tiles = 0;
+    if (!this.banned.has(this.pubHex)) {
+      const seen = new Set();
+      for (const b of await this.store.allBatches()) {
+        if (b.gen !== g || b.contributor !== this.pubHex) continue;
+        const k = b.key ?? batchKey(b);
+        if (seen.has(k)) continue;
+        seen.add(k);
+        tiles++;
+      }
+    }
+    const earned = creditsFromTiles(tiles);
     let spent = 0;
     for (const v of await this.store.allVotes()) {
       if (v.gen === g && v.from === this.pubHex) spent += v.n;
     }
-    return { earned, spent, available: Math.max(0, earned - spent) };
+    return { tiles, earned, spent, available: Math.max(0, earned - spent), perCredit: TILES_PER_CREDIT };
   }
 
   /** How many votes a key has cast in a generation (the next seq for that key). */

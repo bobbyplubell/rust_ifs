@@ -5,9 +5,9 @@ discussions. Ordered roughly by priority within each section. The committed
 design lives in ARCHITECTURE.md; this is the "next" list.
 
 ## Done (for reference)
-- Vote-credit economy: rendering earns fungible, use-it-or-lose-it **credits**;
-  spend them to **back** sheep; selection = backing, decoupled from render
-  coverage. Back-only, flat (no anti-whale curve — credits = audited CPU is the
+- Vote-credit economy: rendering earns fungible, use-it-or-lose-it **credits**
+  (128 tiles each); spend them to **back** sheep; selection = backing, decoupled
+  from render coverage. Back-only, flat (no anti-whale curve — credits = audited CPU is the
   real Sybil/whale defense), deterministic-recompute enforced (`computeBacking`
   caps spend at earned, drops over-budget votes canonically). New `vote` record
   kind + `votes` store, synced via the same anti-entropy buckets.

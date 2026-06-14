@@ -283,15 +283,15 @@ let firstId; // a baked sheep id, reused by the swarm section's peer=1 store
     }
     const g = gen() - 2;
     const author = 'f'.repeat(64);
-    // baked[0] gets render work (earns credits) AND backing votes this gen.
-    // Selection keys off BACKING (spent credits), so it needs the votes to win.
-    const batches = [0, 1, 2, 3].map((idx) => ({
+    // 128 tiles = 1 credit; spend it backing baked[0] so it wins selection.
+    // (Selection keys off BACKING, not render coverage, so the vote is required.)
+    const batches = Array.from({ length: 128 }, (_, idx) => ({
       sheepId: baked[0].id, frame: 0, idx, contributor: author, gen: g,
     }));
-    const votes = [0, 1, 2, 3].map((seq) => ({
-      from: author, gen: g, sheepId: baked[0].id, n: 1, seq,
-      key: `vote:${g}:${author}:${seq}`,
-    }));
+    const votes = [{
+      from: author, gen: g, sheepId: baked[0].id, n: 1, seq: 0,
+      key: `vote:${g}:${author}:0`,
+    }];
     const store = {
       allSheep: async () => [],
       allBatches: async () => batches,
@@ -374,55 +374,60 @@ let firstId; // a baked sheep id, reused by the swarm section's peer=1 store
   await page.close();
 }
 
-// ---- 7. vote-credit economy: earn credits, back a sheep, it syncs -----------
+// ---- 7. vote-credit economy: 128 tiles/credit, cap, cross-peer vote sync ----
 {
   section('vote-credit economy');
-  // nocontribute so credits change ONLY via our explicit actions (no background
-  // contribute loop racing the balance).
+  // (a) unit: credit floor (128 tiles/credit) + backing cap. Pure + fast — no
+  // need to render 128 real tiles to exercise the rule.
+  const u = await ctx.newPage();
+  await u.goto(`${base}/about.html`);
+  const r = await u.evaluate(async () => {
+    const { computeBacking, creditsFromTiles, TILES_PER_CREDIT } = await import('./js/net.js');
+    const earned = new Map([['X', 2], ['Y', 0]]); // X has 2 credits, Y has 0
+    const votes = [
+      { from: 'X', gen: 1, sheepId: 'A', n: 1, seq: 0 },
+      { from: 'X', gen: 1, sheepId: 'A', n: 1, seq: 1 },
+      { from: 'X', gen: 1, sheepId: 'A', n: 1, seq: 2 }, // over X's 2-credit budget
+      { from: 'Y', gen: 1, sheepId: 'A', n: 1, seq: 0 }, // Y can't afford it
+    ];
+    const backing = computeBacking(votes, earned);
+    return {
+      tpc: TILES_PER_CREDIT,
+      f: [creditsFromTiles(127), creditsFromTiles(128), creditsFromTiles(256)],
+      backingA: backing.get('A') || 0,
+    };
+  });
+  check('128 tiles per credit', r.tpc === 128, `TILES_PER_CREDIT=${r.tpc}`);
+  check('credit floor 127->0, 128->1, 256->2',
+    r.f[0] === 0 && r.f[1] === 1 && r.f[2] === 2, `floor=${r.f.join('/')}`);
+  check('backing capped at earned credits; uncredited votes dropped',
+    r.backingA === 2, `backing=${r.backingA}`);
+  await u.close();
+
+  // (b) cross-peer: a vote record propagates over anti-entropy (the new kind
+  // syncs). castVote injects a record directly — its selection effect is still
+  // gated by credits on recompute, so this only exercises the wire path.
   const a = await ctx.newPage();
   const b = await ctx.newPage();
-  a.on('console', (m) => { if (m.type() === 'error') console.log('a console.error:', m.text()); });
   await a.goto(`${base}/index.html?peer=30&stress=1&nocontribute=1`);
   await b.goto(`${base}/index.html?peer=31&stress=1&nocontribute=1`);
   await a.waitForFunction(() => window.__sheepAct && document.querySelectorAll('.card').length > 0);
   await b.waitForFunction(() => window.__sheepAct && document.querySelectorAll('.card').length > 0);
-
-  // a: render 3 tiles to one sheep (earn 3 credits), then back it twice.
-  const r = await a.evaluate(async () => {
+  // Let both nets finish start() + exchange a round of inv so they're meshed
+  // (otherwise the vote's gossip can land before b is listening and only
+  // anti-entropy — slower — carries it).
+  await new Promise((res) => setTimeout(res, 2500));
+  const sid = await a.evaluate(() => {
     const id = document.querySelector('.card').dataset.id;
-    for (let i = 0; i < 3; i++) await window.__sheepAct.contributeTo(id);
-    const before = await window.__sheepAct.credits();
-    await window.__sheepAct.back(id);
-    await window.__sheepAct.back(id);
-    const after = await window.__sheepAct.credits();
-    return { id, before, after, backing: await window.__sheepAct.backing(id) };
+    return window.__sheepAct.castVote(id).then(() => id);
   });
-  check('a earned credits from rendering', r.before.earned === 3, `earned=${r.before.earned}`);
-  check('a spent credits, balance dropped',
-    r.after.spent === 2 && r.after.available === 1,
-    `spent=${r.after.spent}, available=${r.after.available}`);
-  check('a backing reflects its votes (<= credits)', r.backing === 2, `backing=${r.backing}`);
-
-  // b: receives a's batches + votes via anti-entropy and computes the same backing.
-  let bBacking = 0;
-  for (let i = 0; i < 40; i++) {
-    bBacking = await b.evaluate((id) => window.__sheepAct.backing(id), r.id);
-    if (bBacking >= 2) break;
+  let synced = false;
+  for (let i = 0; i < 60; i++) {
+    synced = await b.evaluate((id) => window.__sheepAct.hasVoteFor(id), sid);
+    if (synced) break;
     await new Promise((res) => setTimeout(res, 500));
   }
-  check('b received the votes (backing synced cross-peer)', bBacking === 2, `b backing=${bBacking}`);
-
-  // Overspend is impossible: spend the last credit, then back() is a no-op.
-  const over = await a.evaluate(async (id) => {
-    await window.__sheepAct.back(id);              // spend the 3rd/last credit
-    const c = await window.__sheepAct.credits();
-    const blocked = await window.__sheepAct.back(id); // no credits -> null
-    return { available: c.available, blocked, backing: await window.__sheepAct.backing(id) };
-  }, r.id);
-  check('overspend blocked; backing capped at earned credits',
-    over.available === 0 && over.blocked === null && over.backing === 3,
-    `available=${over.available}, blocked=${over.blocked}, backing=${over.backing}`);
-
+  check('vote record syncs cross-peer (new kind over anti-entropy)', synced, `synced=${synced}`);
   await a.close();
   await b.close();
 }
