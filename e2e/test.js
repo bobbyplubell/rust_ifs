@@ -474,6 +474,119 @@ let firstId; // a baked sheep id, reused by the swarm section's peer=1 store
   await b.close();
 }
 
+// ---- 7. late joiner converges to an established peer's flock -----------------
+// The recurring worry: peer A builds up non-trivial state (contributes work,
+// casts a vote, releases a bred sheep), evolving its replicated fact set beyond
+// pure genesis. Peer B then joins LATE — after A is already established — and
+// must, via anti-entropy alone, pull A's whole built-up state and compute the
+// SAME flock. We assert B converges on A's living-sheep ids AND on A's
+// replicated facts (votes, sheep records, batchSetHash). If B stayed on the
+// genesis flock or missed A's facts, this fails and pinpoints what diverged.
+//
+// STATUS: this currently FAILS — it caught a real anti-entropy bug. The pull
+// path works up to the digest exchange, but every reply that ships actual
+// records is mis-ADDRESSED and dropped. In net.js the request/offer messages
+// `bucket` (_onInv), `covreq` (_onCov), and `covkeys` (_onCovReq) are sent with
+// `to:` but NO `from:` field; their handlers (_onBucket/_onCovReq/_onCovKeys/
+// _onWantItems) then reply with `to: msg.from` — which is undefined — and
+// _fillFor builds a `data` message addressed `to: undefined`. The receiver's
+// `if (msg.to !== this.pubHex) return` in _recv('data') drops the whole batch.
+// So peers detect divergence forever (inv/cov carry `from`) but never repair it.
+// Fix: stamp `from: this.pubHex` on the bucket/covreq/covkeys/want-items sends
+// (and have _fillFor address the data to that real `from`). This test goes green
+// once a late joiner can actually pull records. Live gossip (publishVote/Batch/
+// Sheep broadcasts) is unaffected — that's why same-time peers sync fine and
+// only a LATE joiner, which depends on the pull path, is left stuck on genesis.
+{
+  section('late joiner converges to established peer');
+
+  // A joins ALONE and builds state. nocontribute=1 freezes the background loop
+  // so the only batches/votes/sheep in the system are the ones we drive here —
+  // a deterministic, inspectable fact set (no churn racing the settle window).
+  const A = await ctx.newPage();
+  A.on('pageerror', (e) => console.log('A pageerror:', e.message));
+  await A.goto(`${base}/index.html?peer=40&stress=1&nocontribute=1`);
+  await A.waitForFunction(() => window.__sheepAct && document.querySelectorAll('.card').length > 0);
+
+  // (1) A contributes real render work across its flock (earns batches, which
+  // both feed tallies and are the bulky data a late joiner must pull), ...
+  let aBatches = 0;
+  for (let i = 0; i < 8; i++) {
+    const id = await A.evaluate(() => window.__sheepAct.contributeRandom());
+    if (id) aBatches++;
+  }
+  // ... casts a vote (the fact that evolves selection — the one a stuck peer
+  // historically never received), ...
+  const votedId = await A.evaluate(() => {
+    const id = document.querySelector('.card').dataset.id;
+    return window.__sheepAct.castVote(id).then(() => id);
+  });
+  // ... and releases a bred child (a NEW signed sheep record not derivable from
+  // the gen number — B can only have it by syncing it from A).
+  const childId = await A.evaluate(() => window.__sheepAct.breedRandom());
+  check('A built non-trivial state (batches + vote + release)',
+    aBatches >= 4 && !!votedId && !!childId,
+    `batches=${aBatches} vote=${!!votedId} child=${childId}`);
+
+  // Let A's rebuild settle so its flock + dump reflect the new facts.
+  await new Promise((res) => setTimeout(res, 1500));
+  const flockIds = (page) => page.evaluate(() =>
+    [...document.querySelectorAll('.card')].map((c) => c.dataset.id).sort());
+  const aFlock = await flockIds(A);
+  const aDump = await A.evaluate(() => window.__sheepDump());
+
+  // (2) B joins LATE — created only now, after A is fully established. It starts
+  // from a clean store (peer=41, its own IndexedDB namespace) and must catch up
+  // entirely over anti-entropy.
+  const B = await ctx.newPage();
+  B.on('pageerror', (e) => console.log('B pageerror:', e.message));
+  await B.goto(`${base}/index.html?peer=41&stress=1&nocontribute=1`);
+  await B.waitForFunction(() => window.__sheepAct && document.querySelectorAll('.card').length > 0);
+
+  // (3) Give anti-entropy several rounds (inv every ~2.5–5s). Poll for the
+  // strongest single signal — full batch-set agreement — then read the rest.
+  let converged = false;
+  for (let i = 0; i < 60; i++) {
+    const bHash = await B.evaluate(() => window.__sheepDump().then((d) => d.batchSetHash));
+    if (bHash === aDump.batchSetHash) { converged = true; break; }
+    await new Promise((res) => setTimeout(res, 1000));
+  }
+  // A small extra settle so B's last received records trigger its flock rebuild.
+  await new Promise((res) => setTimeout(res, 2000));
+
+  const bFlock = await flockIds(B);
+  const bDump = await B.evaluate(() => window.__sheepDump());
+
+  // Did B pull A's released bred sheep record (a fact only A authored)?
+  const bHasChild = await B.evaluate(async (cid) => {
+    const { openStore } = await import('./js/store.js');
+    const s = await openStore();
+    return (await s.allSheep()).some((r) => r.id === cid);
+  }, childId);
+  // Did B pull A's vote?
+  const bHasVote = await B.evaluate((id) => window.__sheepAct.hasVoteFor(id), votedId);
+
+  const flockAgrees = aFlock.length === bFlock.length
+    && aFlock.every((id, i) => id === bFlock[i]);
+
+  check('late joiner B pulled A full replicated batch set (batchSetHash)',
+    bDump.batchSetHash === aDump.batchSetHash,
+    `A=${aDump.batchSetHash.slice(0, 12)} B=${bDump.batchSetHash.slice(0, 12)} batches A=${aDump.batches}/B=${bDump.batches}`);
+  check('late joiner B received A vote', bHasVote, `voted=${votedId}`);
+  check('late joiner B received A released bred sheep record', bHasChild, `child=${childId}`);
+  check('late joiner B converged on the SAME flock (living-sheep ids)',
+    flockAgrees,
+    `A=${aFlock.length} ids / B=${bFlock.length} ids` +
+    (flockAgrees ? '' : ` · onlyA=[${aFlock.filter((id) => !bFlock.includes(id)).join(',')}]` +
+      ` onlyB=[${bFlock.filter((id) => !aFlock.includes(id)).join(',')}]`));
+  check('late joiner B agrees on current-gen tally fingerprint',
+    bDump.tallyFingerprint === aDump.tallyFingerprint,
+    `A=${aDump.tallyFingerprint.slice(0, 12)} B=${bDump.tallyFingerprint.slice(0, 12)}`);
+
+  await A.close();
+  await B.close();
+}
+
 console.log(failures ? `\n${failures} CHECK(S) FAILED` : '\nALL E2E CHECKS PASSED');
 await browser.close();
 server.close();
