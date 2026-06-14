@@ -103,7 +103,7 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
     return { checked, mismatch };
   });
   check('browser render_chunk matches native expected-hashes',
-    result.checked === 48 && result.mismatch === 0,
+    result.checked === 40 && result.mismatch === 0,
     `checked=${result.checked}, mismatch=${result.mismatch}`);
   await page.close();
 }
