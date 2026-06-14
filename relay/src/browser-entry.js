@@ -13,7 +13,6 @@ import { identify } from '@libp2p/identify';
 import { bootstrap } from '@libp2p/bootstrap';
 import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
 import { multiaddr } from '@multiformats/multiaddr';
-import { pipe } from 'it-pipe';
 import { TOPIC, DISCOVERY_TOPIC, RELAY_TOPIC, enc, dec } from './common.js';
 
 // Public STUN servers (used unless the caller passes its own). STUN is a cheap,
@@ -73,25 +72,9 @@ export async function createLibp2pTransport({ relays, stun }) {
     ],
     services: {
       identify: identify(),
-      pubsub: gossipsub({
-        allowPublishToZeroTopicPeers: true,
-        // Headroom so the browser's mesh holds the relay alongside its WebRTC
-        // peers instead of pruning the backbone down to the default D=6.
-        D: 8, Dlo: 6, Dhi: 12,
-      }),
+      pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }),
     },
   });
-
-  // Respond to /ipfs/ping/1.0.0 — a plain byte echo. The connectionMonitor on
-  // the relay AND on other browsers pings us to check we're alive; with no
-  // handler the ping fails as "unsupported" and is treated as alive, so DEAD
-  // peers are never detected and pile up in the gossip mesh, crowding out the
-  // live relay link (the root of the "stuck at 0 peers" bug). With this, dead
-  // links get aborted and the mesh stays clean. (node_modules is read-only here
-  // so we can't add @libp2p/ping — this is the minimal echo it implements.)
-  node.handle('/ipfs/ping/1.0.0', ({ stream }) => {
-    pipe(stream, stream).catch(() => {});
-  }, { runOnLimitedConnection: true }).catch(() => {});
 
   node.services.pubsub.subscribe(TOPIC);
 
