@@ -766,20 +766,25 @@ let batchActivity = 0; // batches seen since the last tick (the "live" pulse)
 const markTally = (sheepId) => tallyDirty.add(sheepId);
 
 // A card's ♥ is its BACKING (credits spent on it this gen) — the selection
-// score, not render coverage. Backing is a gen-wide computation (a voter's
-// spend is capped across all the sheep they backed), so recompute the whole
-// open generation once per tick and repaint just the dirty cards.
+// score. Backing is a gen-wide computation, and rank is global (top-3 get
+// medals — the live leaderboard), so recompute once and repaint ALL cards.
+const MEDALS = ['🥇', '🥈', '🥉'];
 async function refreshTallies() {
   if (!tallyDirty.size) return;
-  const ids = [...tallyDirty];
   tallyDirty.clear();
   const backing = await net.tallies(gen());
-  for (const id of ids) {
-    const entry = cards.get(id);
-    if (!entry) continue;
+  const ranked = [...cards.keys()]
+    .map((id) => [id, backing.get(id) || 0])
+    .filter(([, n]) => n > 0)
+    .sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1));
+  const medalOf = new Map(ranked.slice(0, 3).map(([id], i) => [id, MEDALS[i]]));
+  for (const [id, entry] of cards) {
     const n = backing.get(id) || 0;
-    entry.tallyEl.textContent = n > 0 ? `${n} ♥` : '';
-    entry.tallyEl.title = `${n} credit${n === 1 ? '' : 's'} backing this sheep this generation`;
+    const m = medalOf.get(id);
+    entry.tallyEl.textContent = n > 0 ? `${m ? m + ' ' : ''}${n} ♥` : '';
+    entry.tallyEl.title = n > 0
+      ? `${n} credit${n === 1 ? '' : 's'} backing${m ? ` · rank #${MEDALS.indexOf(m) + 1} this generation` : ''}`
+      : '';
   }
 }
 

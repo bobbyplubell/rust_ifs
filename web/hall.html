@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>hall of fame — electric sheep</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    main { max-width: 760px; }
+    .champ {
+      display: flex; gap: 16px; align-items: center;
+      padding: 14px 0; border-bottom: 1px solid #1c1c28;
+    }
+    .champ canvas {
+      width: 128px; height: 128px; background: #000;
+      border-radius: 4px; flex-shrink: 0; image-rendering: auto;
+    }
+    .champ .info { min-width: 0; }
+    .champ .gen { color: #7d7d92; font-size: 12px; letter-spacing: 0.04em; }
+    .champ .name { font-size: 17px; margin: 2px 0; }
+    .champ .name a { color: #c8b06a; text-decoration: none; }
+    .champ .name a:hover { text-decoration: underline; }
+    .champ .backing { color: #9a9ab0; font-size: 13px; }
+    .crown { font-size: 18px; }
+    #hall { margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>hall of fame</h1>
+    <p>
+      the most-backed sheep of every closed generation, shown in their full
+      community-rendered glory — derived from signed facts in this peer's store,
+      no server kept score. <a href="index.html" id="back">← back to the flock</a>
+    </p>
+  </header>
+  <main id="hall">replaying the generations…</main>
+
+  <script type="module">
+    import init, { sheep_id, breed, mutate_genome, random_genome_json } from './pkg/flame_wasm.js';
+    import { WorkerPool } from './js/pool.js';
+    import { openStore } from './js/store.js';
+    import { computeFlock } from './js/gens.js';
+    import { specForGen, specCells, GENESIS_GEN } from './js/net.js';
+    import { provenance } from './js/names.js';
+    import { PEER_NS } from './js/identity.js';
+
+    const hall = document.getElementById('hall');
+    try {
+      await init();
+      const store = await openStore();
+      const pool = new WorkerPool(1); // a timeline doesn't need the whole pool
+
+      // Baked gen-0 flock from the manifest (same seed as the flock view).
+      const baked = [];
+      const manifest = await (await fetch('genomes/manifest.json')).json();
+      for (const s of manifest.sheep) {
+        const genome = await (await fetch(s.file)).text();
+        baked.push({ id: sheep_id(genome), genome, parents: null, gen: 0, baked: true, name: s.name });
+      }
+      const breedFn = async (a, b, ch) => { const j = breed(a, b, ch); return { childJson: j, childId: sheep_id(j) }; };
+      const mutateFn = async (g, ch, r) => { const j = mutate_genome(g, ch, r); return { childJson: j, childId: sheep_id(j) }; };
+      const randomFn = async (seed) => { const j = random_genome_json(seed, 3); return { childJson: j, childId: sheep_id(j) }; };
+
+      // Replay the chain → the champion (most-backed) of each closed generation.
+      const { history } = await computeFlock({ store, baked, breedFn, mutateFn, randomFn });
+
+      if (!history.length) {
+        hall.textContent = 'no champions yet — once a generation closes with backing, its winner is enshrined here.';
+      } else {
+        hall.textContent = '';
+        for (const champ of [...history].reverse()) { // newest generation first
+          const row = document.createElement('div');
+          row.className = 'champ';
+          const canvas = document.createElement('canvas');
+          const info = document.createElement('div');
+          info.className = 'info';
+          const peerQ = PEER_NS !== '0' ? `&peer=${PEER_NS}` : '';
+          info.innerHTML =
+            `<div class="gen">GENERATION ${champ.gen - GENESIS_GEN}</div>` +
+            `<div class="name"><a href="sheep.html?id=${champ.record.id}${peerQ}" target="_blank">` +
+            `${provenance(champ.record).who}</a> <span class="crown">👑</span></div>` +
+            `<div class="backing">${champ.backing} credit${champ.backing === 1 ? '' : 's'} backing</div>`;
+          row.append(canvas, info);
+          hall.append(row);
+          renderChampion(pool, store, champ.record, canvas).catch(console.error);
+        }
+      }
+    } catch (err) {
+      hall.textContent = 'error: ' + (err?.message || err);
+      console.error(err);
+    }
+
+    // Paint a champion's HIGH-QUALITY accumulated frame-0 render: the verified
+    // cached render if this peer holds it, else reconstruct by re-rendering and
+    // summing its batches (off-thread, so the page stays responsive).
+    async function renderChampion(pool, store, record, canvas) {
+      const spec = specForGen(record.gen);
+      canvas.width = spec.width; canvas.height = spec.height;
+      let histBuf;
+      const cached = await store.getRender(record.id, 0);
+      if (cached?.buf) {
+        histBuf = cached.buf;
+      } else {
+        const batches = (await store.batchesForSheep(record.id)).filter((b) => b.frame === 0);
+        if (!batches.length) { canvas.title = 'render not synced to this peer yet'; return; }
+        const acc = new BigUint64Array(specCells(spec));
+        for (const b of batches) {
+          const m = await pool.submit({
+            type: 'render-batch', genomeJson: record.genome, sheepId: record.id,
+            frame: 0, idx: b.idx, w: spec.width, h: spec.height, ss: spec.ss, spp: spec.spp,
+          }).done;
+          if (m.type === 'batch-done') {
+            const bh = new BigUint64Array(m.hist);
+            for (let i = 0; i < acc.length; i++) acc[i] += bh[i];
+          }
+        }
+        histBuf = acc.buffer;
+      }
+      const m = await pool.submit({
+        type: 'tonemap-int', hist: histBuf, genomeJson: record.genome,
+        w: spec.width, h: spec.height, ss: spec.ss,
+      }).done;
+      if (m.type === 'done') {
+        canvas.getContext('2d').putImageData(
+          new ImageData(new Uint8ClampedArray(m.rgba), m.width, m.height), 0, 0);
+      }
+    }
+  </script>
+</body>
+</html>

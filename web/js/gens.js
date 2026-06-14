@@ -171,6 +171,10 @@ export async function computeFlock({
 
   let living = new Map(baked.map((r) => [r.id, r]));
 
+  // Hall of Fame: the most-backed sheep of each closed generation. Emergent —
+  // derived from the same replay, no stored state.
+  const history = [];
+
   // Only generations with activity change anything — skip the quiet ones.
   const eventGens = [...new Set([...byGen.keys(), ...tallyByGen.keys()])]
     .filter((g) => g < current)
@@ -186,6 +190,8 @@ export async function computeFlock({
       .map((r) => [r, tally.get(r.id) || 0])
       .filter(([, c]) => c > 0)
       .sort((a, b) => b[1] - a[1] || (a[0].id < b[0].id ? -1 : 1));
+    // The most-backed sheep of this generation enters the Hall of Fame.
+    if (voted.length) history.push({ gen: g, record: voted[0][0], backing: voted[0][1] });
     // Down-voted to net-negative: culled outright. They cannot survive, fill,
     // or breed this close — death is in the voters' hands too.
     const condemned = new Set(
@@ -276,5 +282,5 @@ export async function computeFlock({
     if (releaseAdmitted(r)) living.set(r.id, r);
   }
 
-  return { living, genActive: current };
+  return { living, genActive: current, history };
 }
