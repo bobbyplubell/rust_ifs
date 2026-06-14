@@ -277,9 +277,10 @@ export function audit_frame(genome_json, width, height, ss, samples_per_frame, c
  * @param {number} h
  * @param {number} ss
  * @param {number} spp
+ * @param {number} n_frames
  * @returns {string}
  */
-export function batch_hash(genome_json, sheep_id_hex, frame, idx, w, h, ss, spp) {
+export function batch_hash(genome_json, sheep_id_hex, frame, idx, w, h, ss, spp, n_frames) {
     let deferred4_0;
     let deferred4_1;
     try {
@@ -287,7 +288,7 @@ export function batch_hash(genome_json, sheep_id_hex, frame, idx, w, h, ss, spp)
         const len0 = WASM_VECTOR_LEN;
         const ptr1 = passStringToWasm0(sheep_id_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
         const len1 = WASM_VECTOR_LEN;
-        const ret = wasm.batch_hash(ptr0, len0, ptr1, len1, frame, idx, w, h, ss, spp);
+        const ret = wasm.batch_hash(ptr0, len0, ptr1, len1, frame, idx, w, h, ss, spp, n_frames);
         var ptr3 = ret[0];
         var len3 = ret[1];
         if (ret[3]) {
@@ -473,10 +474,12 @@ export function random_genome_json(seed, transforms) {
 
 /**
  * Render batch `(frame, idx)` of the sheep identified by `sheep_id_hex`
- * (32-byte hex). The genome is animated to `phase = frame / N_FRAMES`, then
+ * (32-byte hex). The genome is animated to `phase = frame / n_frames`, then
  * `spp` samples are plotted from `batch_seed(sheep_id, frame, idx)` into an
- * integer histogram at `w*ss x h*ss`. Deterministic: every peer rendering the
- * same args gets a byte-identical `hist` and `hash`.
+ * integer histogram at `w*ss x h*ss`. `n_frames` is the sheep's loop length
+ * (from its spec) so a 128-frame sheep renders phase = frame / 128.
+ * Deterministic: every peer rendering the same args gets a byte-identical
+ * `hist` and `hash`.
  * @param {string} genome_json
  * @param {string} sheep_id_hex
  * @param {number} frame
@@ -485,14 +488,15 @@ export function random_genome_json(seed, transforms) {
  * @param {number} h
  * @param {number} ss
  * @param {number} spp
+ * @param {number} n_frames
  * @returns {RenderedBatch}
  */
-export function render_batch(genome_json, sheep_id_hex, frame, idx, w, h, ss, spp) {
+export function render_batch(genome_json, sheep_id_hex, frame, idx, w, h, ss, spp, n_frames) {
     const ptr0 = passStringToWasm0(genome_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(sheep_id_hex, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len1 = WASM_VECTOR_LEN;
-    const ret = wasm.render_batch(ptr0, len0, ptr1, len1, frame, idx, w, h, ss, spp);
+    const ret = wasm.render_batch(ptr0, len0, ptr1, len1, frame, idx, w, h, ss, spp, n_frames);
     if (ret[2]) {
         throw takeFromExternrefTable0(ret[1]);
     }

@@ -142,7 +142,7 @@ async function main() {
       const s = specForGen((await lookupSheep(sheepId))?.gen ?? gen());
       return pool.submit({
         type: 'batch-hash', genomeJson, sheepId, frame, idx,
-        w: s.width, h: s.height, ss: s.ss, spp: s.spp,
+        w: s.width, h: s.height, ss: s.ss, spp: s.spp, nFrames: s.nFrames,
       }).done.then((m) => m.hash);
     },
     checkSheepId: (genomeJson) =>
@@ -489,7 +489,7 @@ function renderBatchMsg(record, frame, idx) {
   const s = specOf(record);
   return {
     type: 'render-batch', genomeJson: record.genome, sheepId: record.id,
-    frame, idx, w: s.width, h: s.height, ss: s.ss, spp: s.spp,
+    frame, idx, w: s.width, h: s.height, ss: s.ss, spp: s.spp, nFrames: s.nFrames,
   };
 }
 

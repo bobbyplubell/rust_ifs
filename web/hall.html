@@ -108,7 +108,7 @@
         for (const b of batches) {
           const m = await pool.submit({
             type: 'render-batch', genomeJson: record.genome, sheepId: record.id,
-            frame: 0, idx: b.idx, w: spec.width, h: spec.height, ss: spec.ss, spp: spec.spp,
+            frame: 0, idx: b.idx, w: spec.width, h: spec.height, ss: spec.ss, spp: spec.spp, nFrames: spec.nFrames,
           }).done;
           if (m.type === 'batch-done') {
             const bh = new BigUint64Array(m.hist);

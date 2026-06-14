@@ -100,9 +100,12 @@ pub fn render_proof_frame(
 
 // ---- batch primitives (the protocol's unit of work, v2) --------------------
 
-/// Number of animation frames in a sheep's loop. Frame `f` is the genome
-/// animated to phase `f / N_FRAMES`. PROTOCOL CONSTANT.
-pub const N_FRAMES: u32 = 64;
+/// Default / reference number of animation frames in a sheep's loop. Frame `f`
+/// is the genome animated to phase `f / n_frames`. The AUTHORITATIVE frame
+/// count is now the `n_frames` argument threaded through `render_batch` /
+/// `batch_hash` (sourced from a sheep's spec), not this constant — a sheep's
+/// spec, not a global, decides its loop length. Kept as the genesis reference.
+pub const N_FRAMES: u32 = 128;
 
 /// Burn-in iterations per batch (each batch settles onto the attractor
 /// independently, like a chunk).
@@ -129,10 +132,11 @@ pub fn batch_seed(sheep_id: &[u8], frame: u32, idx: u32) -> u64 {
 /// Render one batch into its own fresh integer accumulation buffer at
 /// supersampled resolution (`w*ss x h*ss`).
 ///
-/// The genome is animated to `phase = frame / N_FRAMES`, then `spp` samples are
+/// The genome is animated to `phase = frame / n_frames`, then `spp` samples are
 /// plotted from `seed = batch_seed(sheep_id, frame, idx)`. Deterministic and
 /// content-addressable: hash the returned `Accum` with `hist_hash` to get the
-/// batch's commitment.
+/// batch's commitment. `n_frames` is the sheep's loop length (from its spec),
+/// not a global constant, so a 128-frame sheep renders phase = frame / 128.
 pub fn render_batch(
     genome: &Genome,
     sheep_id: &[u8],
@@ -142,9 +146,10 @@ pub fn render_batch(
     height: usize,
     ss: usize,
     spp: u32,
+    n_frames: u32,
 ) -> Accum {
     let mut accum = Accum::new(width * ss, height * ss);
-    let phase = frame as f64 / N_FRAMES as f64;
+    let phase = frame as f64 / n_frames as f64;
     let g = crate::animate::animated(genome, phase);
     let seed = batch_seed(sheep_id, frame, idx);
     accumulate(&g, spp as u64, BATCH_BURN_IN, seed, &mut accum);
@@ -469,9 +474,9 @@ mod tests {
     /// that hash is pinned so a future bitstream change is caught.
     ///
     /// sheep_id is the canonical id of a fixed genome; frame=2, idx=5, 64x64,
-    /// ss=1, spp=50_000.
+    /// ss=1, spp=50_000, n_frames=128 (genesis loop length, so phase = 2/128).
     const BATCH_GOLDEN: &str =
-        "1635d61a57b67bd3e33f06d980c3f178f9a3c127b7978c61e8d50346c093bc73";
+        "39c6ee55e86f3b5e9177fa255bfac3727af4d5f568c47332665f2b4aaece31fd";
 
     #[test]
     fn render_batch_is_deterministic_and_golden() {
@@ -479,8 +484,8 @@ mod tests {
         let genome = Genome::random(&mut rng, 3);
         let sheep_id = crate::canonical::sheep_id(&genome);
 
-        let a = render_batch(&genome, &sheep_id, 2, 5, 64, 64, 1, 50_000);
-        let b = render_batch(&genome, &sheep_id, 2, 5, 64, 64, 1, 50_000);
+        let a = render_batch(&genome, &sheep_id, 2, 5, 64, 64, 1, 50_000, 128);
+        let b = render_batch(&genome, &sheep_id, 2, 5, 64, 64, 1, 50_000, 128);
         let ha = hist_hash_hex(&a);
         let hb = hist_hash_hex(&b);
         assert_eq!(ha, hb, "render_batch must be byte-deterministic");
@@ -502,7 +507,7 @@ mod tests {
         let mut rng = Rng::new(2);
         let genome = Genome::random(&mut rng, 3);
         let sheep_id = crate::canonical::sheep_id(&genome);
-        let a = render_batch(&genome, &sheep_id, 2, 5, 64, 64, 1, 50_000);
+        let a = render_batch(&genome, &sheep_id, 2, 5, 64, 64, 1, 50_000, 128);
         println!("BATCH_GOLDEN: \"{}\"", hist_hash_hex(&a));
     }
 

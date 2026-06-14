@@ -454,10 +454,12 @@ impl RenderedBatch {
 }
 
 /// Render batch `(frame, idx)` of the sheep identified by `sheep_id_hex`
-/// (32-byte hex). The genome is animated to `phase = frame / N_FRAMES`, then
+/// (32-byte hex). The genome is animated to `phase = frame / n_frames`, then
 /// `spp` samples are plotted from `batch_seed(sheep_id, frame, idx)` into an
-/// integer histogram at `w*ss x h*ss`. Deterministic: every peer rendering the
-/// same args gets a byte-identical `hist` and `hash`.
+/// integer histogram at `w*ss x h*ss`. `n_frames` is the sheep's loop length
+/// (from its spec) so a 128-frame sheep renders phase = frame / 128.
+/// Deterministic: every peer rendering the same args gets a byte-identical
+/// `hist` and `hash`.
 #[wasm_bindgen]
 pub fn render_batch(
     genome_json: &str,
@@ -468,10 +470,11 @@ pub fn render_batch(
     h: usize,
     ss: usize,
     spp: u32,
+    n_frames: u32,
 ) -> Result<RenderedBatch, JsValue> {
     let genome = parse_genome_unvalidated(genome_json)?;
     let sheep_id = sheep_id_bytes(sheep_id_hex)?;
-    let accum = chunked::render_batch(&genome, &sheep_id, frame, idx, w, h, ss, spp);
+    let accum = chunked::render_batch(&genome, &sheep_id, frame, idx, w, h, ss, spp, n_frames);
     let hash = chunked::hist_hash_hex(&accum);
     let hist = accum.data.iter().flatten().copied().collect();
     Ok(RenderedBatch { hash, hist })
@@ -489,10 +492,11 @@ pub fn batch_hash(
     h: usize,
     ss: usize,
     spp: u32,
+    n_frames: u32,
 ) -> Result<String, JsValue> {
     let genome = parse_genome_unvalidated(genome_json)?;
     let sheep_id = sheep_id_bytes(sheep_id_hex)?;
-    let accum = chunked::render_batch(&genome, &sheep_id, frame, idx, w, h, ss, spp);
+    let accum = chunked::render_batch(&genome, &sheep_id, frame, idx, w, h, ss, spp, n_frames);
     Ok(chunked::hist_hash_hex(&accum))
 }
 

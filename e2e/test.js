@@ -59,11 +59,11 @@ ctx.on('weberror', (e) => console.log('PAGE ERROR:', e.error().message));
     await w.default();
     const g = w.random_genome_json(2, 3);
     const id = w.sheep_id(g);
-    const a = w.render_batch(g, id, 2, 5, 64, 64, 1, 50000);
-    const b = w.render_batch(g, id, 2, 5, 64, 64, 1, 50000);
+    const a = w.render_batch(g, id, 2, 5, 64, 64, 1, 50000, 128);
+    const b = w.render_batch(g, id, 2, 5, 64, 64, 1, 50000, 128);
     return { a: a.hash, b: b.hash, cells: a.hist.length };
   });
-  const GOLDEN = '1635d61a57b67bd3e33f06d980c3f178f9a3c127b7978c61e8d50346c093bc73';
+  const GOLDEN = '39c6ee55e86f3b5e9177fa255bfac3727af4d5f568c47332665f2b4aaece31fd';
   check('render_batch byte-identical browser vs native', out.a === GOLDEN && out.a === out.b,
     `${out.a.slice(0, 16)}… (golden ${GOLDEN.slice(0, 16)}…), cells=${out.cells}`);
   await page.close();

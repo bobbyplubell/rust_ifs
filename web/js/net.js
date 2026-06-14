@@ -37,7 +37,7 @@ import { verify } from './identity.js';
 /** Generation length: 5 minutes, dev and deployed. */
 export const GEN_MS = 300_000;
 /** The network's first generation (absolute); displayed numbers are relative to it. */
-export const GENESIS_GEN = Math.floor(Date.parse('2026-06-12T00:00:00Z') / GEN_MS);
+export const GENESIS_GEN = Math.floor(Date.parse('2026-06-14T00:00:00Z') / GEN_MS);
 /** Current generation (absolute number; clock-derived so peers agree without consensus). */
 export const gen = () => Math.floor(Date.now() / GEN_MS);
 /** Survivors per generation — fixes the automatic-breeding output regardless of peer count. */
@@ -61,7 +61,7 @@ export const BREED_MIN_TILES = 64;
  *  global flag-day. Append entries with a higher `from`; NEVER edit an existing
  *  one (it would change the tile hashes of sheep already rendered under it). */
 export const SPEC_SCHEDULE = [
-  { from: 0, spec: { width: 384, height: 384, ss: 1, nFrames: 64, spp: 640_000 } },
+  { from: 0, spec: { width: 384, height: 384, ss: 1, nFrames: 128, spp: 640_000 } },
 ];
 export function specForGen(g) {
   let s = SPEC_SCHEDULE[0].spec;
@@ -91,8 +91,8 @@ export const HEX64 = /^[0-9a-f]{64}$/;
  *  then decide whether it understands that version — so future clients can
  *  tolerate or bridge old/new records instead of silently failing. v1 accepts
  *  only its own; widen ACCEPTED_VERSIONS to add forward compatibility. */
-export const PROTOCOL_VERSION = 1;
-export const ACCEPTED_VERSIONS = new Set([1]);
+export const PROTOCOL_VERSION = 2;
+export const ACCEPTED_VERSIONS = new Set([2]);
 
 export const batchKey = (b) => `${b.sheepId}:${b.frame}:${b.idx}`;
 export const batchSignBytes = (b) =>
@@ -166,9 +166,9 @@ export const sheepSignBytes = (r) =>
 export const fraudSignBytes = (f) =>
   utf8('fraud|' + [f.v, f.batchKey, f.expected, f.reporter].join('|'));
 
-/** BroadcastChannel bus name — bumped on wire-format breaks. v15 adds the
- *  vote-credit economy (a new `vote` record kind; selection = backing). */
-export const CHANNEL = 'sheep-net-v15';
+/** BroadcastChannel bus name — bumped on wire-format breaks. v16 is the
+ *  protocol-v2 relaunch: clean epoch reset + 128-frame genesis loop. */
+export const CHANNEL = 'sheep-net-v16';
 
 // Lossless gzip via the platform CompressionStream (no deps). Used to shrink
 // the heavy render-data histogram in transit; verification is unaffected.

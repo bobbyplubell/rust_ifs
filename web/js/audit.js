@@ -72,7 +72,7 @@ export class Auditor {
     const reply = await this.pool.submit({
       type: 'batch-hash', genomeJson: sheep.genome, sheepId: b.sheepId,
       frame: b.frame, idx: b.idx,
-      w: spec.width, h: spec.height, ss: spec.ss, spp: spec.spp,
+      w: spec.width, h: spec.height, ss: spec.ss, spp: spec.spp, nFrames: spec.nFrames,
     }).done;
     if (reply.type !== 'done') return;
 

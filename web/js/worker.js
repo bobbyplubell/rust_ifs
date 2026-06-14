@@ -7,8 +7,8 @@
 // deterministic, and content-addressed by the histogram hash.
 //
 // main -> worker:
-//   {type:'render-batch', jobId, genomeJson, sheepId, frame, idx, w, h, ss, spp}
-//   {type:'batch-hash',   jobId, genomeJson, sheepId, frame, idx, w, h, ss, spp}
+//   {type:'render-batch', jobId, genomeJson, sheepId, frame, idx, w, h, ss, spp, nFrames}
+//   {type:'batch-hash',   jobId, genomeJson, sheepId, frame, idx, w, h, ss, spp, nFrames}
 //   {type:'tonemap-int',  jobId, hist:ArrayBuffer(u64), genomeJson, w, h, ss}
 //   {type:'total-count',  jobId, hist:ArrayBuffer(u64), w, h, ss}
 //   {type:'subtract-check', jobId, acc:ArrayBuffer(u64), batch:ArrayBuffer(u64), w, h, ss}
@@ -71,7 +71,7 @@ self.onmessage = async (event) => {
 // local accumulation). The histogram buffer is transferred.
 function handleRenderBatch(msg) {
   const b = render_batch(
-    msg.genomeJson, msg.sheepId, msg.frame, msg.idx, msg.w, msg.h, msg.ss, msg.spp,
+    msg.genomeJson, msg.sheepId, msg.frame, msg.idx, msg.w, msg.h, msg.ss, msg.spp, msg.nFrames,
   );
   const hash = b.hash;
   const hist = b.hist; // BigUint64Array (owns its buffer, copied out of wasm)
@@ -89,7 +89,7 @@ function handleRenderBatch(msg) {
 // Audit/verify primitive: a batch's hash only, no pixels.
 function handleBatchHash(msg) {
   const hash = batch_hash(
-    msg.genomeJson, msg.sheepId, msg.frame, msg.idx, msg.w, msg.h, msg.ss, msg.spp,
+    msg.genomeJson, msg.sheepId, msg.frame, msg.idx, msg.w, msg.h, msg.ss, msg.spp, msg.nFrames,
   );
   if (cancelled.has(msg.jobId)) return;
   self.postMessage({ type: 'done', jobId: msg.jobId, hash, frame: msg.frame, idx: msg.idx });

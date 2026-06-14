@@ -85,10 +85,11 @@
     const id = params.get('id');
     if (PEER_NS !== '0') $('#back').href = `index.html?peer=${PEER_NS}`;
 
-    // Frame count is fixed across render specs; resolution (W/H/SS, and so
-    // HIST_CELLS) is keyed to THIS sheep's spec and rebound once its record
-    // (and birth generation) is known — see main().
-    const N_FRAMES = BATCH_SPEC.nFrames;
+    // Frame count, like resolution (W/H/SS, and so HIST_CELLS), is keyed to
+    // THIS sheep's spec and rebound once its record (and birth generation) is
+    // known — see main(). The genesis default seeds the per-frame arrays before
+    // the record loads (genesis === this sheep's spec under the single schedule).
+    let N_FRAMES = BATCH_SPEC.nFrames;
     let W = BATCH_SPEC.width, H = BATCH_SPEC.height, SS = BATCH_SPEC.ss;
     let HIST_CELLS = W * SS * H * SS * 4;
     const LOOP_MS = 14_000;
@@ -125,7 +126,7 @@
     function renderBatchMsg(frame, idx) {
       return {
         type: 'render-batch', genomeJson: record.genome, sheepId: id,
-        frame, idx, w: W, h: H, ss: SS, spp: BATCH_SPP,
+        frame, idx, w: W, h: H, ss: SS, spp: BATCH_SPP, nFrames: N_FRAMES,
       };
     }
 
@@ -561,7 +562,7 @@
       // Bind resolution to THIS sheep's render spec (keyed to its birth gen),
       // so a future higher-res spec for new sheep renders correctly here.
       const spec = specForGen(record.gen);
-      W = spec.width; H = spec.height; SS = spec.ss;
+      W = spec.width; H = spec.height; SS = spec.ss; N_FRAMES = spec.nFrames;
       HIST_CELLS = specCells(spec);
       PREVIEW = { width: W, height: H, samples: 200_000, seed: 7 };
       cv.width = W; cv.height = H;
@@ -620,7 +621,7 @@
         checkBatchHash: (genomeJson, sheepId, frame, idx) =>
           pool.submit({
             type: 'batch-hash', genomeJson, sheepId, frame, idx,
-            w: W, h: H, ss: SS, spp: BATCH_SPP,
+            w: W, h: H, ss: SS, spp: BATCH_SPP, nFrames: N_FRAMES,
           }).done.then((m) => m.hash),
         checkSheepId: (genomeJson) =>
           pool.submit({ type: 'sheep-id', genomeJson }).done.then((m) => m.id),
