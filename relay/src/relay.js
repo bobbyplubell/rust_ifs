@@ -128,7 +128,9 @@ const health = () => {
 node.addEventListener('connection:open', (evt) => {
   console.log(`[+] open  ${shortId(evt.detail.remotePeer)}  ${health()}`);
 });
+const everSubbed = new Set(); // connection ids that have been a TOPIC subscriber
 node.addEventListener('connection:close', (evt) => {
+  everSubbed.delete(evt.detail.id);
   console.log(`[-] close ${shortId(evt.detail.remotePeer)}  ${health()}`);
 });
 setInterval(() => console.log(`[stat] ${health()}`), 20_000);
@@ -141,12 +143,16 @@ setInterval(() => console.log(`[stat] ${health()}`), 20_000);
 // and on a churny link they pile up faster than that, degrading the relay
 // (subscribers=0, mesh=0) until a manual restart. But every REAL peer in this
 // swarm subscribes to the data topic within ~1-2s of connecting, so we can reap
-// zombies directly and quickly: sweep periodically and close any connection
-// older than SUBSCRIBE_GRACE whose remote peer still isn't a TOPIC subscriber.
-// Keyed per-PEER (getSubscribers is per-peer), so a subscribed peer keeps ALL
-// its connections — this only ever closes genuine non-participants / half-dead
-// links. Circuit-relay + WebRTC signaling ride a browser's existing subscribed
-// connection, so they're never targeted. No-op on a healthy swarm.
+// zombies directly: sweep periodically and close any connection older than
+// SUBSCRIBE_GRACE that has NEVER been a TOPIC subscriber. The "never" is key —
+// a flaky link can subscribe then briefly drop the subscription, and we must
+// NOT churn such an established connection over a transient blip (that would
+// also disrupt healthy peers on a momentary gossipsub hiccup); those are left
+// to the gentler connection-monitor ping (~30-60s). We only kill connections
+// that came up and never participated at all. Keyed per-PEER for the live
+// check, per-CONNECTION for "ever subscribed". Circuit-relay + WebRTC signaling
+// ride a browser's existing subscribed connection, so they're never targeted.
+// No-op on a healthy swarm.
 const SUBSCRIBE_GRACE = 20_000;
 setInterval(() => {
   let subs;
@@ -154,10 +160,11 @@ setInterval(() => {
   catch { return; }
   const now = Date.now();
   for (const c of node.getConnections()) {
+    if (subs.has(c.remotePeer.toString())) { everSubbed.add(c.id); continue; } // healthy now
     const opened = c.timeline?.open ?? now;
     if (now - opened < SUBSCRIBE_GRACE) continue;        // still within grace
-    if (subs.has(c.remotePeer.toString())) continue;     // healthy data peer
-    console.log(`[reap] ${shortId(c.remotePeer)} no sub after ${Math.round((now - opened) / 1000)}s — closing`);
+    if (everSubbed.has(c.id)) continue;                  // subscribed before — leave blips to the ping
+    console.log(`[reap] ${shortId(c.remotePeer)} never subscribed in ${Math.round((now - opened) / 1000)}s — closing`);
     c.close().catch(() => {});
   }
 }, 10_000);
