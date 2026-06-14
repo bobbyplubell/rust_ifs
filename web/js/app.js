@@ -70,7 +70,12 @@ let me, store, net, auditor, baked = [];
 // Build stamp (written by the deploy workflow), so you can tell which build is
 // live. Absent in local dev → shows nothing.
 let buildVersion = '';
-fetch('version.txt').then((r) => (r.ok ? r.text() : '')).then((t) => { buildVersion = t.trim(); }).catch(() => {});
+// Resolve before importing the libp2p bundle so we can cache-bust it: GitHub
+// Pages serves the 620 KB bundle with a 10-min cache, so without busting a
+// connectivity fix can't reach a returning peer until that cache expires — the
+// "I deployed but it didn't take effect" trap.
+const versionReady = fetch('version.txt')
+  .then((r) => (r.ok ? r.text() : '')).then((t) => (buildVersion = t.trim())).catch(() => '');
 let shownGen = -1;
 let banned = new Set();     // contributors with verified fraud proofs (local view)
 
@@ -100,7 +105,9 @@ async function main() {
   if (relays.length) {
     (async () => {
       try {
-        const { createLibp2pTransport } = await import('./vendor/libp2p.js');
+        await versionReady;
+        const bust = buildVersion ? `?v=${buildVersion}` : '';
+        const { createLibp2pTransport } = await import(`./vendor/libp2p.js${bust}`);
         const stun = (params.get('stun') || '').split(',').map((s) => s.trim()).filter(Boolean);
         const lp = await createLibp2pTransport({ relays, stun });
         transport.add(lp);
