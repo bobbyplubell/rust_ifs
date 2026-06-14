@@ -67,7 +67,11 @@ export class FrameLoop {
       // reaches past the ready frames (or wraps) while boomeranging.
       const hi = this.range ? this.range.hi : n - 1;
       const i = Math.min(Math.floor(pos), hi);
-      const frac = pos - Math.floor(pos);
+      // Ease the cross-fade with smoothstep instead of a linear ramp: at any
+      // frame count (64, 128, …) the discrete keyframes blend with a soft S-curve
+      // so the transition reads as continuous motion rather than a stepped
+      // dissolve — the fix for "N frames still isn't smooth enough".
+      const frac = smoothstep(pos - Math.floor(pos));
       const next = this.range ? Math.min(i + 1, hi) : (i + 1) % n;
       const a = this.getFrame(i) || null;
       const b = this.getFrame(next) || a; // hold on a if the next isn't ready
@@ -83,4 +87,12 @@ export class FrameLoop {
     }
     requestAnimationFrame(this._raf);
   }
+}
+
+// Smoothstep: 0→0, 1→1, with zero slope at both ends — eases the cross-fade so
+// adjacent keyframes blend on an S-curve, killing the stepped look of a linear
+// dissolve. Pure function of the sub-frame fraction, so boomerang mode (which
+// only changes WHICH frames are picked, not the fraction) keeps working.
+function smoothstep(t) {
+  return t * t * (3 - 2 * t);
 }

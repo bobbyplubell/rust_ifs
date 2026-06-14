@@ -32,7 +32,7 @@
         <tr>
           <th>peer</th>
           <th class="num">votes</th>
-          <th class="num">weight ♥</th>
+          <th class="num">credits ♥</th>
           <th class="num">work proven</th>
           <th class="num">sheep released</th>
           <th class="num">alive now</th>
@@ -52,7 +52,7 @@
     import { WorkerPool } from './js/pool.js';
     import { openStore } from './js/store.js';
     import { loadIdentity, PEER_NS } from './js/identity.js';
-    import { CHANNEL, BATCH_SPP, batchKey, gen, GENESIS_GEN, GEN_MS } from './js/net.js';
+    import { CHANNEL, BATCH_SPP, batchKey, gen, GENESIS_GEN, GEN_MS, creditsFromTiles } from './js/net.js';
     import { computeFlock } from './js/gens.js';
     import { handle } from './js/names.js';
 
@@ -106,18 +106,20 @@
       const peers = new Map(); // pubHex -> stats
       const peer = (k) => {
         if (!peers.has(k)) {
-          peers.set(k, { votes: 0, weight: 0, work: 0, released: 0, alive: 0, reports: 0 });
+          peers.set(k, { votes: 0, tiles: 0, work: 0, released: 0, alive: 0, reports: 0 });
         }
         return peers.get(k);
       };
 
       // Each verified batch a peer contributed is one vote AND BATCH_SPP of
-      // shared rendering work.
+      // shared rendering work. `tiles` is the raw tile count; vote WEIGHT is
+      // credits = floor(tiles / TILES_PER_CREDIT) — the same unit gens.js backs
+      // votes with — converted at display below.
       for (const b of batches) {
         const p = peer(b.contributor);
         p.votes++;
         p.work += BATCH_SPP;
-        if (!banned.has(b.contributor)) p.weight += 1;
+        if (!banned.has(b.contributor)) p.tiles += 1;
       }
       for (const s of sheep) {
         if (!s.author) continue;
@@ -130,7 +132,7 @@
       peer(me.pubHex); // and so do you
 
       const rows = [...peers.entries()]
-        .sort((a, b) => b[1].weight - a[1].weight || b[1].work - a[1].work);
+        .sort((a, b) => b[1].tiles - a[1].tiles || b[1].work - a[1].work);
       $('#rows').innerHTML = '';
       for (const [k, p] of rows) {
         const tr = document.createElement('tr');
@@ -140,11 +142,21 @@
         if (k === me.pubHex) name.className = 'you';
         name.title = k;
         tr.append(name);
-        for (const val of [p.votes, p.weight ? `${p.weight} ♥` : '—',
-          p.work ? fmtWork(p.work) : '—', p.released, p.alive, p.reports]) {
+        // Vote weight is CREDITS (floor(tiles / 128)), not raw tiles — the unit
+        // votes are actually backed with in gens.js.
+        const credits = creditsFromTiles(p.tiles);
+        const cells = [
+          { v: p.votes },
+          { v: credits ? `${credits} ♥` : '—',
+            title: `${credits} credit${credits === 1 ? '' : 's'} from ${p.tiles} tiles` },
+          { v: p.work ? fmtWork(p.work) : '—' },
+          { v: p.released }, { v: p.alive }, { v: p.reports },
+        ];
+        for (const { v, title } of cells) {
           const td = document.createElement('td');
           td.className = 'num';
-          td.textContent = String(val);
+          td.textContent = String(v);
+          if (title) td.title = title;
           tr.append(td);
         }
         const st = document.createElement('td');

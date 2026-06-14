@@ -21,18 +21,19 @@
     #hud .id { color: #62627a; }
     #hud a { color: #8d8da4; margin-left: auto; }
     #hud button.on { color: #cfe; }
-    /* per-frame tile coverage: one square per animation frame, shaded by tile
-       count (darker = fuzzier / fewer tiles), the count shown inside. */
+    /* per-frame tile coverage heat grid: one cell per animation frame, its
+       BRIGHTNESS encodes the combined (you + swarm) tile count — dim = fuzzy /
+       few tiles, bright = sharp. No numbers (the exact count is in each cell's
+       hover title). The frame currently on screen gets a clear outline. */
     #tilemap {
       position: fixed; top: 10px; right: 10px;
-      display: grid; grid-template-columns: repeat(8, 15px); gap: 2px;
+      display: grid; grid-template-columns: repeat(8, 13px); gap: 2px;
       padding: 7px; background: rgba(0,0,0,0.55); border-radius: 6px;
     }
     #tilemap .cell {
-      width: 15px; height: 15px; border-radius: 2px; background: #1c1c28;
-      font-size: 8px; line-height: 15px; text-align: center; color: #aab;
+      width: 13px; height: 13px; border-radius: 2px; background: #1c1c28;
     }
-    #tilemap .cell.cur { outline: 1px solid #c8b06a; }
+    #tilemap .cell.cur { outline: 2px solid #c8b06a; outline-offset: 1px; }
     #tilemap .cap { grid-column: 1 / -1; font-size: 9px; color: #7a7a93; }
   </style>
 </head>
@@ -40,12 +41,13 @@
   <div id="stage">
     <canvas id="cv" width="384" height="384"></canvas>
   </div>
-  <div id="tilemap"><span class="cap">tiles · you / swarm</span></div>
+  <div id="tilemap"><span class="cap">tile density · per frame</span></div>
   <div id="hud">
     <span id="info">loading…</span>
     <span id="sheep-id" class="id"></span>
     <span id="loading" class="id"></span>
     <span id="samples" class="id"></span>
+    <span id="tiles" class="id"></span>
     <span id="credits" class="id"></span>
     <button id="contribute">contribute</button>
     <button id="dl">genome ↓</button>
@@ -312,13 +314,21 @@
       updateTilemap();
     }
     function updateTilemap() {
+      let mineTotal = 0, swarmTotal = 0;
       for (let f = 0; f < N_FRAMES; f++) {
         const { mine, total } = swarmCov[f];
-        tileCells[f].textContent = total ? (mine ? `${mine}/${total}` : `${total}`) : '';
-        const t = Math.min(1, total / 24);     // shade by swarm total (darker = fuzzier)
-        tileCells[f].style.background = `hsl(265 45% ${Math.round(9 + t * 38)}%)`;
-        tileCells[f].title = `frame ${f}: you ${mine} / swarm ${total} tiles`;
+        mineTotal += mine; swarmTotal += total;
+        // Heat: brightness encodes the COMBINED density (swarm total includes
+        // your own tiles) — dim = few tiles / fuzzy, bright = sharp. No number;
+        // the exact count lives in the hover title.
+        const t = Math.min(1, total / 24);
+        tileCells[f].style.background = `hsl(265 50% ${Math.round(9 + t * 44)}%)`;
+        tileCells[f].title = `frame ${f}: ${total} tiles (you ${mine} · swarm ${total})`;
       }
+      // Per-sheep tile totals HUD readout: your tiles vs the whole swarm's for
+      // THIS sheep (summed across every frame).
+      $('#tiles').textContent = swarmTotal
+        ? `you ${mineTotal} · swarm ${swarmTotal} tiles` : '';
     }
     setInterval(() => refreshSwarmCov().catch(console.error), 2000);
     // Outline the frame currently on screen.
@@ -530,8 +540,14 @@
         const fetched = await fetch('version.txt', { cache: 'no-store' })
           .then((r) => (r.ok ? r.text() : '')).then((t) => t.trim()).catch(() => '');
         if (fetched && loaded && fetched !== loaded) {
-          console.log('new build ' + fetched + ' (was ' + loaded + ') — reloading to stay in sync');
-          location.reload();
+          // Only reload a BACKGROUNDED tab — never yank a foreground session
+          // mid-render during a deploy. A hidden tab reloads silently; a visible
+          // one keeps its loaded version, so the loop guard still holds (it'll
+          // reload the next time it's hidden, once, when fetched !== loaded).
+          if (document.hidden) {
+            console.log('new build ' + fetched + ' (was ' + loaded + ') — reloading hidden tab to stay in sync');
+            location.reload();
+          }
         }
       }, VERSION_POLL_MS), VERSION_SETTLE_MS);
     }

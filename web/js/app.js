@@ -208,6 +208,7 @@ async function main() {
     }
     refreshTallies().catch(console.error); // batched backing repaint
     refreshCredits().catch(console.error); // refresh cached credit balance
+    refreshTileTotals().catch(console.error); // per-card + global tile totals
     updateStatus();     // shows the activity pulse + credit balance
     batchActivity = 0;  // reset the per-tick pulse after showing it
   }, 1000);
@@ -250,8 +251,14 @@ function startVersionPoll() {
     const fetched = await fetch('version.txt', { cache: 'no-store' })
       .then((r) => (r.ok ? r.text() : '')).then((t) => t.trim()).catch(() => '');
     if (fetched && loaded && fetched !== loaded) {
-      console.log('new build ' + fetched + ' (was ' + loaded + ') — reloading to stay in sync');
-      location.reload();
+      // Only reload a BACKGROUNDED tab — never interrupt active use during a
+      // deploy. A hidden tab updates silently; a foreground one keeps its loaded
+      // version (the loop guard still holds), so it'll pick up the new build the
+      // next time it's hidden, exactly once.
+      if (document.hidden) {
+        console.log('new build ' + fetched + ' (was ' + loaded + ') — reloading hidden tab to stay in sync');
+        location.reload();
+      }
     }
   }, VERSION_POLL_MS), VERSION_SETTLE_MS);
 }
@@ -298,7 +305,7 @@ async function rebuildFlock() {
       disposeHover(entry);
       flockVisibility.unobserve(entry.card);
       const at = selected.indexOf(id);
-      if (at !== -1) { selected.splice(at, 1); $('#nursery').hidden = true; }
+      if (at !== -1) { selected.splice(at, 1); showNurseryHint(); }
       entry.card.remove();
       cards.delete(id);
     }
@@ -358,11 +365,15 @@ function addCard(record) {
   const barFill = document.createElement('div');
   barFill.className = 'bar-fill';
   bar.append(barFill);
-  card.append(canvas, bar, meta);
+  // Per-sheep tile totals: your contributed tiles vs the whole swarm's, for
+  // THIS sheep. Filled by the 1 Hz tile scan (refreshTileTotals).
+  const tilesEl = document.createElement('div');
+  tilesEl.className = 'tiles';
+  card.append(canvas, bar, meta, tilesEl);
   $('#flock').append(card);
 
   const entry = {
-    record, canvas, tallyEl, contribBtn, card, barFill, onScreen: true,
+    record, canvas, tallyEl, tilesEl, contribBtn, card, barFill, onScreen: true,
     spec, histCells: specCells(spec),
     acc0: null, covered: new Set(),
     tonemapPending: false, repaintQueued: false, paintedPreview: false,
@@ -881,6 +892,36 @@ async function refreshTallies() {
 // Defer a single card's repaint to the next tick's batched recompute.
 function updateTally(sheepId) { markTally(sheepId); }
 
+// ---- tile totals (you vs swarm) ---------------------------------------------
+//
+// Scan the whole batch store ONCE per tick and distribute by sheepId: each card
+// shows your tiles vs the swarm's for that sheep, and the footer shows the
+// global totals across every sheep. One pass keeps it cheap regardless of flock
+// size (a per-card store scan would be O(cards × batches)).
+let globalTiles = { mine: 0, total: 0 };
+async function refreshTileTotals() {
+  const batches = await store.allBatches();
+  const bySheep = new Map(); // sheepId -> { mine, total }
+  let gMine = 0, gTotal = 0;
+  for (const b of batches) {
+    if (banned.has(b.contributor)) continue;
+    gTotal++;
+    const mine = b.contributor === me.pubHex;
+    if (mine) gMine++;
+    let e = bySheep.get(b.sheepId);
+    if (!e) { e = { mine: 0, total: 0 }; bySheep.set(b.sheepId, e); }
+    e.total++;
+    if (mine) e.mine++;
+  }
+  globalTiles = { mine: gMine, total: gTotal };
+  for (const [id, entry] of cards) {
+    const e = bySheep.get(id) || { mine: 0, total: 0 };
+    entry.tilesEl.textContent = e.total ? `you ${e.mine} · swarm ${e.total} tiles` : '';
+    entry.tilesEl.title = e.total
+      ? `${e.mine} tiles you contributed · ${e.total} tiles from the whole swarm` : '';
+  }
+}
+
 // ---- credits (the vote-credit economy) --------------------------------------
 //
 // Earn one credit per batch you render this gen; spend credits to BACK sheep.
@@ -937,7 +978,13 @@ function toggleSelect(sheepId) {
   }
   cards.get(sheepId)?.card.classList.toggle('selected', selected.includes(sheepId));
   if (selected.length === 2) breedSelected().catch(showError);
-  else $('#nursery').hidden = true;
+  else showNurseryHint();
+}
+
+// Show the explanatory placeholder (fewer than two parents picked): the nursery
+// box stays visible with the "pick two parents" hint instead of going blank.
+function showNurseryHint() {
+  $('#nursery').classList.add('picking');
 }
 
 function deselect(sheepId) {
@@ -954,7 +1001,7 @@ async function breedSelected() {
   // these two would have if they both survive this generation.
   const challengeHex = await breedChallenge(g, aId, bId);
 
-  $('#nursery').hidden = false;
+  $('#nursery').classList.remove('picking'); // show the child preview, not the hint
   $('#nursery-note').textContent = 'breeding…';
   $('#release').hidden = true;
 
@@ -1034,10 +1081,12 @@ function updateStatus() {
   const per = creditsView.perCredit || 128;
   const toNext = per - (creditsView.tiles % per);
   const creds = `${creditsView.available} credits (${toNext} tiles to next)`;
+  // Global tile total across ALL sheep: your contributed tiles vs the swarm's.
+  const tiles = `${globalTiles.mine}/${globalTiles.total} tiles`;
   $('#status').textContent =
     `gen ${gen() - GENESIS_GEN} closes in ${mm}:${ss} · ` +
     `you are ${handle(me.pubHex)} · ${net.peerCount()} peers · ` +
-    `${creds} · ` +
+    `${creds} · ${tiles} · ` +
     `${a.audits} audits${a.frauds ? `, ${a.frauds} frauds!` : ''}${pulse}${credHint}` +
     (buildVersion ? ` · build ${buildVersion}` : '');
 }
