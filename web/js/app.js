@@ -188,9 +188,15 @@ async function main() {
   installDebugHooks();
   if (params.get('stress')) installStressHooks();
 
-  await rebuildFlock();
+  // Connect to the swarm BEFORE building the flock. The flock is a deterministic
+  // replay of ALL history from genesis (computeFlock); on a populated store
+  // (gen 600+) that's heavy, and awaiting it before net.start() meant a RETURNING
+  // client with data couldn't connect until the whole replay finished — which on
+  // a real store is effectively never. THAT is the "clear browser data or it
+  // won't reconnect" bug. Network first (cheap, unblocks peers), flock second.
   await net.start();
   banned = net.banned;
+  await rebuildFlock();
   if (!params.get('noaudit')) auditor.start();
 
   // ?nocontribute: a pure auditor/viewer peer (tests use this so an audit peer
