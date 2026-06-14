@@ -493,6 +493,11 @@ function repaint(entry) {
 // tally changed) and refresh the tally label.
 async function onBatch(rec) {
   batchActivity++;
+  // A batch *I* contributed — including from the fullscreen view in another tab,
+  // which arrives here over the local BroadcastChannel — builds my credit
+  // balance. Mark it dirty even if this sheep isn't carded below, otherwise the
+  // balance looks frozen while you render in fullscreen.
+  if (rec.contributor === me.pubHex) creditsDirty = true;
   // Batches change tallies, not flock MEMBERSHIP — membership only changes at a
   // generation close (or a new release, via onSheep). So we do NOT rebuild the
   // flock per-batch (that was the gallery churn); only a retroactive batch for

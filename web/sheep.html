@@ -45,6 +45,7 @@
     <span id="info">loading…</span>
     <span id="sheep-id" class="id"></span>
     <span id="samples" class="id"></span>
+    <span id="credits" class="id"></span>
     <button id="contribute">contribute</button>
     <button id="dl">genome ↓</button>
     <a id="back" href="index.html">← flock</a>
@@ -229,6 +230,19 @@
       updateTilemap();
     }
 
+    // Credit balance, same accounting as the flock: tiles you render this gen
+    // earn fungible credits (use-it-or-lose-it). Shown here so contributing in
+    // fullscreen gives the same feedback as the flock's status bar.
+    async function updateCredits() {
+      if (!net) return;
+      try {
+        const c = await net.credits(gen());
+        const per = c.perCredit || 128;
+        const toNext = per - (c.tiles % per);
+        $('#credits').textContent = `${c.available} credits · ${toNext} tiles to next`;
+      } catch { /* store not ready yet */ }
+    }
+
     // ---- per-frame tile coverage map ------------------------------------------
 
     const tilemap = $('#tilemap');
@@ -321,6 +335,7 @@
       rec.sig = await sign(me.pair, batchSignBytes(rec));
       await net.publishBatch(rec);
       showSamples();
+      updateCredits();
       return f;
     }
 
@@ -531,6 +546,8 @@
       });
       await net.start();
       banned = net.banned;
+      updateCredits();
+      setInterval(updateCredits, 3000); // keep the balance live as the gen fills
 
       // Make the page interactive IMMEDIATELY — the contribute toggle and the
       // playback loop must not wait on frame re-seeding (below) or the relay.

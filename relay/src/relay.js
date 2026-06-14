@@ -107,3 +107,24 @@ node.services.pubsub.subscribe(RELAY_TOPIC);
 console.log('relay peer id:', node.peerId.toString());
 for (const addr of node.getMultiaddrs()) console.log('listening:', addr.toString());
 console.log(`browsers should bootstrap to: <public-addr>/p2p/${node.peerId.toString()}`);
+
+// ---- Observability -------------------------------------------------------
+// libp2p's own debug logs are off, so we had ZERO visibility into why peers
+// drop. Log every connection open/close and a periodic health line so we can
+// actually SEE churn (does a peer drop? does it leave the gossip mesh? does
+// the subscriber set shrink?) instead of guessing and restarting.
+const shortId = (p) => '…' + p.toString().slice(-8);
+const health = () => {
+  const conns = node.getConnections();
+  const subs = node.services.pubsub.getSubscribers(TOPIC).length;
+  let mesh = -1;
+  try { mesh = node.services.pubsub.getMeshPeers(TOPIC).length; } catch { /* api shape */ }
+  return `conns=${conns.length} subscribers=${subs} mesh=${mesh}`;
+};
+node.addEventListener('connection:open', (evt) => {
+  console.log(`[+] open  ${shortId(evt.detail.remotePeer)}  ${health()}`);
+});
+node.addEventListener('connection:close', (evt) => {
+  console.log(`[-] close ${shortId(evt.detail.remotePeer)}  ${health()}`);
+});
+setInterval(() => console.log(`[stat] ${health()}`), 20_000);
