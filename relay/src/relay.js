@@ -132,3 +132,32 @@ node.addEventListener('connection:close', (evt) => {
   console.log(`[-] close ${shortId(evt.detail.remotePeer)}  ${health()}`);
 });
 setInterval(() => console.log(`[stat] ${health()}`), 20_000);
+
+// ---- Self-heal: reap "connected but never subscribed" zombies ------------
+// A flaky client link can open a connection that never finishes the gossipsub
+// handshake — the link dies mid-subscribe — leaving it as a "connected but
+// subscribers=0" zombie. The connection-monitor ping only reaps these after
+// ~30-60s (a long floor we keep so busy/backgrounded tabs aren't false-evicted),
+// and on a churny link they pile up faster than that, degrading the relay
+// (subscribers=0, mesh=0) until a manual restart. But every REAL peer in this
+// swarm subscribes to the data topic within ~1-2s of connecting, so we can reap
+// zombies directly and quickly: sweep periodically and close any connection
+// older than SUBSCRIBE_GRACE whose remote peer still isn't a TOPIC subscriber.
+// Keyed per-PEER (getSubscribers is per-peer), so a subscribed peer keeps ALL
+// its connections — this only ever closes genuine non-participants / half-dead
+// links. Circuit-relay + WebRTC signaling ride a browser's existing subscribed
+// connection, so they're never targeted. No-op on a healthy swarm.
+const SUBSCRIBE_GRACE = 20_000;
+setInterval(() => {
+  let subs;
+  try { subs = new Set(node.services.pubsub.getSubscribers(TOPIC).map((p) => p.toString())); }
+  catch { return; }
+  const now = Date.now();
+  for (const c of node.getConnections()) {
+    const opened = c.timeline?.open ?? now;
+    if (now - opened < SUBSCRIBE_GRACE) continue;        // still within grace
+    if (subs.has(c.remotePeer.toString())) continue;     // healthy data peer
+    console.log(`[reap] ${shortId(c.remotePeer)} no sub after ${Math.round((now - opened) / 1000)}s — closing`);
+    c.close().catch(() => {});
+  }
+}, 10_000);
