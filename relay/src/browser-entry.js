@@ -59,10 +59,18 @@ export async function createLibp2pTransport({ relays, stun }) {
     ],
     connectionEncrypters: [noise()],
     streamMuxers: [yamux()],
-    // Notice a dead relay link fast (sleep / network blip), so it's actually
-    // disconnected and the reconnect watchdog below re-dials it — otherwise a
-    // stale connection lingers and the watchdog thinks we're still connected.
-    connectionMonitor: { abortConnectionOnPingFailure: true },
+    // Detect a genuinely dead link (so the watchdog re-dials), but DON'T mistake
+    // a busy or backgrounded tab for dead. The ping monitor's default 5s timeout
+    // floor fires whenever the main thread stalls past 5s — which a saturated
+    // render pump (44 tiles/s bursts) or a throttled background tab does
+    // routinely — and with abort-on-failure it kills a LIVE connection (the
+    // self-eviction churn: relay shows subscribers=0). Raise the floor to 30s: a
+    // real dead link still aborts within ~30-60s and ensureRelays recovers it.
+    connectionMonitor: {
+      pingInterval: 20_000,
+      pingTimeout: { minTimeout: 30_000, maxTimeout: 60_000 },
+      abortConnectionOnPingFailure: true,
+    },
     peerDiscovery: [
       ...(relays.length ? [bootstrap({ list: relays })] : []),
       // Broadcast our own circuit address on the discovery topic and dial peers

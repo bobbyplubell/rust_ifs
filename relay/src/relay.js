@@ -54,12 +54,16 @@ const node = await createLibp2p({
   transports: [webSockets()],
   connectionEncrypters: [noise()],
   streamMuxers: [yamux()],
-  // Detect + drop DEAD browser links fast. Browsers vanish uncleanly (sleep,
-  // network blip, tab close), and a stale wss isn't noticed for a long time by
-  // default — the dead peers then pile up in the gossip mesh and crowd out the
-  // live ones, so the relay stops forwarding to whoever's actually connected
-  // (the "needs a restart to recover" symptom). Ping every 10s, abort on failure.
-  connectionMonitor: { abortConnectionOnPingFailure: true },
+  // Detect + drop genuinely-dead browser links, but tolerate a momentarily-busy
+  // browser (saturated render / throttled background tab). The default 5s ping
+  // timeout false-positives on those and aborts a live link; raise the floor to
+  // 30s so only real dead links (sleep / drop) get aborted (~30-60s), then the
+  // dead peers stop crowding the mesh without evicting busy-but-alive ones.
+  connectionMonitor: {
+    pingInterval: 20_000,
+    pingTimeout: { minTimeout: 30_000, maxTimeout: 60_000 },
+    abortConnectionOnPingFailure: true,
+  },
   // Forward the discovery topic only (listenOnly: don't advertise the relay
   // itself — its address is already baked into every client's config).
   peerDiscovery: [pubsubPeerDiscovery({ listenOnly: true, topics: [DISCOVERY_TOPIC] })],
