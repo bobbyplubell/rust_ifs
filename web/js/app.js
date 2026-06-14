@@ -663,13 +663,35 @@ let contribCursor = 0;
 // tail). No effect on normal use.
 let contributePaused = false;
 
-function startContributeLoop() {
-  const tick = () => {
-    (contributePaused ? Promise.resolve() : contributeStep())
+// Keep the worker pool SATURATED instead of rendering one tile at a time. The
+// old loop awaited each contribution then slept, so it used a SINGLE worker no
+// matter how many the pool had — making the worker count irrelevant. Batches are
+// independent + deterministic, and contributeBatch reserves its idx
+// synchronously before its first await, so firing pool.size of them at once
+// renders distinct tiles in parallel with no collision. Only pledged sheep (or
+// auto/stress) are pickable, so an idle viewer with nothing pledged still does
+// no work — saturation only kicks in on explicit intent.
+let contribInFlight = 0;
+function pumpContribute() {
+  if (contributePaused) return;
+  while (contribInFlight < pool.size) {
+    contribInFlight++;
+    let did = false;
+    contributeStep(true)
+      .then((id) => { did = !!id; })
       .catch(console.error)
-      .finally(() => setTimeout(tick, CONTRIB_CADENCE_MS));
-  };
-  setTimeout(tick, 1500); // let the flock settle before contributing
+      .finally(() => {
+        contribInFlight--;
+        if (did && !contributePaused) pumpContribute(); // refill the freed slot
+      });
+  }
+}
+
+function startContributeLoop() {
+  setTimeout(pumpContribute, 1500); // let the flock settle before contributing
+  // Restart the pump if it ever fully drains (e.g. nothing pledged yet, then a
+  // pledge appears) — cheap since an empty pickable set returns instantly.
+  setInterval(() => { if (!contributePaused) pumpContribute(); }, CONTRIB_CADENCE_MS * 4);
 }
 
 // Round-robin over visible (or pledged) living cards; render the lowest free

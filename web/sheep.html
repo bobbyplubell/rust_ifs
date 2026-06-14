@@ -339,22 +339,28 @@
       return f;
     }
 
-    let pullCursor = 0;
+    // Saturate the pool when contributing so a focused render uses ALL workers,
+    // not one tile at a time. contributeBatch reserves its idx synchronously
+    // before its first await, so firing pool.size in a row renders distinct
+    // tiles in parallel; each refills its slot on completion.
+    let fsInFlight = 0;
+    function pumpFullscreen() {
+      if (!contributing) return;
+      while (fsInFlight < pool.size) {
+        fsInFlight++;
+        const f = leastCoveredFrame();
+        contributeBatch(f, nextFreeIdx(f))
+          .catch(console.error)
+          .finally(() => { fsInFlight--; if (contributing) pumpFullscreen(); });
+      }
+    }
     function startLoop() {
-      const step = async () => {
-        // ALWAYS pull community-accumulated frames (verified) so the loop shows
-        // whatever the swarm has rendered — whether or not you contribute.
-        if ((pullCursor = (pullCursor + 1) % 10) === 0) {
-          net.requestRender(id, leastCoveredFrame());
-        }
-        // Render + publish tiles only when the user has opted in (manual).
-        if (contributing && pool.running < pool.size) {
-          const f = leastCoveredFrame();
-          await contributeBatch(f, nextFreeIdx(f)).catch(console.error);
-        }
-        setTimeout(step, 200);
-      };
-      setTimeout(step, 1200);
+      // Saturating contribution pump (only runs while the contribute toggle is on).
+      setTimeout(pumpFullscreen, 1200);
+      setInterval(() => { if (contributing) pumpFullscreen(); }, 800);
+      // ALWAYS pull community-accumulated frames (verified) so the loop shows
+      // whatever the swarm has rendered — whether or not you contribute.
+      setInterval(() => { net.requestRender(id, leastCoveredFrame()); }, 2000);
     }
 
     // ---- the Verification gate (same property as app.js) ----------------------
@@ -559,6 +565,7 @@
         contributing = !contributing;
         $('#contribute').classList.toggle('on', contributing);
         $('#contribute').textContent = contributing ? 'contributing ✓' : 'contribute';
+        if (contributing) pumpFullscreen(); // start saturating the pool immediately
       };
       $('#dl').onclick = () => {
         const a = document.createElement('a');
