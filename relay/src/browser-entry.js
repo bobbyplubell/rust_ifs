@@ -10,6 +10,7 @@ import { noise } from '@chainsafe/libp2p-noise';
 import { yamux } from '@chainsafe/libp2p-yamux';
 import { gossipsub } from '@chainsafe/libp2p-gossipsub';
 import { identify } from '@libp2p/identify';
+import { ping } from '@libp2p/ping';
 import { bootstrap } from '@libp2p/bootstrap';
 import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
 import { multiaddr } from '@multiformats/multiaddr';
@@ -72,6 +73,12 @@ export async function createLibp2pTransport({ relays, stun }) {
     ],
     services: {
       identify: identify(),
+      // Real @libp2p/ping: gives the connection-monitor a correct ping protocol
+      // handler so it can verify peer liveness and DROP dead links (e.g. a stale
+      // WebRTC peer that lingers in the gossip mesh and crowds out the relay).
+      // Without it the mesh drains to zero over hours. The package handles the
+      // protocol correctly (proper RTT + adaptive timeout) — do NOT hand-roll it.
+      ping: ping(),
       pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }),
     },
   });
