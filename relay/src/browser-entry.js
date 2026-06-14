@@ -13,6 +13,7 @@ import { identify } from '@libp2p/identify';
 import { bootstrap } from '@libp2p/bootstrap';
 import { pubsubPeerDiscovery } from '@libp2p/pubsub-peer-discovery';
 import { multiaddr } from '@multiformats/multiaddr';
+import { peerIdFromString } from '@libp2p/peer-id';
 import { TOPIC, DISCOVERY_TOPIC, RELAY_TOPIC, enc, dec } from './common.js';
 
 // Public STUN servers (used unless the caller passes its own). STUN is a cheap,
@@ -31,6 +32,18 @@ const DEFAULT_STUN = [
  */
 export async function createLibp2pTransport({ relays, stun }) {
   const stunUrls = (stun && stun.length) ? stun : DEFAULT_STUN;
+
+  // Pin the relays as gossipsub DIRECT peers. A direct peer is kept in the mesh
+  // PERMANENTLY and never pruned. Without this, the browser's gossipsub (D=6)
+  // prunes the relay once its mesh fills with WebRTC peers (including dead ones
+  // that linger) — so over ~30 min the relay's mesh drains to zero and every
+  // hard-NAT peer silently loses all data ("stuck at 0 peers, needs a restart").
+  // The relay is the backbone/fallback; it must never be pruned out of the mesh.
+  const directPeers = relays.map((r) => {
+    const idStr = r.split('/p2p/').pop();
+    try { return { id: peerIdFromString(idStr), addrs: [multiaddr(r)] }; }
+    catch { return null; }
+  }).filter(Boolean);
   const node = await createLibp2p({
     // Listen via WebRTC, signaled through a relay reservation: this is what
     // lets two browsers talk directly after the relay introduces them.
@@ -72,7 +85,7 @@ export async function createLibp2pTransport({ relays, stun }) {
     ],
     services: {
       identify: identify(),
-      pubsub: gossipsub({ allowPublishToZeroTopicPeers: true }),
+      pubsub: gossipsub({ allowPublishToZeroTopicPeers: true, directPeers }),
     },
   });
 
