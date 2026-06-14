@@ -20,7 +20,7 @@ import {
   voteSignBytes, BREED_MIN_TILES, PROTOCOL_VERSION, specForGen, specCells,
 } from './net.js';
 import { computeFlock, breedChallenge } from './gens.js';
-import { handle, provenance } from './names.js';
+import { handle, provenance, sheepName } from './names.js';
 import { Auditor } from './audit.js';
 import { FrameLoop } from './loop.js';
 import { RELAYS } from '../config.js';
@@ -335,9 +335,11 @@ function addCard(record) {
   canvas.height = spec.height;
   const meta = document.createElement('div');
   meta.className = 'meta';
+  // The PRIMARY name shown is the unique id-derived name (sheepName); the
+  // origin sentence (provenance.how) lives in the hover title as context.
   const prov = provenance(record);
   const label = document.createElement('a');
-  label.textContent = prov.who;
+  label.textContent = sheepName(record);
   label.title = `${prov.how}\n${record.id}`;
   label.href = `sheep.html?id=${record.id}${PEER_NS !== '0' ? `&peer=${PEER_NS}` : ''}`;
   label.target = '_blank';

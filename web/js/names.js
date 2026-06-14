@@ -24,6 +24,23 @@ export function handle(pubHex) {
   return `${ADJ[a]}-${ANIMAL[b]}-${pubHex.slice(4, 8)}`;
 }
 
+/**
+ * A sheep's UNIQUE display name — same adjective-animal-hex flavor as handle()
+ * (so sheep names feel of-a-piece with peer names), but SEEDED FROM THE SHEEP'S
+ * CONTENT-ADDRESSED id instead of a pubkey. Because the id is unique per sheep
+ * the name is unique; because it's a pure function of the id, every peer shows
+ * the same name with no syncing. Display-only sugar: identity IS the id (the hex
+ * tail disambiguates the rare adjective/animal collision visually).
+ */
+export function sheepName(record) {
+  // Accept either a record or a bare id string.
+  const id = typeof record === 'string' ? record : record?.id;
+  if (!id) return 'unknown';
+  const a = parseInt(id.slice(0, 2), 16) % 32;
+  const b = parseInt(id.slice(2, 4), 16) % 32;
+  return `${ADJ[a]}-${ANIMAL[b]}-${id.slice(4, 8)}`;
+}
+
 /** Short + long provenance for a sheep record. */
 export function provenance(record) {
   const g = record.gen - GENESIS_GEN;

@@ -21,6 +21,16 @@
     #hud .id { color: #62627a; }
     #hud a { color: #8d8da4; margin-left: auto; }
     #hud button.on { color: #cfe; }
+    /* lineage line: "<p1> + <p2> : <name>". Living/HoF parents are links in the
+       accent color; perished+not-enshrined parents are dimmed plain text (their
+       fullscreen can't be opened). The arrows/separators are muted. */
+    #info { color: #b9b9c8; }
+    #info a.parent { color: #c8b06a; text-decoration: none; margin-left: 0; }
+    #info a.parent:hover { text-decoration: underline; }
+    #info .parent-dead { color: #55556a; }
+    #info .sep { color: #6a6a80; }
+    #info .self { color: #e6e6f0; }
+    #info .tag { color: #6a6a80; }
     /* per-frame tile coverage heat grid: one cell per animation frame, its
        BRIGHTNESS encodes the combined (you + swarm) tile count — dim = fuzzy /
        few tiles, bright = sharp. No numbers (the exact count is in each cell's
@@ -73,7 +83,8 @@
     import { openStore } from './js/store.js';
     import { loadIdentity, sign, verify, PEER_NS } from './js/identity.js';
     import { sha256Hex, utf8 } from './js/hash.js';
-    import { provenance } from './js/names.js';
+    import { provenance, sheepName } from './js/names.js';
+    import { computeFlock } from './js/gens.js';
     import {
       Net, BroadcastTransport, CompositeTransport, gen,
       BATCH_SPEC, BATCH_SPP, batchKey, batchSignBytes, fraudSignBytes, PROTOCOL_VERSION,
@@ -501,6 +512,89 @@
       showSamples();
     }
 
+    // ---- lineage line ---------------------------------------------------------
+    //
+    // A compact pedigree shown in place of the descriptive origin sentence:
+    //   2 parents (bred pair): "<p1> + <p2> : <name>"
+    //   1 parent (mutant):     "<parent> ↻ : <name>"   (↻ = mutation)
+    //   0 parents (immigrant / genesis seed): just "<name>" (tagged).
+    // Each parent name LINKS to its own fullscreen IF that parent is still
+    // viewable — i.e. it's in the current LIVING flock OR enshrined in the Hall
+    // of Fame. A parent that has PERISHED and isn't enshrined is rendered greyed
+    // out (non-link), since its fullscreen can no longer be opened.
+    async function renderLineage(rec) {
+      const info = $('#info');
+      info.textContent = '';
+      info.title = provenance(rec).how; // origin sentence kept as hover context
+
+      const append = (node) => info.appendChild(node);
+      const text = (s, cls) => {
+        const el = document.createElement('span');
+        el.textContent = s;
+        if (cls) el.className = cls;
+        return el;
+      };
+
+      const peerQ = PEER_NS !== '0' ? `&peer=${PEER_NS}` : '';
+      const parents = Array.isArray(rec.parents) ? rec.parents.filter(Boolean) : [];
+
+      // Determine which parents are still viewable. Compute the living flock +
+      // Hall-of-Fame history exactly as hall.html does (baked from the manifest,
+      // breed/mutate/random wired through the worker pool), then a parent is
+      // link-worthy iff it's alive or enshrined.
+      let viewable = new Set();
+      if (parents.length) {
+        try {
+          const baked = [];
+          const manifest = await (await fetch('genomes/manifest.json')).json();
+          for (const s of manifest.sheep) {
+            const genome = await (await fetch(s.file)).text();
+            const sid = (await pool.submit({ type: 'sheep-id', genomeJson: genome }).done).id;
+            baked.push({ id: sid, genome, parents: null, gen: 0, baked: true, name: s.name });
+          }
+          const breedFn = (a, b, ch) => pool.submit({ type: 'breed', aJson: a, bJson: b, challengeHex: ch }).done;
+          const mutateFn = (g, ch, r) => pool.submit({ type: 'mutate', genomeJson: g, challengeHex: ch, rate: r }).done;
+          const randomFn = (seed) => pool.submit({ type: 'random-genome', seed }).done;
+          const { living, history } = await computeFlock({ store, baked, breedFn, mutateFn, randomFn });
+          viewable = new Set([...living.keys(), ...history.map((h) => h.record.id)]);
+        } catch (e) {
+          // If the flock can't be computed, fail safe: render parents greyed
+          // (non-link) rather than dead links.
+          console.error('lineage flock compute failed:', e);
+        }
+      }
+
+      // A single parent slot: a link if viewable, else dimmed plain text.
+      const parentNode = (pid) => {
+        const name = sheepName(pid);
+        if (viewable.has(pid)) {
+          const a = document.createElement('a');
+          a.className = 'parent';
+          a.textContent = name;
+          a.href = `sheep.html?id=${pid}${peerQ}`;
+          a.title = pid;
+          return a;
+        }
+        const span = text(name, 'parent-dead');
+        span.title = `${pid} — perished, not in the Hall of Fame (can't be opened)`;
+        return span;
+      };
+
+      if (parents.length >= 2) {
+        append(parentNode(parents[0]));
+        append(text(' + ', 'sep'));
+        append(parentNode(parents[1]));
+        append(text(' : ', 'sep'));
+      } else if (parents.length === 1) {
+        append(parentNode(parents[0]));
+        append(text(' ↻ : ', 'sep')); // mutation arrow
+      } else {
+        const tag = rec.baked ? 'genesis ' : (rec.origin === 'immigrant' ? 'immigrant ' : '');
+        if (tag) append(text(tag, 'tag'));
+      }
+      append(text(sheepName(rec), 'self'));
+    }
+
     // ---- record lookup --------------------------------------------------------
 
     async function findRecord() {
@@ -565,7 +659,14 @@
         return;
       }
       $('#sheep-id').textContent = id;
-      $('#info').textContent = provenance(record).how;
+      // The page's primary identity is the unique id-derived name; the origin
+      // sentence (provenance.how) becomes the hover tooltip of the lineage line.
+      document.title = sheepName(record);
+      // Compact lineage line, with links to viewable parents — see renderLineage.
+      renderLineage(record).catch((e) => {
+        console.error(e);
+        $('#info').textContent = sheepName(record); // fall back to just the name
+      });
 
       // Record the build this page loaded with, then poll for new deploys.
       // (The libp2p cache-bust below also captures this, but it's gated on

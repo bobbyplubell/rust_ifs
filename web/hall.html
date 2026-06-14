@@ -42,7 +42,7 @@
     import { openStore } from './js/store.js';
     import { computeFlock } from './js/gens.js';
     import { specForGen, specCells, GENESIS_GEN } from './js/net.js';
-    import { provenance } from './js/names.js';
+    import { sheepName } from './js/names.js';
     import { PEER_NS } from './js/identity.js';
 
     const hall = document.getElementById('hall');
@@ -79,7 +79,7 @@
           info.innerHTML =
             `<div class="gen">GENERATION ${champ.gen - GENESIS_GEN}</div>` +
             `<div class="name"><a href="sheep.html?id=${champ.record.id}${peerQ}" target="_blank">` +
-            `${provenance(champ.record).who}</a> <span class="crown">👑</span></div>` +
+            `${sheepName(champ.record)}</a> <span class="crown">👑</span></div>` +
             `<div class="backing">${champ.backing} credit${champ.backing === 1 ? '' : 's'} backing</div>`;
           row.append(canvas, info);
           hall.append(row);
