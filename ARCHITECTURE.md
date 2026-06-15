@@ -169,9 +169,22 @@ are **rate-limited / reputation-weighted** so evolution can't be brigaded.
   player — though display is mostly video now), `web/js/{identity,hash}.js`
   (signing), `web/js/audit.js` (verify primitives — now run natively too), genesis
   genomes + golden hashes, `web/build.sh` (WASM build).
+- **Preserve the v1 front-end** — the look and the game design carry over: keep
+  `style.css`, the page markup, sheep names, lineage, hall of fame, the gen
+  countdown, per-card tile totals, and the **contribute → earn credits → back a
+  sheep** loop. The rebuild is "rewire the plumbing under the same skin," not a
+  redesign: swap the data/control layer (`net.js`/`gens.js`/`store.js` → a thin
+  coordinator HTTP client), and swap local-render display for **video playback**
+  (the boomerang/preview-loading machinery retires). The heat-grid/per-frame stats
+  stay, now fed by server coverage data. The page markup lives in
+  `attic/v1-p2p-client/` as the basis.
+- **Breeding becomes propose-a-pairing.** The nursery stays: spend credits to pick
+  two parents → the coordinator does the crossover, renders the child, adds it to
+  the flock. Keeps the creative agency; the server still owns genome generation
+  (also what keeps malicious genomes out). Pure-vote-driven breeding is the
+  fallback if user pairing is dropped.
 - **Build new:** the Rust coordinator (axum service: assign / ingest / verify /
-  merge / encode / GA / vote / serve), and a new static client (crib display +
-  contribute UI from `attic/v1-p2p-client/`, drop all net/gens/store guts).
+  merge / encode / GA / vote / serve), and the client's data/control layer.
 - **Cribbable for reference:** the GA logic in `attic/.../gens.js`, the audit/
   count-conservation/subtract logic, the FrameLoop display.
 
