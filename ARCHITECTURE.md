@@ -1,414 +1,187 @@
-# wasm-sheep architecture
+# proof-of-sheep architecture (v2 — coordinator)
 
-**Electric Sheep, reborn as a static site + browser swarm.** A GitHub
-Pages-deployable site serves a WASM fractal-flame renderer. Each sheep is a
-**community-rendered animated artifact**: visitors contribute deterministic
-render work into the sheep's shared accumulation, which improves the loop *for
-everyone*, and each verified contribution earns a credit you spend to vote on
-selection.
-There is no application server — all state lives in the swarm — and because the
-renderer is deterministic, every pixel on screen is provably a render of a
-public genome, never attacker-supplied data.
+**Electric Sheep, reborn.** A central **coordinator** runs the genetic algorithm,
+hands out small deterministic render work-units to volunteers, merges their
+results into a canonical per-sheep render, encodes the viewable loop as a video,
+and serves it. A **static client** (GitHub Pages) displays the merged videos,
+lets people contribute render work, and lets them vote.
 
-> **v2 redesign (this document).** Earlier the unit of work was a *personal
-> loop-proof per voter* (each client rendered the whole sheep; that proof was
-> their vote) with low/med/high/ultra quality tiers. That is replaced by the
-> model below: one sheep, one ever-improving high-resolution render, built
-> collectively from verifiable sample-batches. See **Implementation plan** for
-> the staged migration.
+This replaces the v1 fully-P2P design (libp2p/WebRTC/gossip), which never
+connected reliably in browsers. v1 lives in git history and `attic/v1-p2p-client/`.
 
-```
-┌─────────────────────┐     static assets only (wasm, js, seed genomes)
-│   GitHub Pages      │────────────────────────────────┐
-└─────────────────────┘                                ▼
-┌─────────────────────┐  WebSocket   ┌──────────────────────────────────┐
-│   Relay node        │◄────────────►│  Browser peer                    │
-│  (circuit relay v2) │   signaling  │  ┌────────────┐ ┌─────────────┐  │
-│   holds no          │   WebRTC     │  │ flame-core │ │ js-libp2p   │  │
-│   authority         │  ┌──────────►│  │  (wasm)    │ │ (gossipsub) │  │
-└─────────────────────┘  │ p2p data  │  └────────────┘ └─────────────┘  │
-                         │           │  ┌────────────────────────────┐  │
-   other browser peers ◄─┘           │  │ IndexedDB: sheep, batches, │  │
-                                     │  │ render cache, fraud, id     │  │
-                                     └──┴────────────────────────────┴──┘
-```
+The guiding principle survives unchanged: **every displayed pixel is a
+deterministic render of a coordinator-authored genome.** Work is verifiable;
+results are reproducible; the heavy data is a *recipe*, not a payload.
 
-## Design principles
+---
 
-1. **Determinism is the root of trust.** `flame-core` renders any unit of work
-   `(genome, seed)` byte-identically on every target (all transcendentals via
-   the `libm` crate; a guard test forbids std float math outside `fmath.rs`).
-   Every claim — "I rendered this batch", "this is fraudulent", "these are the
-   children" — is a pure function of public data, checkable without trusting
-   anyone.
-2. **The sheep is the shared object.** What the swarm holds and grows is the
-   sheep itself: its genome plus the accumulated render of its animation loop.
-   There is no separate "ledger" to reason about — a sheep simply carries the
-   set of sample-batches it contains (its coverage), the way a torrent carries
-   its piece list. Contributing = adding batches; sharing = batches flowing to
-   other holders; merging two copies = union of their batches.
-3. **Nothing displays unless it is validated to be a render of the genome.**
-   This is a hard gate, not best-effort (see **Verification**). Shared pixels
-   are only ever an optimization to save CPU; the source of truth is always
-   "render the genome", and any client can fall back to rendering locally with
-   zero trust.
-4. **Work earns credits; credits are votes.** A contributed batch (a) makes the
-   sheep look better for everyone and (b) earns its contributor one fungible
-   **credit**. Render quality and selection are *decoupled*: you render where it
-   helps, then spend credits to **back** the sheep you want to survive. A sheep's
-   selection weight is its total backing (spent credits), not its render coverage,
-   so the best-looking sheep and the most-backed sheep can differ. Credits are
-   audited render work, so influence is bought only with real CPU — it can't be
-   faked or Sybil-farmed for free. Honest users never do makework; only attackers
-   experience the render cost as a cost.
-
-## Components
-
-| Component | Tech | Role |
-|---|---|---|
-| `flame-core` | Rust | Deterministic renderer: integer-histogram chaos game, batch rendering, tone map, interpolation, crossover/mutation |
-| `flame-wasm` | wasm-bindgen | Browser bindings: batch render/verify, histogram merge + tonemap, hashing, breeding, canonicalization |
-| `flame-cli` | Rust | Dev tool; native rendering + auditing |
-| `web/` | JS, no framework | GUI + swarm logic: gossip, IndexedDB store, accumulation/verify/selection engines |
-| Relay | one tiny always-on host | libp2p circuit relay v2 + bootstrap + anchor peer |
-
-## Identity
-
-A peer identity is an Ed25519 keypair (the libp2p PeerId), generated on first
-visit, kept in IndexedDB. Identities are free; the protocol never assumes
-otherwise. Votes cost honest render work, not identity.
-
-## Data model
-
-All IDs are SHA-256 over canonical bytes. All signed messages are immutable
-once published. Time divides into **generations** (5 minutes, wall-clock
-aligned, public schedule, no coordination).
-
-### Sheep
+## 1. Shape
 
 ```
-sheep_id = H(canonical_genome_json)
-{
-  genome:  <flame-core genome JSON, canonicalized (sorted keys, fixed floats)>,
-  parents: [sheep_id, sheep_id] | [sheep_id] | null,  // 2=bred, 1=mutant, null=immigrant/seed/release
-  gen:     u64,                       // generation it entered the flock
-  origin:  "seed" | "release" | "pair" | "mutant" | "immigrant",
-  author:  pubkey | null,            // set for user releases; null for derived
-  sig:     ...                       // present for releases; absent for derived (recomputable)
-}
+        ┌─────────────────────────── GitHub Pages (static) ───────────────────────┐
+        │  client: display merged video · render assigned tiles (WASM) · vote      │
+        └───────────────▲───────────────────────────────────────────┬─────────────┘
+                        │ GET video / sheep list (cached at CDN)     │ POST results / votes
+                ┌───────┴───────── Cloudflare (CDN + DDoS shield) ───┴───────┐
+                └───────▲───────────────────────────────────────────┬───────┘
+                        │                                            │
+        ┌───────────────┴──────────────── Coordinator (VPS) ────────┴─────────────┐
+        │  axum/Rust · reuses flame-core natively · runs the GA · assigns work ·   │
+        │  ingests + verifies results · merges histograms · ffmpeg encode · SQLite │
+        └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-Sheep are content-addressed: the same genome submitted twice — or bred
-independently by two partitioned clients — is one sheep. A genome is an IFS:
-a few dozen affine coefficients, variation weights, and a palette. **The medium
-cannot represent an arbitrary image** (no photo/text/"scare image" fits in it);
-the worst a hostile genome yields is an ugly *fractal*. Genomes are
-bounds-checked at ingest (finite params, weights in range, xaos rows well
-formed); out-of-bounds genomes are dropped.
+- **Static client** — GitHub Pages, free, no app logic that needs trust. Talks
+  to the coordinator over plain HTTPS (POST results/votes, GET sheep list).
+  Pulls videos via the CDN.
+- **Coordinator** — the one stateful service. Authoritative over the flock.
+- **Shared renderer** — `crates/flame-core` is the *same deterministic code* run
+  natively by the coordinator (verification, final tonemap) and as WASM by the
+  client (`web/js/{worker,pool}.js`, contribution). Determinism is the contract
+  that lets the coordinator trust a client's pixels by spot-re-rendering.
 
-### Batch (the unit of work, contribution, and vote)
+## 2. The render pipeline & its three forms
 
-A flame is rendered by the chaos game, whose trajectories hop all over the
-image plane — so you cannot split the work *spatially*. You split the **stream
-of input points**. A **batch** is a deterministic slice of that stream for one
-animation frame:
+A sheep exists in three representations that differ by ~1000× (numbers for the
+current spec: 384×384, ss=1, 4 channels, u64 counts, 128 frames):
 
-```
-batch_seed(sheep_id, frame, idx) = first 8 bytes of H(sheep_id ‖ "b" ‖ le32(frame) ‖ le32(idx))
-```
+| form | size | role | mergeable? | distributed? |
+|---|---|---|---|---|
+| **batch log** (recipe: `(frame, idx)` per tile) | ~0.2–9 MB | canonical contribution record | yes (append) | between coordinators only |
+| **accumulated histogram** | **~576 MB** | working merge state | yes (additive) | never leaves the coordinator |
+| **viewable video** (tonemap → AV1/VP9) | **~1–4 MB** | what people watch | **no** (lossy) | yes, via CDN |
 
-Rendering batch `(frame f, idx i)` plots a fixed number of samples (`BATCH_SPP`)
-of the genome animated to phase `f / N_FRAMES`, into an integer histogram.
-Because the seed and the renderer are deterministic, **every peer who renders
-`(f, i)` produces a byte-identical histogram** with a byte-identical hash. A
-frame's full render is the sum of its rendered batches; the loop is `N_FRAMES`
-such frames. Global `(f, i)` indices mean a sheep's coverage is a compact set
-of integer ranges, and two peers rendering the same `(f, i)` produce identical
-data (a harmless, idempotent duplicate).
+Pipeline is one-directional:
+**log → (re-render + sum) → histogram → tonemap → lossy-compress → video.**
+You merge at the left; you distribute the right; the 576 MB only materializes
+transiently when a sheep needs repainting. Tonemap is nonlinear, so the video is
+a dead-end for merging — keep merge state in the count domain.
 
-A **contribution record** (signed, gossiped — small):
+**Cost follows egress.** Ingress (clients pushing results) is free; egress
+(serving video) is the only bill. A ~2 MB video to 10k viewers ≈ 20 GB ≈ $2 on a
+cloud, ~free behind the CDN. So "serve the video, never the histogram" is the
+whole hosting story.
 
-```
-batch_key = sheep_id ‖ ":" ‖ f ‖ ":" ‖ i
-{
-  sheep_id:    ...,
-  frame:       u32,
-  idx:         u32,
-  hash:        H(integer batch histogram),   // commits to the render output
-  spp:         u32,                           // samples in this batch (= BATCH_SPP)
-  contributor: pubkey,
-  gen:         u64,                           // generation the work counts toward
-  sig:         sign(contributor, "batch|sheep_id|f|i|hash|spp|gen")
-}
-```
+## 3. Work model
 
-It is verifiable by re-rendering `(f, i)` and checking `hash` (the audit
-primitive). Each accepted, non-duplicate, verified batch mints **one credit** for
-its contributor in that generation (spent on votes — see Credits/selection).
+- The coordinator owns the flock. When a client clicks **contribute**, it gets a
+  **bundle of small work-units**: each is `(sheepId, genome, frame, idx)` — render
+  `spp` samples for that tile and return the histogram contribution + a signed
+  record. The coordinator **assigns distinct idxs**, so no two clients ever render
+  the same tile (the v1 collision problem is gone by construction).
+- **Small units** keep render/audit/honeypot cheap. Their per-record signature
+  overhead is fine because **records are transient**: verify → merge the pixels →
+  bump a per-contributor tally for credits/reputation → discard the record. The
+  canonical state is the histogram + the tallies, not a growing log.
+- A bundle also carries **audit tasks** (see §4) so verification is volunteer work
+  too. Round-trips are amortized by bundling N tasks per request.
 
-### Accumulated render (the sheep's pixels — the shared artifact)
+## 4. Trust model
 
-Per sheep, per frame, peers hold the **summed integer histogram** of that
-frame's batches, plus the **coverage set** of which `(f, i)` are included.
-Integer/fixed-point accumulation (see **Renderer**) makes the sum
-**order-independent and bit-identical**, so any two peers with the same
-coverage have byte-identical pixels and merge trivially (union the coverage,
-add the histograms). Two fidelities of the same sheep travel the network:
+Two tiers. **Ship the thin one; the hardened one is designed and bolts on without
+rework when real abuse appears** (the v1 lesson: don't carry weight you don't need
+yet — original Electric Sheep had ~no verification because cheating wasn't
+profitable).
 
-- **Heavy:** the integer frame histograms (what a *contributor* needs to add
-  samples and what verification operates on).
-- **Light:** the tonemapped frames / short video (what a *viewer* needs to
-  watch). Derived from the heavy form; ~a few MB for a whole loop, like the
-  original Electric Sheep clips.
+**Identity:** the existing **Ed25519 keypair** (`web/js/identity.js`), not IP.
+Stable across IP changes, reputation attaches to the key. Keypairs are free →
+Sybil-cheap, but that's handled by sampling (a fresh key is heavily audited). **IP
+is a secondary signal only** — per-IP rate-limit + flag bursts of new keys from
+one IP/subnet for extra scrutiny. Never identity (NAT conflates real users,
+dynamic IPs wipe reputation, rotation is cheap for attackers).
 
-### Fraud proof
+**Thin (v2.0):** every result is signed; the coordinator **re-renders a random
+sample** and checks the hash (reusing `web/js/audit.js` primitives natively),
+applies **count conservation** and **subtract-check**, and **bans + invalidates
+all work** on a fraud catch. That alone defeats the realistic threat (bored
+griefers) and the economic deterrent (lose everything) makes the rest unprofitable.
 
-```
-{
-  batch_key: sheep_id:f:i,    // the offending contribution
-  expected:  H(...),          // what (f,i) actually hashes to
-  reporter:  pubkey,
-  sig:       ...
-}
-```
+**Hardened (v2.x, when needed):**
+- **Reputation tiers** — a new key is sampled ~100%; sampling decays toward a
+  floor as accepted work accumulates. Never 0%. Reputation ≠ spendable credits.
+- **Peer-offloaded auditing** — contribute bundles include audit tasks
+  (re-render someone else's claimed tile, report hash match). Deterministic render
+  ⇒ honest auditors agree ⇒ a liar is outvoted by N independent reputation-weighted
+  auditors.
+- **Honeypots** — salt the audit stream with planted tasks the coordinator already
+  knows the answer to. **Known-bad** (a real-looking tile with a wrong claimed
+  hash) catches rubber-stampers — you can't pass it without actually re-rendering.
+  **Known-good** catches false accusers. Grading is *free* (the coordinator planted
+  the answer; no re-render). Honeypots are indistinguishable from real audits.
+- Reputation governs three things: how much *your work* is audited, how much *your
+  audit verdict* is trusted, and whether the coordinator **re-renders to verify**
+  you (new) vs **trusts your uploaded pixels** (proven) — the latter is what
+  actually offloads the coordinator's compute.
 
-Objectively verifiable: any peer re-renders `(f, i)` (cheap, one batch) and
-confirms the contributor signed a wrong hash. On a confirmed fraud proof a
-client discards **all** contributions ever signed by that key and excludes its
-votes everywhere. Keys are free, but a fresh key restarts at zero votes and
-pays full render cost per batch — fraud never beats honesty on cost.
+End state: volunteers do the rendering **and** the verification; the coordinator's
+compute is just assignment + merge + occasional honeypot/meta-audit + encode.
 
-## Renderer (flame-core)
+**Content integrity (free property, not a feature):** since every accepted tile is
+a verified deterministic render of the genome, the merged pixels can *only*
+converge on the genome's image — arbitrary-image injection through tiles is blocked
+by construction. The only content vector is the genome, which the coordinator
+authors (server-side GA) and can review/remove (it controls the flock). Fractal
+flames can't produce photographic content, only abstract/symbolic shapes.
 
-**Integer histograms (the keystone).** A histogram cell accumulates
-`[r, g, b, count]` as integers: each plotted sample adds its palette color
-quantized to fixed-point (`u16` per channel) and `1` to the count, into `u64`
-accumulators. Consequences:
+## 5. Genetic algorithm (server-side)
 
-- **Order-independent merge.** Integer addition is exactly associative and
-  commutative, so summing the same batches in any order — or merging two peers'
-  partial sums — yields identical bytes. This is what makes a shared,
-  convergent, content-addressable sheep possible (floats would diverge by ULPs
-  and break content-addressing).
-- **Exact verification.** Total `count` over all cells equals the sum of
-  contributed `spp` exactly; subtracting a known batch can never make a cell go
-  negative. Both checks below become provable, not statistical.
+The GA runs in the coordinator — this deletes v1's hardest problem (deterministic
+replay-from-genesis, the divergence/checkpoint/gen-boundary mess). The server
+**is** the flock: it tallies votes, selects survivors, breeds (crossover +
+mutation), injects fresh-blood random immigrants, and stores genomes. Clients
+fetch the current flock; nobody replays anything. Trade: the server is
+authoritative over creative direction (breeding fairness becomes "trust the
+server"); the *render-work* accounting stays trustless. Votes drive selection and
+are **rate-limited / reputation-weighted** so evolution can't be brigaded.
 
-The tone map reads the integer histogram (dividing fixed-point color back to
-`[0,1]`) and is otherwise the current pipeline, which is **built for partial
-data** because a flame is a Monte Carlo estimate — any subset of batches is an
-unbiased, noisier estimate of the *same* image:
+## 6. Deployment & resilience
 
-- **Sample-invariant exposure:** density is normalized by the mean nonzero
-  density, so the tone curve is identical at 10 batches or 10,000 — a partial
-  render looks like the finished one with more grain, never a different
-  brightness.
-- **Absolute-count density estimation:** the DE blur radius keys to a cell's
-  absolute sample count, so sparse partial renders read as smooth glow and
-  resolve into solid structure as batches accumulate (a ratio-based radius
-  would blur the dim majority into permanent "fog").
+- **Client:** GitHub Pages (static, `web/`), custom domain via `CNAME`. Free.
+- **CDN:** **Cloudflare (free tier)** in front of the coordinator — caches the
+  videos (kills egress), absorbs DDoS, terminates TLS at the edge. Important for an
+  exposed server.
+- **Coordinator stack — Rust:** `axum` + `tokio`, **reusing `flame-core` natively**
+  for verification + final tonemap (same deterministic code as the client's WASM,
+  full native speed). Rust's memory safety matters for a server eating untrusted
+  input. `ffmpeg` shells out for the video encode.
+- **State:** **SQLite (WAL mode)** holds the small canonical state — genomes,
+  sheep, votes, credits, reputation, per-sheep tile tallies, the batch log. The
+  576 MB histograms and the videos are **regenerable caches** on disk (reconstruct
+  by re-rendering the log; encode on a quality-delta threshold and cache).
+- **Process:** Docker `restart: always` behind **Caddy** (already on the VPS;
+  auto-HTTPS). Coordinator API is plain HTTP/SSE — no WebSocket, so the v1 h2/wss
+  handshake bug can't recur.
+- **Resilience across the two droplets** (relay1 `178.128.157.72`, relay2
+  `174.138.34.46` — repurposed, not destroyed): **primary + warm standby.** Because
+  the canonical state is small SQLite, replicate it continuously with
+  **litestream** (→ standby or object storage); rsync the histogram/video caches (or
+  let the standby regenerate them from the replicated log). Failover via a
+  **DigitalOcean reserved (floating) IP** reassigned to the standby. Start with one
+  solid box + continuous backup; automate failover when it's worth it.
+- **Hardening:** input validation, **bounded verification renders** (iteration/time
+  cap in flame-core for any untrusted genome — though genomes are server-authored,
+  belt-and-suspenders), per-IP/key **rate limiting** (Cloudflare + tower middleware).
 
-These two properties (already in `render.rs`) are precisely what make a sheep
-coherent at every coverage level and monotonically improving.
+## 7. Reuse vs build
 
-## Verification — nothing renders to screen unverified
+- **Reuse as-is:** `crates/flame-core` + `flame-wasm` + `flame-cli` (the renderer),
+  `web/js/{worker,pool}.js` (client render harness), `web/js/loop.js` (frame
+  player — though display is mostly video now), `web/js/{identity,hash}.js`
+  (signing), `web/js/audit.js` (verify primitives — now run natively too), genesis
+  genomes + golden hashes, `web/build.sh` (WASM build).
+- **Build new:** the Rust coordinator (axum service: assign / ingest / verify /
+  merge / encode / GA / vote / serve), and a new static client (crib display +
+  contribute UI from `attic/v1-p2p-client/`, drop all net/gens/store guts).
+- **Cribbable for reference:** the GA logic in `attic/.../gens.js`, the audit/
+  count-conservation/subtract logic, the FrameLoop display.
 
-Two independent walls; either alone is strong.
+## 8. Phasing
 
-**Wall 1 — the medium can't hold an arbitrary image.** A sheep is an IFS
-genome; the renderer can only produce a fractal flame. There is no path for an
-uploaded photo/text to become a sheep. Bounds-checking genomes at ingest closes
-the only crafted-input surface.
-
-**Wall 2 — pixels are never trusted, only verified.** Shared render data is an
-optimization; the source of truth is the genome. Before any accumulated render
-is displayed or merged:
-
-1. **Count conservation:** the histogram's total `count` must equal the sum of
-   the `spp` of the batches it claims to contain. Extra (injected) density fails
-   this exactly (integer arithmetic).
-2. **Spot re-render:** re-render a random sample of the claimed batches and
-   compare hashes; integer-subtract them from the sum and confirm no cell goes
-   negative (the batch is genuinely present). Any mismatch ⇒ discard the whole
-   copy and publish a fraud proof against the source; the signed contribution
-   makes the ban attributable.
-3. **Dominance bound:** a *visible* forgery must dominate the histogram, i.e.
-   require many fake batches, so spot re-render catches it with overwhelming
-   probability. A handful of fakes cannot form a visible image; a visible image
-   cannot hide.
-4. **Zero-trust fallback:** any client may ignore shared pixels entirely and
-   render the sheep from its genome — guaranteed correct, no network trust. A
-   "strict" display mode shows only locally-rendered or fully-verified data.
-
-This is strictly stronger than the original Electric Sheep, where clients
-trusted the server's rendered video outright.
-
-## Sharing the sheep (anti-entropy, torrent-style)
-
-The contribution records (small, signed) gossip normally and define each
-sheep's coverage and tally. The heavy pixels move on demand:
-
-- A peer announces, per sheep, a compact **coverage digest** (per-frame batch
-  ranges, hashed). Peers with gaps request the missing frame histograms (or the
-  light video); the server streams them; the receiver runs the **Verification**
-  gate before accepting, then merges (union coverage, add histograms).
-- Because merges are integer-exact, copies converge regardless of who rendered
-  what or in what order. Popular sheep attract more contributors → more batches
-  → smoother, cleaner, more-covered loops; ignored sheep stay rough.
-- Contribution coordination is implicit: a contributor renders the
-  least-covered frames / next-free `(f, i)` it sees, so work spreads across
-  frames without a coordinator. Collisions render identical data and are
-  deduped by `(f, i)`.
-
-## Credits, votes, selection, generations
-
-The **vote-credit economy** decouples render work from selection:
-
-- **Credits** earned by a key in generation `g` = `floor(distinct verified
-  batches with gen = g / TILES_PER_CREDIT)`, non-banned. `TILES_PER_CREDIT = 128`,
-  so a vote costs real work (≈ one breeding gate). Fungible and
-  **use-it-or-lose-it** — they expire at gen close, no stockpiling.
-- **Votes** are signed `vote` records (`{from, gen, sheepId, n, seq}`, back-only,
-  flat) that spend credits to back a sheep. Ingest checks only well-formedness +
-  signature; the credit BUDGET is enforced by deterministic recompute, exactly
-  like batch tallies (earned credits depend on batches that may not have synced).
-- **Backing** of a sheep in `g` = sum of valid votes for it. `computeBacking`
-  caps each voter's spend at their earned credits, dropping over-budget votes in
-  canonical (`seq`) order — so every peer agrees. Backing, NOT render coverage,
-  is the selection score.
-- **Selection** (`gens.js`): per generation, **niched** top-`K` (K=6) by backing
-  survive (fitness-sharing over genome distance so one aesthetic can't
-  monopolize), filling empty slots from unbacked living, newest first. Survivors
-  breed by cyclic pairing; each active generation also derives 2 high-rate mutant
-  clones of the top survivors and 1 deterministic immigrant. All
-  children/mutants/immigrants derive from public data — identical on every peer.
-- **Releases:** a user can submit a bred sheep directly (signed, `origin:
-  "release"`), capped per (author, gen), admitted only after rendering 64 tiles
-  to EACH parent (the breeding gate). It then earns backing like any other sheep.
-- **Anti-whale, honestly:** there's no quadratic/cap shaping — in a permissionless
-  swarm, free identities defeat it. The real defense is that credits = audited CPU
-  work, so influence is meritocratic (most useful work → most say) and can't be
-  Sybil-farmed for free.
-
-The clock-derived generation schedule and content-addressed, recomputable
-children mean a late-arriving batch or vote retroactively recomputes backing and
-every peer self-heals to the same flock.
-
-## Network
-
-Transport interface (`send(msg)` / `onMessage(fn)` in `web/js/net.js`), two
-implementations:
-
-- **BroadcastChannel (dev):** same-origin tabs form a real swarm; `?peer=N`
-  namespaces identity + store per tab.
-- **js-libp2p (production):** WebSocket (browser ↔ relay) + WebRTC (browser ↔
-  browser via circuit relay v2). Browsers can't accept inbound; the relay only
-  introduces peers, then data flows direct. `?relay=<multiaddr>` /
-  `localStorage.relays` override `config.js` RELAYS for local testing.
-- **Gossip:** small signed records — `sheep`, `batch` (contribution), `fraud`.
-  Heavy render data is **never** broadcast; it is fetched point-to-point on
-  demand (`want-render` / `render-data`) and verified before use.
-- **Anti-entropy:** jittered `inv` beacons carry one digest per (kind,
-  generation) bucket and per-sheep coverage digests; only mismatched buckets
-  exchange keys, then records — O(generations + sheep) beacon size, not
-  O(records). Every browser persists what it sees and serves it onward.
-- **Ingest gate (before storing or relaying):** valid signature; genome parses
-  and is in bounds; batch references a known sheep and a live generation;
-  dedup; per-peer rate limits; render data passes **Verification**. Invalid ⇒
-  dropped, not propagated.
-
-## Cold start and the anchor peer
-
-1. **Baked state:** the static site ships seed genomes and a deploy-time
-   snapshot of sheep + their current coverage/light renders, so an empty swarm
-   still shows a full, already-decent gallery.
-2. **Anchor peer:** the relay host also runs an ordinary peer with disk
-   persistence — subscribes, stores, serves sync, contributes batches when
-   idle. **No authority**; just a peer that never sleeps, on hardware we own.
-3. **Long-lived tabs:** the site is a screensaver; left-open tabs are organic
-   anchors and idle contributors.
-
-## GUI
-
-- **Flock view:** gallery of current-generation sheep at thumbnail scale —
-  downscaled tonemaps of the *same* shared histograms, sharpening live as
-  batches arrive. A "contribute" affordance pledges idle CPU to a sheep.
-- **Sheep view:** the full-resolution animated loop, sharpening as the swarm
-  (and you) contribute; lineage; a samples/pixel quality readout. **One**
-  excellent render — no quality tiers.
-- **Idle contribution:** a background worker renders batches for under-covered
-  frames of sheep the user is watching / has pledged to, publishes records,
-  earns votes.
-- **Breeding lab:** pick two living sheep → the canonical child they'd have this
-  generation (the preview *is* the deterministic child), plus what-ifs.
-- **Network panel:** peers, sync status, coverage of viewed sheep, audit/verify
-  activity ("verified 14 batches, 0 frauds").
-
-All rendering runs in a Web Worker pool; the main thread never blocks.
-
-## WASM API (flame-wasm) — contract
-
-Integer-histogram era. `Hist` is a transferable typed array of `u64` cells
-(`[r16.16, g, b, count]` fixed-point), length `w·ss·h·ss·4`.
-
-- `render_batch(genome_json, sheep_id, frame, idx, w, h, ss, spp) -> { hash, hist }`
-  — deterministic batch render; `hist` integer, `hash = H(hist bytes)`.
-- `batch_hash(genome_json, sheep_id, frame, idx, w, h, ss, spp) -> hash`
-  — audit primitive (hash only, no pixel return).
-- `merge_into(acc: Hist, add: Hist)` — integer add (may live in JS over the
-  typed arrays; exact either way).
-- `tonemap_hist(hist: Hist, genome_json, w, h, ss) -> rgba` — integer-histogram
-  tone map (sample-invariant exposure + absolute-count DE), for any coverage.
-- `total_count(hist) -> u64` and `subtract_check(acc, batch) -> bool` —
-  verification helpers (count conservation, non-negative subtraction).
-- `sheep_id(genome_json)`, `canonicalize(genome_json)`,
-  `breed(a, b, challenge)`, `mutate_genome(genome, challenge, rate)`,
-  `random_genome_json(seed, transforms)`, `animated(genome, phase)` — unchanged.
-
-## Implementation plan (staged; verification gate is first-class throughout)
-
-Contracts above are fixed so waves can be built against disjoint files.
-
-1. **Renderer foundation (`crates/`).** Integer/fixed-point `Accum`; deterministic
-   `render_batch` / `batch_hash` (animation phase + batch seed); integer
-   `tonemap_hist`; verification helpers; regenerate goldens (these hashes *do*
-   change — this is the protocol break); fmath guard intact; `./web/build.sh`
-   produces a working wasm. **Gate:** native goldens pass, browser-vs-native
-   determinism for `render_batch` holds.
-2. **Protocol (`web/js/net.js`, `store.js`).** `batch` contribution records;
-   per-sheep coverage; `want-render`/`render-data` with the Verification gate;
-   coverage-digest anti-entropy; fraud over batches; store schema for sheep +
-   batches + accumulated render cache. Wire/store version bump.
-3. **Engine + UI (`web/js/app.js`, `gens.js`, `audit.js`, `sheep.html`).** Idle
-   batch contribution loop; accumulate + verify + tonemap display (flock
-   thumbnails and the one-tier sheep view); selection tally from batch counts;
-   auditor re-rendering batches. Remove quality tiers and the loop-proof vote.
-4. **Tests (`e2e/test.js`) + docs.** Determinism of `render_batch`; two-peer
-   contribute → shared sheep improves on both → tally/selection; **forged
-   render-data rejected by the Verification gate**; fraud → ban; generation
-   engine with batch tallies.
-
-Migration note: wave 1 changes the bitstream, so all prior proofs/goldens are
-invalidated by design — there is no in-place compatibility, and the wire/store
-versions bump (a clean break, acceptable pre-launch).
-
-## Known limits and open questions
-
-- **Sybil floor.** One vote ≈ one batch ≈ seconds of honest CPU; a native farm
-  renders faster than browsers. Bounds, not eliminates, manipulation —
-  acceptable for art. Reputation weighting (older clean-audit keys count more)
-  can raise the floor later.
-- **Heavy-render availability.** A sheep nobody seeds at full fidelity must be
-  re-rendered from its genome by a viewer (CPU, not bandwidth). The light video
-  cache + the anchor peer mitigate; popular sheep are always well-seeded.
-- **Coverage coordination at scale.** Implicit "render the least-covered frame"
-  can waste work under high churn (collisions render identical data — wasted
-  CPU, never wrong data). Partitioning `(f, i)` space by peer-id hash is the
-  escape hatch if measured waste is high.
-- **Clock skew / reorg UX, relay SPOF, gossip flooding, eclipse** — as before:
-  generation acceptance window, multiple relays, validate-before-relay, and the
-  fact that audits/derivations are objective so an attacker can hide state but
-  never forge it.
-- **Tuning constants.** `N_FRAMES`, `BATCH_SPP`, render resolution, K, audit
-  fraction, generation length, fixed-point bits — all TBD by experiment;
-  version them in a protocol config.
+1. **Coordinator skeleton** — axum, SQLite, a hardcoded genome; `/assign`,
+   `/submit` (render a tile, return it), thin sampled verify, merge, `/video`.
+2. **Static client** — display the served video; a contribute button that pulls a
+   bundle, renders in the WASM pool, posts results; show credits.
+3. **GA + votes** — server-side breeding, a `/vote` endpoint, the flock list.
+4. **Resilience** — Cloudflare, standby + litestream, reserved-IP failover.
+5. **Harden trust** *(only when abuse appears)* — reputation tiers, peer-audit,
+   honeypots.
