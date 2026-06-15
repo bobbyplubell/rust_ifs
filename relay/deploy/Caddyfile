@@ -1,3 +1,16 @@
+# Force HTTP/1.1 only. The relay serves NOTHING but the libp2p WebSocket, and
+# browsers' wss upgrade fails (HTTP 400) when the connection negotiates HTTP/2 —
+# Caddy advertises h2 by default, so a browser that picks h2 for its WebSocket
+# never opens the socket and the whole transport hangs at createLibp2p (0 peers).
+# Node clients use HTTP/1.1, which is why relay-to-relay works but browsers don't.
+# h1-only makes every client take the known-good WebSocket path. (No downside:
+# there are no HTTP assets here to benefit from h2.)
+{
+	servers {
+		protocols h1
+	}
+}
+
 # TLS for the relay domain; transparently upgrades + proxies WebSocket
 # (libp2p /wss) to the relay's internal plain-ws listener.
 {$RELAY_DOMAIN} {
