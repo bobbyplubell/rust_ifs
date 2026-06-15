@@ -24,9 +24,9 @@
 // default (no ?world=, nothing stored) stays the dev coordinator; for a
 // production deploy, move the prod world to the front of this list.
 export const WORLDS = [
+  { name: 'Sandbox', url: 'https://relay.proof-of-sheep.com' },   // relay1 droplet — fast/wild (5min, high mutation)
+  { name: 'Gallery', url: 'https://relay2.proof-of-sheep.com' },  // relay2 droplet — slow/refined (1h, low mutation)
   { name: 'Local dev', url: 'http://localhost:8080' },
-  { name: 'Sandbox', url: 'https://sandbox.proof-of-sheep.com' }, // deploy fills in
-  { name: 'Gallery', url: 'https://gallery.proof-of-sheep.com' }, // deploy fills in
 ];
 
 const WORLD_LS_KEY = 'sheep-world';
@@ -45,6 +45,13 @@ export function resolveWorld() {
   let stored = null;
   try { stored = normalize(localStorage.getItem(WORLD_LS_KEY)); } catch { /* ignore */ }
   if (stored) return stored;
+  // Host-aware default: a page served from localhost (./dev.sh) defaults to the
+  // local coordinator; the deployed Pages client defaults to the first real world.
+  const h = location.hostname;
+  if (h === 'localhost' || h === '127.0.0.1' || h === '') {
+    const dev = WORLDS.find((w) => /localhost|127\.0\.0\.1/.test(w.url));
+    if (dev) return normalize(dev.url);
+  }
   return normalize(WORLDS[0].url);
 }
 

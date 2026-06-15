@@ -1,0 +1,8 @@
+target
+.git
+web/pkg
+web/js/vendor
+attic
+e2e
+**/node_modules
+*.log
