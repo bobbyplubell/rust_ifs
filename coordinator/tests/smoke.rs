@@ -201,7 +201,11 @@ fn assign_submit_round_trip() {
         .unwrap();
     assert_eq!(me["tiles"].as_u64().unwrap() as usize, units.len());
 
-    // 6. A tampered submit (wrong hash) must be rejected/banned.
+    // 6. Trust-ingest model: a submit whose CLAIMED hash does not match the
+    //    pixels it uploaded is REJECTED on the cheap self-consistency check (no
+    //    re-render). It is NOT a ban — bans now come from peer-audit DISPUTES,
+    //    where self-consistent-but-wrong pixels are caught by an auditor's
+    //    re-render. Here we prove the self-consistency gate rejects garbage.
     let sk2 = SigningKey::from_bytes(&[99u8; 32]);
     let assign2_body = sign(&sk2, json!({ "nonce": 1u64 }));
     let assign2: Value = client
@@ -216,7 +220,7 @@ fn assign_submit_round_trip() {
         "sheepId": u["sheepId"],
         "frame": u["frame"],
         "idx": u["idx"],
-        "hash": "00".repeat(32),
+        "hash": "00".repeat(32),               // claimed hash ≠ hash of all-zero pixels
         "count": "1",
         "hist": encode_hist(&vec![0u64; (384*384*4) as usize]),
     }]);
@@ -226,9 +230,13 @@ fn assign_submit_round_trip() {
         .json(&bad_submit)
         .send()
         .unwrap();
-    assert_eq!(resp.status(), 403, "fraud should be forbidden + banned");
+    let status = resp.status();
+    let body: Value = resp.json().unwrap();
+    assert!(status.is_success(), "self-inconsistent submit returns 200 (no render)");
+    assert_eq!(body["accepted"].as_u64().unwrap(), 0, "garbage not accepted");
+    assert_eq!(body["rejected"].as_u64().unwrap(), 1, "garbage rejected on self-check");
 
-    println!("SMOKE OK: {} tiles accepted, fraud banned", accepted);
+    println!("SMOKE OK: {} tiles accepted, self-inconsistent submit rejected", accepted);
 }
 
 /// Same encoding as `histio::encode_hist` (base64 + zlib deflate of LE u64s).

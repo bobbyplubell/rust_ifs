@@ -38,6 +38,17 @@ impl Db {
             // Cached on-disk byte size of this sheep's hist/<id>/ dir. 0 when
             // evicted/absent; lets us total usage without statting every file.
             "ALTER TABLE sheep ADD COLUMN hist_bytes INTEGER NOT NULL DEFAULT 0",
+            // Peer-audit state of an accepted tile:
+            //   0 = unaudited (trust-ingested; merged but not yet peer-verified)
+            //   1 = audited   (a peer re-rendered it and the hash matched)
+            // The `hash` column already holds the tile's content hash (now the
+            // hash of the UPLOADED pixels, not a server re-render).
+            "ALTER TABLE tile ADD COLUMN audit_status INTEGER NOT NULL DEFAULT 0",
+            // Reputation-weighted audit bookkeeping on the account: how many of
+            // this key's tiles have been audited, and how many audits it has
+            // performed correctly — both feed the trust math.
+            "ALTER TABLE account ADD COLUMN audits_done INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE account ADD COLUMN audits_correct INTEGER NOT NULL DEFAULT 0",
         ] {
             match conn.execute(alter, []) {
                 Ok(_) => {}
@@ -132,4 +143,38 @@ CREATE TABLE IF NOT EXISTS coverage (
     accepted    INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (sheep_id, frame)
 );
+
+-- Peer-audit ledger: an outstanding audit task handed to an auditor by /assign,
+-- awaiting their re-rendered hash report in a later /submit. This is what lets
+-- the coordinator OFFLOAD verification — it plants the task and grades the
+-- reply instead of re-rendering itself.
+--
+--   auditor       the pubkey we handed this task to (who must report a hash)
+--   sheep_id/frame/idx   the tile to re-render (a real submitter's tile, or a
+--                        honeypot the coordinator authored)
+--   kind          0 = real audit (grade against the submitter's stored hash)
+--                 1 = honeypot   (grade against `expected_hash`, known up front)
+--   expected_hash for honeypots: the hash the coordinator already computed at
+--                 plant time (free grading, no re-render on report). NULL for
+--                 real audits (their truth is the tile's stored content hash).
+--   submitter     for real audits: the tile's submitter pubkey, captured at
+--                 plant time so a dispute can identify the accused. NULL for
+--                 honeypots (no real submitter — the coordinator authored it).
+--   status        0 = pending (handed out, awaiting report)
+--                 1 = resolved (report received + graded)
+--   created_ms    when planted (so stale/unreported audits can be reaped).
+CREATE TABLE IF NOT EXISTS audit (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    auditor       TEXT NOT NULL,
+    sheep_id      TEXT NOT NULL,
+    frame         INTEGER NOT NULL,
+    idx           INTEGER NOT NULL,
+    kind          INTEGER NOT NULL DEFAULT 0,
+    expected_hash TEXT,
+    submitter     TEXT,
+    status        INTEGER NOT NULL DEFAULT 0,
+    created_ms    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS audit_by_auditor ON audit(auditor, status);
+CREATE INDEX IF NOT EXISTS audit_open_tile ON audit(sheep_id, frame, idx, status);
 "#;

@@ -119,8 +119,11 @@ export class Contributor {
       if (!this.running) return;
 
       const units = bundle.units || [];
-      // Audit tasks: render-to-verify. v2.0 stub — we acknowledge but report
-      // nothing (the trust model ships the thin tier; peer-audit bolts on later).
+      // Peer-audit tasks (ARCHITECTURE §4): each is a WorkUnit naming someone
+      // ELSE's tile (the submitter's claimed hash is withheld). We re-render it
+      // through the SAME WASM pool and report the observed hash; the coordinator
+      // grades the report (match → validate, mismatch → dispute, honeypot →
+      // graded for free) instead of re-rendering everything itself.
       const audits = bundle.audits || [];
 
       if (!units.length && !audits.length) {
@@ -129,7 +132,7 @@ export class Contributor {
         continue;
       }
 
-      // Saturate the pool: fire every unit at once, await them in parallel.
+      // Saturate the pool with our OWN render work; build Result objects.
       const jobs = units.map((u) => {
         const handle = this.pool.submit(renderBatchMsg(u));
         this._inflight.add(handle);
@@ -145,12 +148,30 @@ export class Contributor {
           .catch(() => { this._inflight.delete(handle); return null; });
       });
 
-      const results = (await Promise.all(jobs)).filter(Boolean);
+      // Audit work: re-render each assigned audit unit and observe its hash.
+      // We do NOT upload pixels for audits — only the hash is reported. The
+      // contributor's own render work above is unchanged.
+      const auditJobs = audits.map((u) => {
+        const handle = this.pool.submit(renderBatchMsg(u));
+        this._inflight.add(handle);
+        return handle.done
+          .then((m) => {
+            this._inflight.delete(handle);
+            if (m.type !== 'batch-done') return null;
+            return { sheepId: u.sheepId, frame: u.frame, idx: u.idx, hash: m.hash };
+          })
+          .catch(() => { this._inflight.delete(handle); return null; });
+      });
+
+      const [results, auditReports] = await Promise.all([
+        Promise.all(jobs).then((r) => r.filter(Boolean)),
+        Promise.all(auditJobs).then((r) => r.filter(Boolean)),
+      ]);
       if (!this.running) return;
-      if (!results.length) continue;
+      if (!results.length && !auditReports.length) continue;
 
       try {
-        const reply = await this.api.submit(this.identity, results, /* auditReports */ []);
+        const reply = await this.api.submit(this.identity, results, auditReports);
         this.opts.onResult?.(reply);
       } catch (e) {
         this.opts.onError?.(e);

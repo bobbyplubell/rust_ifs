@@ -4,6 +4,7 @@
 //! deterministic render work-units, verifies + merges contributions natively
 //! via flame-core, and serves merged loop videos. See API.md for the contract.
 
+mod audit;
 mod auth;
 mod db;
 mod disk;

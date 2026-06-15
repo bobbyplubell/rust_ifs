@@ -12,6 +12,7 @@
 //! tonemap via flame-core for the video.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use flame_core::chunked;
 use flame_core::genome::Genome;
@@ -33,6 +34,17 @@ pub fn parse_genome(genome_json: &str) -> ApiResult<Genome> {
 /// Bounds (untrusted-input safety): the caller passes server-pinned w/h/ss/spp
 /// from the sheep's spec, never client-supplied values, so the render cost is
 /// fixed and known. `spp` is capped here as belt-and-suspenders.
+/// Count of native tile re-renders performed by `verify_tile_hash`. In the
+/// thin-coordinator model this should stay at ZERO across an honest submit —
+/// the coordinator only re-renders for honeypot planting and the rare dispute,
+/// never to verify an ingested tile. Exposed via `/health` so a test (and prod
+/// monitoring) can prove the happy path does no per-tile render.
+pub static VERIFY_RENDERS: AtomicU64 = AtomicU64::new(0);
+
+pub fn verify_renders() -> u64 {
+    VERIFY_RENDERS.load(Ordering::Relaxed)
+}
+
 pub fn verify_tile_hash(
     genome: &Genome,
     sheep_id: &[u8; 32],
@@ -44,6 +56,7 @@ pub fn verify_tile_hash(
     spp: u32,
     n_frames: u32,
 ) -> String {
+    VERIFY_RENDERS.fetch_add(1, Ordering::Relaxed);
     let accum = chunked::render_batch(
         genome,
         sheep_id,
@@ -55,6 +68,23 @@ pub fn verify_tile_hash(
         spp.min(5_000_000),
         n_frames,
     );
+    chunked::hist_hash_hex(&accum)
+}
+
+/// Content hash of an uploaded tile's pixels — WITHOUT re-rendering. This is the
+/// trust-ingest primitive: we take the client's decoded histogram cells as-is,
+/// pack them into an `Accum`, and hash them with the SAME `hist_hash_hex` the
+/// client used. An honest client's upload therefore hashes to exactly the hash
+/// it reported (and to what a re-render would produce); a liar's pixels hash to
+/// whatever they actually uploaded, which a peer audit will later contradict.
+///
+/// `cells` must be the flat w*ss*h*ss*4 u64 vector (as produced by
+/// `histio::decode_hist`).
+pub fn content_hash(cells: &[u64], w: u32, h: u32, ss: u32) -> String {
+    let mut accum = Accum::new((w * ss) as usize, (h * ss) as usize);
+    for (cell, src) in accum.data.iter_mut().zip(cells.chunks_exact(4)) {
+        cell.copy_from_slice(src);
+    }
     chunked::hist_hash_hex(&accum)
 }
 

@@ -9,6 +9,7 @@ use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::audit;
 use crate::auth;
 use crate::disk;
 use crate::error::{ApiError, ApiResult};
@@ -280,14 +281,21 @@ pub async fn post_assign(
         }
     }
 
-    if units.is_empty() {
+    // Peer-audit tasks: a reputation-weighted sample of OTHER contributors'
+    // unaudited tiles (+ the occasional honeypot). This is what offloads
+    // verification onto volunteers — the requester re-renders these and reports
+    // hashes in the next /submit, and the coordinator grades the report instead
+    // of re-rendering everything itself. (audit::sample_audits.)
+    let audits = audit::sample_audits(&conn, &pubkey);
+
+    if units.is_empty() && audits.is_empty() {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "this sheep is fully assigned; try another",
         ));
     }
 
-    Ok(Json(json!({ "units": units, "audits": [] })))
+    Ok(Json(json!({ "units": units, "audits": audits })))
 }
 
 // ---------------------------------------------------------------------------
@@ -327,7 +335,6 @@ pub async fn post_submit(
 
     let mut accepted = 0u64;
     let mut rejected = 0u64;
-    let mut fraud = false;
 
     for r in &results {
         // The tile must be assigned to THIS pubkey and still pending.
@@ -346,7 +353,7 @@ pub async fn post_submit(
             continue;
         }
 
-        // Load the genome + spec.
+        // Load the genome (still needed by the disk guard's reconstruct path).
         let genome_json: String = {
             let conn = state.db.conn.lock().unwrap();
             match conn.query_row("SELECT genome FROM sheep WHERE id = ?1", [&r.sheep_id], |row| {
@@ -366,35 +373,12 @@ pub async fn post_submit(
                 continue;
             }
         };
-        let sheep_id_bytes = match render::sheep_id_bytes(&r.sheep_id) {
-            Ok(b) => b,
-            Err(_) => {
-                rejected += 1;
-                continue;
-            }
-        };
 
-        // Re-render natively and verify the hash (v2.0 = verify everything).
-        let server_hash = render::verify_tile_hash(
-            &genome,
-            &sheep_id_bytes,
-            r.frame,
-            r.idx,
-            spec::W,
-            spec::H,
-            spec::SS,
-            spec::SPP,
-            spec::N_FRAMES,
-        );
-
-        if server_hash != r.hash.trim() {
-            // Fraud: hash mismatch. Ban + invalidate everything.
-            fraud = true;
-            break;
-        }
-
-        // Decode the contributed histogram and confirm IT hashes to the same
-        // value (so the merged pixels are exactly the verified render).
+        // INGEST — trust the uploaded pixels; DO NOT re-render here (this is the
+        // whole point of the thin coordinator). Decode the uploaded histogram and
+        // CONTENT-HASH it: that hash becomes the tile's canonical content hash,
+        // recorded in the ledger alongside the submitter so a peer audit (or, on
+        // a dispute, a single targeted re-render) can later check it.
         let cells = match histio::decode_hist(&r.hist) {
             Ok(c) => c,
             Err(_) => {
@@ -402,27 +386,21 @@ pub async fn post_submit(
                 continue;
             }
         };
-        // Cheap integrity: client hist must match the verified hash too.
-        let client_hash = {
-            use flame_core::render::Accum;
-            let mut accum = Accum::new((spec::W * spec::SS) as usize, (spec::H * spec::SS) as usize);
-            for (cell, src) in accum.data.iter_mut().zip(cells.chunks_exact(4)) {
-                cell.copy_from_slice(src);
-            }
-            flame_core::chunked::hist_hash_hex(&accum)
-        };
-        if client_hash != server_hash {
+        let content_hash = render::content_hash(&cells, spec::W, spec::H, spec::SS);
+        // Cheap self-consistency: the submitter's CLAIMED hash must match the
+        // hash of the pixels they actually uploaded. (A liar can still upload
+        // self-consistent-but-wrong pixels — that's exactly what the peer audit
+        // catches; this only rejects a sloppy/garbled upload, no render needed.)
+        if content_hash != r.hash.trim() {
             rejected += 1;
             continue;
         }
 
         // Merge into the accumulated frame histogram on disk, through the disk
-        // guard: it reconstructs-from-log if this sheep was evicted, evicts LRU
-        // sheep to stay under the cap / above the free floor, and DEGRADES
-        // gracefully (skips the merge, never errors) when the disk is too full.
-        // Either way we still accept the tile + record it in the ledger below,
-        // so the contributor earns credit, the collision guard holds, and the
-        // histogram stays reconstructable from the log.
+        // guard (preserve all its safety gating: reconstruct-on-evict, LRU
+        // eviction under the cap/floor, graceful degradation). We accept + record
+        // the tile regardless, so credit + the collision guard hold and the hist
+        // stays reconstructable from the log.
         let merged = disk::merge_tile(
             &state.disk,
             &state.db,
@@ -442,12 +420,15 @@ pub async fn post_submit(
             );
         }
 
-        // Mark the tile accepted, bump counters.
+        // Record the tile as accepted + UNAUDITED, stamping the content hash and
+        // (implicitly via `pub`) the submitter. Credit is provisional — a later
+        // audit validates it (or a dispute claws it back).
         {
             let conn = state.db.conn.lock().unwrap();
             conn.execute(
-                "UPDATE tile SET status = 1, hash = ?1 WHERE sheep_id = ?2 AND frame = ?3 AND idx = ?4",
-                rusqlite::params![server_hash, r.sheep_id, r.frame, r.idx],
+                "UPDATE tile SET status = 1, audit_status = 0, hash = ?1
+                 WHERE sheep_id = ?2 AND frame = ?3 AND idx = ?4",
+                rusqlite::params![content_hash, r.sheep_id, r.frame, r.idx],
             )?;
             conn.execute(
                 "UPDATE sheep SET tiles = tiles + 1 WHERE id = ?1",
@@ -462,11 +443,45 @@ pub async fn post_submit(
         accepted += 1;
     }
 
-    if fraud {
-        ban_account(&state, &pubkey)?;
-        return Err(ApiError::forbidden(
-            "fraud detected (hash mismatch): account banned, work invalidated",
-        ));
+    // ----- Peer-audit reports: grade the auditor's re-rendered hashes ---------
+    // The auditor re-rendered the tiles /assign planted; their reports validate
+    // (or dispute) OTHER contributors' trust-ingested tiles. Grading is cheap
+    // (hash compares + counter bumps); only a corroborated MISMATCH costs the
+    // coordinator one targeted re-render (the dispute), resolved below.
+    let audit_reports: Vec<Value> = body
+        .get("audit_reports")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut audit_validated = 0u32;
+    let mut disputes = Vec::new();
+    if audit_reports.len() <= 64 && !audit_reports.is_empty() {
+        let conn = state.db.conn.lock().unwrap();
+        let outcome = audit::grade_reports(&conn, &pubkey, &audit_reports);
+        audit_validated = outcome.validated;
+        disputes = outcome.disputes;
+    }
+
+    // Resolve disputes OUTSIDE the DB lock: re-render each disputed tile ONCE to
+    // find ground truth, then ban + (for a fraudulent submitter) subtract the
+    // merged contribution. This is the only happy-path-adjacent render and it is
+    // rare (only on a corroborated audit mismatch).
+    for d in &disputes {
+        resolve_dispute(&state, d);
+    }
+
+    // If THIS caller got banned during grading (failed a honeypot) or a dispute
+    // (named as the liar), don't credit them — report the forbidden state.
+    {
+        let conn = state.db.conn.lock().unwrap();
+        let banned: i64 = conn
+            .query_row("SELECT banned FROM account WHERE pub = ?1", [&pubkey], |r| r.get(0))
+            .unwrap_or(0);
+        if banned != 0 {
+            return Err(ApiError::forbidden(
+                "account banned (failed a honeypot or lost an audit dispute)",
+            ));
+        }
     }
 
     // Credit the contributor: 128 accepted tiles = 1 credit. Carry the
@@ -512,7 +527,100 @@ pub async fn post_submit(
         "rejected": rejected,
         "credits": credits,
         "reputation": reputation,
+        "audits_validated": audit_validated,
+        "disputes": disputes.len(),
     })))
+}
+
+/// Resolve an audit DISPUTE: the auditor's re-render disagreed with the stored
+/// (trust-ingested) tile hash, and the disagreement cleared the corroboration
+/// bar. The coordinator now re-renders THIS ONE tile natively to find ground
+/// truth — the only happy-path-adjacent render, and it's rare.
+///
+///   - submitter's stored hash == truth → the AUDITOR lied → ban the auditor.
+///   - submitter's stored hash != truth → the SUBMITTER lied → ban the submitter
+///     AND subtract their fraudulent merged contribution from the accumulation
+///     (re-render the tile and `disk`-subtract it), then free the tile.
+fn resolve_dispute(state: &AppState, d: &audit::Dispute) {
+    // Load genome + sheep_id bytes for the ground-truth re-render.
+    let genome_json: Option<String> = {
+        let conn = state.db.conn.lock().unwrap();
+        conn.query_row("SELECT genome FROM sheep WHERE id = ?1", [&d.sheep_id], |r| r.get(0))
+            .ok()
+    };
+    let Some(genome_json) = genome_json else { return };
+    let Ok(genome) = render::parse_genome(&genome_json) else { return };
+    let Ok(sid) = render::sheep_id_bytes(&d.sheep_id) else { return };
+
+    let truth = render::verify_tile_hash(
+        &genome, &sid, d.frame, d.idx, spec::W, spec::H, spec::SS, spec::SPP, spec::N_FRAMES,
+    );
+
+    if d.stored_hash == truth {
+        // The submitter's tile is genuine → the AUDITOR is the liar (reported a
+        // hash that is neither the stored pixels' nor the true render). Ban them,
+        // and validate the tile (it survived a real re-render).
+        tracing::warn!(
+            "dispute on {}/{}/{}: stored == truth → auditor {} lied; banning auditor",
+            &d.sheep_id[..d.sheep_id.len().min(8)],
+            d.frame,
+            d.idx,
+            &d.auditor[..d.auditor.len().min(8)],
+        );
+        let _ = ban_account(state, &d.auditor);
+        let conn = state.db.conn.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE tile SET audit_status = 1 WHERE sheep_id = ?1 AND frame = ?2 AND idx = ?3",
+            rusqlite::params![d.sheep_id, d.frame, d.idx],
+        );
+        return;
+    }
+
+    // The stored pixels do NOT match the true render → the SUBMITTER injected
+    // bogus pixels. Subtract their fraudulent contribution from the merged
+    // accumulation, ban the submitter, free the tile. (If the auditor's reported
+    // hash ALSO disagrees with truth, they re-rendered wrong too and are banned
+    // by a separate honeypot/audit over time; here the merge-poisoner is the
+    // unambiguous culprit and is dealt with now.)
+    tracing::warn!(
+        "dispute on {}/{}/{}: stored != truth (auditor reported {}) → submitter {} \
+         injected bad pixels; banning submitter + subtracting contribution",
+        &d.sheep_id[..d.sheep_id.len().min(8)],
+        d.frame,
+        d.idx,
+        &d.auditor_hash[..d.auditor_hash.len().min(8)],
+        &d.submitter[..d.submitter.len().min(8)],
+    );
+
+    // Free this fraud tile FIRST (status=2) so the reconstruct below excludes it,
+    // then ban the submitter (which also frees all their other tiles).
+    {
+        let conn = state.db.conn.lock().unwrap();
+        let _ = conn.execute(
+            "UPDATE tile SET status = 2, pub = NULL, audit_status = 0
+             WHERE sheep_id = ?1 AND frame = ?2 AND idx = ?3",
+            rusqlite::params![d.sheep_id, d.frame, d.idx],
+        );
+        let _ = conn.execute(
+            "UPDATE sheep SET tiles = MAX(tiles - 1, 0) WHERE id = ?1",
+            [&d.sheep_id],
+        );
+        let _ = conn.execute(
+            "UPDATE coverage SET accepted = MAX(accepted - 1, 0)
+             WHERE sheep_id = ?1 AND frame = ?2",
+            rusqlite::params![d.sheep_id, d.frame],
+        );
+    }
+    if let Some(submitter) = (!d.submitter.is_empty()).then_some(&d.submitter) {
+        let _ = ban_account(state, submitter);
+    }
+
+    // Subtract the fraudulent contribution from the merged histogram: the clean
+    // way (the upload is gone) is to drop this sheep's hist cache and let it
+    // reconstruct from the now-cleaned log on the next merge/repaint. Eviction is
+    // lossless and the fraud tiles are excluded from the log, so the reconstruct
+    // contains only honest pixels.
+    disk::evict_for_subtract(&state.disk, &state.db, &state.data_dir, &d.sheep_id);
 }
 
 /// Re-encode videos for the distinct sheep touched by this submit, if they've
@@ -728,5 +836,9 @@ pub async fn get_health(State(state): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({
         "status": "ok",
         "disk": disk::stats(&state.disk, &state.db, &state.data_dir),
+        // Native tile re-renders done so far (honeypot plant + dispute only). A
+        // monitor/test reads this to confirm the happy path does NO per-tile
+        // verify-render: it stays flat across honest submits.
+        "verify_renders": render::verify_renders(),
     }))
 }

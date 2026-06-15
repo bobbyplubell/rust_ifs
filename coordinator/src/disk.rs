@@ -393,6 +393,17 @@ pub fn merge_tile(
     Ok(true)
 }
 
+/// Drop a sheep's histogram cache so it is rebuilt from the (now-cleaned) tile
+/// log on the next merge/repaint. Used by the dispute path to SUBTRACT a banned
+/// submitter's fraudulent contribution: their tiles are already removed from the
+/// log (status != accepted), so the reconstruct contains only honest pixels.
+/// Lossless — the video + tile ledger are untouched (same as LRU eviction).
+pub fn evict_for_subtract(_cfg: &DiskConfig, db: &Db, data_dir: &Path, sheep_id: &str) {
+    if has_hist_on_disk(data_dir, sheep_id) {
+        evict_sheep(db, data_dir, sheep_id);
+    }
+}
+
 /// Observability snapshot for `/health` / `/api/stats`.
 pub fn stats(cfg: &DiskConfig, db: &Db, data_dir: &Path) -> serde_json::Value {
     let hist = tracked_hist_bytes(db);

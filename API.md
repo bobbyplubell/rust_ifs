@@ -37,8 +37,23 @@ Result (one per WorkUnit):
                                               //   u64 histogram contribution)
 ```
 `hash`/`count` come straight from `render_batch`. `hist` lets the coordinator
-merge without re-rendering (compute offload); coordinator MAY re-render to verify
-the hash matches (strategy = its choice; start by verifying ~everything).
+merge without re-rendering.
+
+**Trust model = ingest-trust + peer-audit (the coordinator does NOT re-render on
+the happy path).** On `/submit` the coordinator:
+1. verifies the signature;
+2. decodes `hist` and **content-hashes the uploaded pixels** — that hash becomes
+   the tile's canonical content hash (no render);
+3. as a cheap self-consistency gate, requires the submitter's claimed `hash` to
+   equal that content hash (rejects garbled uploads — still no render);
+4. merges the uploaded pixels into the accumulation and records the tile as
+   **`unaudited`** in the ledger, tagged with the submitter's pubkey + content
+   hash, and credits the contributor **provisionally**.
+
+The tile is later **validated by a PEER** (see `assign.audits` /
+`submit.audit_reports`), not by the coordinator re-rendering it. The coordinator
+re-renders a tile only on a corroborated **audit dispute** (rare) or to **grade a
+honeypot** (free — the answer was planted) — never to verify an honest ingest.
 
 ## Endpoints
 
@@ -62,15 +77,36 @@ The merged loop video for a sheep (302 to a cached file is fine).
 Body: `{ pub, nonce, sig, sheepId? }` (sheepId optional = let server choose).
 Returns a bundle:
 ```
-{ units: [ WorkUnit, ... ],          // distinct idxs — never collide
-  audits: [ WorkUnit, ... ] }         // (optional/empty in v2.0) re-render-to-verify tasks
+{ units:  [ WorkUnit, ... ],   // your render work — distinct idxs, never collide
+  audits: [ WorkUnit, ... ] }  // peer-audit tasks: re-render & report the hash
 ```
+`audits` is a **reputation-weighted sample of OTHER contributors' `unaudited`
+tiles** (never your own; new/low-reputation submitters are audited heavily,
+trusted ones lightly), plus the occasional **honeypot** (a tile the coordinator
+already knows the answer to — indistinguishable from a real audit on the wire).
+Each audit task is a WorkUnit (genome/frame/idx/spec) **without** the submitter's
+claimed hash. The client renders each through the same `render-batch` path and
+reports the observed hash in the next `/submit` (`audit_reports`).
 
 ### POST /api/submit        (signed)
 Body: `{ pub, nonce, sig, results: [ Result, ... ], audit_reports?: [ {sheepId,frame,idx,hash} ] }`.
-Coordinator verifies sigs, (re-)verifies, merges accepted pixels, credits the
-contributor (128 accepted tiles = 1 credit), bans on fraud.
-Returns: `{ accepted, rejected, credits, reputation }`.
+Two flows in one call:
+- **`results`** — your rendered tiles. Each is **trust-ingested**: sig verified,
+  pixels content-hashed + merged, tile recorded `unaudited`, credit provisional
+  (128 accepted tiles = 1 credit). **No re-render.** A claimed-hash ≠
+  uploaded-pixels-hash result is rejected on the cheap self-consistency gate.
+- **`audit_reports`** — hashes you observed re-rendering the `audits` you were
+  handed. The coordinator grades each:
+  - real audit, hash == the tile's stored content hash → tile becomes **`audited`**
+    (validated); submitter + auditor reputations bump.
+  - real audit, hash mismatch → **DISPUTE** (once corroborated by a trusted or a
+    second auditor): the coordinator re-renders that ONE tile to find ground
+    truth → the party whose hash ≠ truth is banned; a fraudulent submitter's
+    merged contribution is subtracted from the accumulation.
+  - honeypot, wrong answer → the auditor didn't actually re-render → penalized /
+    banned.
+
+Returns: `{ accepted, rejected, credits, reputation, audits_validated, disputes }`.
 
 ### POST /api/vote          (signed)
 Body: `{ pub, nonce, sig, sheepId }`. Spends 1 credit to back a sheep this gen.
