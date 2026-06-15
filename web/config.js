@@ -1,9 +1,11 @@
-// Deployment config. RELAYS empty = local-only mode (BroadcastChannel between
-// same-origin tabs). To join the internet swarm, list relay multiaddrs
-// (wss:// when the site is served over https), e.g.:
-//   '/dns4/relay.example.com/tcp/443/wss/p2p/12D3KooW...'
-// The libp2p bundle (web/js/vendor/libp2p.js, ~620 KB) is only fetched when
-// this list is non-empty.
-export const RELAYS = [
-  '/dns4/relay.proof-of-sheep.com/tcp/443/wss/p2p/12D3KooWMfGMj9QJPdfQopxN18tUbBDpCmxJG6v3EmxMS4EPN4MU',
-];
+// Deployment config (v2 — coordinator architecture).
+//
+// The static client (GitHub Pages) talks to the coordinator over plain HTTPS:
+// it polls GET /api/flock + GET /api/me for live state and POSTs render
+// results / votes / breed proposals. No WebSocket, no SSE, no libp2p.
+//
+// COORDINATOR is the API base URL — everything in API.md hangs off `${COORDINATOR}/api/...`.
+// Default below is the local dev coordinator; point it at the production VPS
+// (behind Cloudflare) for the deployed site, e.g.
+//   export const COORDINATOR = 'https://api.proof-of-sheep.com';
+export const COORDINATOR = 'http://localhost:8080';

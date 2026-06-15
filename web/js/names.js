@@ -2,7 +2,10 @@
 // provenance lines. A handle is display-sugar only: identity IS the key
 // (handles can collide harmlessly; the hex tail disambiguates visually).
 
-import { SURVIVORS_K, GENESIS_GEN } from './net.js';
+// v2: the coordinator owns the flock, so generations are absolute (no
+// genesis-offset replay) — gen 0 is the seed flock. The old net.js constants
+// (SURVIVORS_K / GENESIS_GEN) retired with the P2P plumbing; inline what's left.
+const GENESIS_GEN = 0;
 
 const ADJ = [
   'amber', 'ashen', 'bold', 'briny', 'calm', 'coral', 'dusky', 'eager',
@@ -41,45 +44,29 @@ export function sheepName(record) {
   return `${ADJ[a]}-${ANIMAL[b]}-${id.slice(4, 8)}`;
 }
 
-/** Short + long provenance for a sheep record. */
+/**
+ * Short + long provenance for a sheep record.
+ *
+ * v2: the coordinator owns the flock and hands the client a flat record
+ * ({ id, name, parents:[idA,idB]|null, gen, ... }). The rich v1 origin
+ * taxonomy (baked / mutant / immigrant / authored) lived in client-side
+ * replay state that no longer exists, so provenance now derives purely from
+ * `parents` + `gen`: gen 0 (or no parents) = seed flock; two parents = a bred
+ * pairing.
+ */
 export function provenance(record) {
-  const g = record.gen - GENESIS_GEN;
-  // Two-parent (crossover) records render a pair; mutants carry a single
-  // parent and immigrants carry none, so guard the second slot.
-  const pair = record.parents && record.parents.length >= 2
-    ? `${record.parents[0].slice(0, 8)} × ${record.parents[1].slice(0, 8)}`
+  const g = (record.gen ?? 0) - GENESIS_GEN;
+  const parents = Array.isArray(record.parents) ? record.parents.filter(Boolean) : [];
+  const pair = parents.length >= 2
+    ? `${parents[0].slice(0, 8)} × ${parents[1].slice(0, 8)}`
     : null;
-  if (record.baked) {
+  if (g <= 0 || !parents.length) {
     return { who: record.name || 'seed flock', how: 'seed flock · generation 0' };
   }
-  if (record.derived) {
-    if (record.origin === 'mutant') {
-      return {
-        who: `mutant g${g}`,
-        how: `born by mutation in generation ${g}: a high-rate mutant clone ` +
-          `of top survivor ${record.parents[0].slice(0, 8)}`,
-      };
-    }
-    if (record.origin === 'immigrant') {
-      return {
-        who: `immigrant g${g}`,
-        how: `arrived in generation ${g}: a fresh random genome derived ` +
-          'deterministically from the generation number — no parents, no author',
-      };
-    }
-    return {
-      who: `selection g${g}`,
-      how: `born by natural selection in generation ${g}: survivor pairing ` +
-        `(top-${SURVIVORS_K} by vote, cyclic) of ${pair}`,
-    };
-  }
-  if (record.author) {
-    const h = handle(record.author);
-    return {
-      who: h,
-      how: `bred & released by ${h} [${record.author.slice(0, 12)}…] in generation ${g}` +
-        (pair ? ` from ${pair}` : ''),
-    };
-  }
-  return { who: 'unknown', how: 'unknown origin' };
+  return {
+    who: `generation ${g}`,
+    how: pair
+      ? `bred in generation ${g} from the pairing of ${pair}`
+      : `born in generation ${g}`,
+  };
 }

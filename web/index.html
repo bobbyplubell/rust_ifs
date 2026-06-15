@@ -3,13 +3,46 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>proof-of-sheep</title>
+  <title>Electric Sheep</title>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <header><h1>proof-of-sheep</h1></header>
-  <p>Rebuilding — v2 (coordinator architecture). The deterministic flame renderer
-  lives on; the swarm is being re-grown on a simpler, sturdier trunk.</p>
-  <p style="color:#7d7d92">See <code>ARCHITECTURE.md</code> for the plan.</p>
+  <header>
+    <h1>electric sheep</h1>
+    <p>
+      a shepherdless flock, voting by <em>proof of sheep</em> —
+      <a href="about.html">what is this?</a><br />
+      contribute idle CPU to render the flock and earn credits; spend them to
+      back the sheep you want to survive. pick two parents to breed their child.
+      generations close on the coordinator's clock.
+    </p>
+  </header>
+
+  <div id="nursery" class="picking">
+    <video id="child-video" width="256" height="256" muted loop autoplay playsinline></video>
+    <div>
+      <p id="nursery-note"></p>
+      <button id="release" hidden></button>
+    </div>
+    <p id="nursery-hint">
+      pick two parents to breed. click any two sheep and propose their pairing —
+      the coordinator does the crossover, renders the child, and adds it to the
+      flock. proposing a pairing spends credits you earn by contributing renders.
+    </p>
+  </div>
+
+  <main id="flock">loading the flock…</main>
+
+  <footer>
+    <span id="status">starting…</span>
+    <span class="links">
+      <a href="hall.html">hall of fame</a>
+      <a href="https://flam3.com/">fractal flames by Scott Draves (flam3)</a>
+      <a href="https://electricsheep.org/">electric sheep</a>
+      <a href="determinism.html">determinism check</a>
+    </span>
+  </footer>
+
+  <script type="module" src="js/app.js"></script>
 </body>
 </html>

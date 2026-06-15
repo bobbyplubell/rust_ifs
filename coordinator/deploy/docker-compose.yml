@@ -1,0 +1,46 @@
+# proof-of-sheep v2 coordinator + Caddy reverse proxy (auto-HTTPS).
+#
+# Caddy terminates TLS and proxies /api + /health to the coordinator. The API
+# is plain REST/HTTP (no WebSocket), so no special protocol pinning is needed —
+# Caddy speaks h2/h1 to clients and h1 upstream by default, which is fine.
+#
+# Build context is the REPO ROOT (the Dockerfile copies the whole workspace),
+# so run: `docker compose -f coordinator/deploy/docker-compose.yml up -d`
+# from the repo root.
+
+services:
+  coordinator:
+    build:
+      context: ../..
+      dockerfile: coordinator/Dockerfile
+    restart: always
+    environment:
+      BIND: "0.0.0.0:8080"
+      DATA_DIR: "/data"
+      GENOMES_DIR: "/app/web/genomes"
+      # Generation length (ms). Default 24h; override here.
+      GEN_MS: "${GEN_MS:-86400000}"
+      RUST_LOG: "coordinator=info,tower_http=info"
+    volumes:
+      - coordinator-data:/data
+    # Not published directly — only Caddy reaches it on the internal network.
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2
+    restart: always
+    depends_on:
+      - coordinator
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  coordinator-data:
+  caddy-data:
+  caddy-config:

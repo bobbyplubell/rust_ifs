@@ -1,0 +1,53 @@
+[package]
+name = "coordinator"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "proof-of-sheep v2 coordinator: axum REST service that runs the GA, assigns deterministic render work-units, verifies + merges contributions natively via flame-core, and serves merged loop videos."
+
+[dependencies]
+# Shared deterministic renderer — the SAME code the client runs as WASM.
+flame-core = { workspace = true }
+
+# Web layer.
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+
+# Serialization.
+serde = { version = "1", features = ["derive"] }
+# float_roundtrip mirrors flame-core: lossless float parse so canonical JSON /
+# sheep_id stay byte-identical across the wire.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+# Auth.
+ed25519-dalek = "2"
+hex = "0.4"
+base64 = "0.22"
+
+# Histogram transport: deflate (zlib) decode of the base64 hist payload.
+flate2 = "1"
+# zstd alternative is supported on submit too.
+zstd = "0.13"
+
+# State.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Filesystem free-space probe (the hard backstop against filling the disk).
+fs2 = "0.4"
+
+# Hashing for nonce / misc.
+sha2 = "0.10"
+
+# Logging.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time.
+anyhow = "1"
+
+[dev-dependencies]
+# Smoke-test client.
+reqwest = { version = "0.12", features = ["json", "blocking"] }

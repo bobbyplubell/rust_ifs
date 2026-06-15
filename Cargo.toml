@@ -4,6 +4,7 @@ members = [
   "crates/flame-core",
   "crates/flame-cli",
   "crates/flame-wasm",
+  "coordinator",
 ]
 
 [workspace.package]

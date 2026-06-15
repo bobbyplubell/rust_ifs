@@ -1,0 +1,20 @@
+# Caddy reverse proxy for the coordinator.
+#
+# Set COORDINATOR_DOMAIN to your hostname (Caddy auto-provisions HTTPS via
+# Let's Encrypt). For a quick local/IP test, replace the site address with
+# `:80` and Caddy will serve plain HTTP.
+#
+# The API is plain REST over HTTP/2 or HTTP/1.1 — no WebSocket, so no
+# `protocols h1` pin is needed (that was a v1 wss workaround). CORS is handled
+# by the coordinator itself (the static client is a separate GitHub Pages
+# origin), so Caddy just proxies transparently.
+
+{$COORDINATOR_DOMAIN:localhost} {
+	encode gzip
+
+	# Cache the merged loop videos at the edge (egress is the only real cost).
+	@video path /api/video/*
+	header @video Cache-Control "public, max-age=60"
+
+	reverse_proxy coordinator:8080
+}

@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>sheep</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    body { max-width: none; padding: 0; overflow: hidden; }
+    #stage {
+      position: fixed; inset: 0; display: flex;
+      align-items: center; justify-content: center; background: #000;
+    }
+    #stage video { height: min(100vh, 100vw); width: min(100vh, 100vw); object-fit: contain; }
+    #hud {
+      position: fixed; left: 0; right: 0; bottom: 0;
+      display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap;
+      padding: 10px 14px; font-size: 12px; color: #8d8da4;
+      background: linear-gradient(transparent, rgba(0,0,0,0.7));
+    }
+    #hud .id { color: #62627a; }
+    #hud a { color: #8d8da4; margin-left: auto; }
+    #hud button.on { color: #cfe; }
+    /* lineage line: "<p1> + <p2> : <name>". Living/HoF parents are links in the
+       accent color; perished+not-enshrined parents are dimmed plain text. */
+    #info { color: #b9b9c8; }
+    #info a.parent { color: #c8b06a; text-decoration: none; margin-left: 0; }
+    #info a.parent:hover { text-decoration: underline; }
+    #info .parent-dead { color: #55556a; }
+    #info .sep { color: #6a6a80; }
+    #info .self { color: #e6e6f0; }
+    #info .tag { color: #6a6a80; }
+    /* per-frame tile coverage heat grid: one cell per animation frame, its
+       BRIGHTNESS encodes the accepted tile count (dim = fuzzy, bright = sharp).
+       Fed by frames_coverage from /api/sheep/:id when present. */
+    #tilemap {
+      position: fixed; top: 10px; right: 10px;
+      display: grid; grid-template-columns: repeat(8, 13px); gap: 2px;
+      padding: 7px; background: rgba(0,0,0,0.55); border-radius: 6px;
+    }
+    #tilemap.empty { display: none; }
+    #tilemap .cell { width: 13px; height: 13px; border-radius: 2px; background: #1c1c28; }
+    #tilemap .cap { grid-column: 1 / -1; font-size: 9px; color: #7a7a93; }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <video id="cv" muted loop autoplay playsinline></video>
+  </div>
+  <div id="tilemap" class="empty"><span class="cap">tile density · per frame</span></div>
+  <div id="hud">
+    <span id="info">loading…</span>
+    <span id="sheep-id" class="id"></span>
+    <span id="samples" class="id"></span>
+    <span id="tiles" class="id"></span>
+    <span id="credits" class="id"></span>
+    <button id="contribute">contribute</button>
+    <a id="back" href="index.html">← flock</a>
+  </div>
+
+  <script type="module">
+    // sheep.html — fullscreen single sheep (v2).
+    //
+    // Plays the coordinator's MERGED LOOP VIDEO (/api/video/:id) — no local
+    // render, no boomerang/preview machinery (that retired with the P2P era).
+    // Shows the lineage line, samples/tiles stats, an optional per-frame
+    // coverage heat grid (from /api/sheep/:id frames_coverage), and a contribute
+    // button that drives the same /assign → WASM pool → /submit loop as the flock.
+
+    import { WorkerPool } from './js/pool.js';
+    import { loadIdentity } from './js/identity.js';
+    import { provenance, sheepName } from './js/names.js';
+    import * as api from './js/api.js';
+    import { Contributor } from './js/contribute.js';
+
+    const $ = (s) => document.querySelector(s);
+    const id = new URLSearchParams(location.search).get('id');
+
+    let me, pool, contributor, contributing = false;
+
+    async function main() {
+      if (!id) { $('#info').textContent = 'no ?id= given'; return; }
+      me = await loadIdentity();
+      pool = new WorkerPool();
+
+      $('#sheep-id').textContent = id;
+      // Play the merged loop immediately (cacheable, CDN-friendly).
+      const video = $('#cv');
+      video.src = api.videoUrl(id);
+      video.play?.().catch(() => {});
+
+      // Full detail: flock entry + genome/coverage/stats + alive/hof flags.
+      let detail;
+      try {
+        detail = await api.getSheep(id);
+      } catch (e) {
+        $('#info').textContent = `sheep not found: ${e.message}`;
+        return;
+      }
+
+      document.title = sheepName(detail);
+      if (detail.video) { video.src = detail.video; video.play?.().catch(() => {}); }
+
+      await renderLineage(detail);
+      renderStats(detail);
+      renderCoverage(detail);
+
+      wireContribute();
+      refreshCredits();
+      setInterval(refreshCredits, 5000);
+    }
+
+    // ---- lineage line: "<p1> + <p2> : <name>" --------------------------------
+    //
+    // v2: the coordinator tells us each parent's id and whether it's still
+    // viewable. We fetch the living flock + Hall of Fame and a parent links iff
+    // it's alive or enshrined; a perished, non-enshrined parent is greyed out.
+    async function renderLineage(rec) {
+      const info = $('#info');
+      info.textContent = '';
+      info.title = provenance(rec).how;
+
+      const text = (s, cls) => {
+        const el = document.createElement('span');
+        el.textContent = s;
+        if (cls) el.className = cls;
+        return el;
+      };
+      const append = (n) => info.appendChild(n);
+
+      const parents = Array.isArray(rec.parents) ? rec.parents.filter(Boolean) : [];
+
+      // Which parents are still viewable (alive in the flock OR in the Hall).
+      let viewable = new Set();
+      if (parents.length) {
+        try {
+          const [flock, hall] = await Promise.all([api.getFlock(), api.getHall()]);
+          for (const s of flock.sheep || []) viewable.add(s.id);
+          for (const s of hall.sheep || hall || []) if (s && s.id) viewable.add(s.id);
+        } catch (e) {
+          console.error('lineage flock/hall fetch failed:', e); // fail safe: grey parents
+        }
+      }
+
+      const parentNode = (pid) => {
+        const name = sheepName(pid);
+        if (viewable.has(pid)) {
+          const a = document.createElement('a');
+          a.className = 'parent'; a.textContent = name;
+          a.href = `sheep.html?id=${encodeURIComponent(pid)}`; a.title = pid;
+          return a;
+        }
+        const span = text(name, 'parent-dead');
+        span.title = `${pid} — perished, not in the Hall of Fame (can't be opened)`;
+        return span;
+      };
+
+      if (parents.length >= 2) {
+        append(parentNode(parents[0]));
+        append(text(' + ', 'sep'));
+        append(parentNode(parents[1]));
+        append(text(' : ', 'sep'));
+      } else if (parents.length === 1) {
+        append(parentNode(parents[0]));
+        append(text(' ↻ : ', 'sep'));
+      } else {
+        append(text('genesis ', 'tag'));
+      }
+      append(text(sheepName(rec), 'self'));
+    }
+
+    // ---- stats: samples + tiles ----------------------------------------------
+    function renderStats(rec) {
+      if (typeof rec.samples === 'number') {
+        $('#samples').textContent = `${rec.samples.toLocaleString()} samples`;
+      }
+      if (typeof rec.tiles === 'number') {
+        $('#tiles').textContent = `${rec.tiles.toLocaleString()} tiles`;
+      }
+    }
+
+    // ---- per-frame coverage heat grid ----------------------------------------
+    // frames_coverage:[n0,n1,...] — accepted tiles per animation frame. Cell
+    // brightness encodes coverage relative to the busiest frame.
+    function renderCoverage(rec) {
+      const grid = $('#tilemap');
+      const cov = rec.frames_coverage;
+      if (!Array.isArray(cov) || !cov.length) { grid.classList.add('empty'); return; }
+      grid.classList.remove('empty');
+      const max = Math.max(1, ...cov);
+      cov.forEach((n, i) => {
+        const cell = document.createElement('div');
+        cell.className = 'cell';
+        const lum = 0.08 + 0.92 * (n / max); // 0.08..1.0
+        cell.style.background = `rgba(200,176,106,${lum.toFixed(3)})`;
+        cell.title = `frame ${i}: ${n} tiles`;
+        grid.appendChild(cell);
+      });
+    }
+
+    // ---- contribute (same loop as the flock) ---------------------------------
+    function wireContribute() {
+      $('#contribute').addEventListener('click', () => {
+        contributing = !contributing;
+        const btn = $('#contribute');
+        btn.classList.toggle('on', contributing);
+        btn.textContent = contributing ? 'contributing…' : 'contribute';
+        if (contributing) {
+          contributor = contributor || new Contributor(pool, me, api, {
+            sheepId: id, // pin contribution to THIS sheep
+            onResult: (r) => { if (typeof r.credits === 'number') showCredits(r.credits); },
+            onError: (e) => console.warn('contribute:', e.message),
+          });
+          contributor.start();
+        } else {
+          contributor?.stop();
+        }
+      });
+    }
+
+    async function refreshCredits() {
+      try { const m = await api.getMe(me.pubHex); showCredits(m.credits ?? 0); } catch { /* fresh key */ }
+    }
+    function showCredits(n) {
+      $('#credits').textContent = `${n} credit${n === 1 ? '' : 's'}`;
+    }
+
+    main().catch((err) => { console.error(err); $('#info').textContent = 'error: ' + (err?.message || err); });
+  </script>
+</body>
+</html>

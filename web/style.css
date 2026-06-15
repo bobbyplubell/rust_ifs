@@ -18,12 +18,19 @@ em { color: #c8b06a; font-style: normal; }
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
 }
 
-.card canvas {
+/* v2: cards show the coordinator's merged loop as a <video> instead of a
+   locally-rendered <canvas>. Same box/border/cursor treatment for both. */
+.card canvas,
+.card video {
   display: block; width: 100%; aspect-ratio: 1;
   background: #000; border: 1px solid #232330; cursor: pointer;
+  object-fit: cover;
 }
 .card canvas.rendering { opacity: 0.85; }
-.card.selected canvas { border-color: #c8b06a; }
+.card.selected canvas,
+.card.selected video { border-color: #c8b06a; }
+/* placeholder while a sheep has no rendered video yet */
+.card video.pending { opacity: 0.5; }
 
 .bar { height: 3px; background: #16161f; }
 .bar-fill {
@@ -61,13 +68,15 @@ button.on { border-color: #c8b06a; color: #c8b06a; }
   display: flex; gap: 16px; align-items: flex-start;
   padding: 12px; border: 1px solid #2a2a3c; margin-top: 8px;
 }
-#nursery canvas { width: 256px; height: 256px; background: #000; }
+#nursery canvas,
+#nursery video { width: 256px; height: 256px; background: #000; object-fit: cover; }
 #nursery p { margin: 0 0 8px; color: #8d8da4; }
 #nursery-hint { color: #7d7d92; max-width: 52ch; }
 /* Before two parents are picked: show the explanatory hint, hide the (empty)
    child preview + release controls. Once two are selected the picking class is
    dropped and the preview/note/release take over. */
 #nursery.picking canvas,
+#nursery.picking video,
 #nursery.picking #nursery-note,
 #nursery.picking #release { display: none; }
 #nursery:not(.picking) #nursery-hint { display: none; }
