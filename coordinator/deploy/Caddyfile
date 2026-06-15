@@ -1,15 +1,17 @@
-# Caddy reverse proxy for the coordinator.
+# Caddy reverse proxy for one coordinator "world".
 #
-# Set COORDINATOR_DOMAIN to your hostname (Caddy auto-provisions HTTPS via
-# Let's Encrypt). For a quick local/IP test, replace the site address with
-# `:80` and Caddy will serve plain HTTP.
+# WORLD_DOMAIN is the world's hostname (e.g. sandbox.proof-of-sheep.com or
+# gallery.proof-of-sheep.com). Caddy auto-provisions HTTPS for it via Let's
+# Encrypt. The SAME Caddyfile + compose runs either world — only the env differs.
+# For a quick local/IP test, leave WORLD_DOMAIN unset and Caddy serves on
+# `localhost`.
 #
 # The API is plain REST over HTTP/2 or HTTP/1.1 — no WebSocket, so no
 # `protocols h1` pin is needed (that was a v1 wss workaround). CORS is handled
-# by the coordinator itself (the static client is a separate GitHub Pages
+# by the coordinator itself (the static GitHub Pages client is a separate
 # origin), so Caddy just proxies transparently.
 
-{$COORDINATOR_DOMAIN:localhost} {
+{$WORLD_DOMAIN:localhost} {
 	encode gzip
 
 	# Cache the merged loop videos at the edge (egress is the only real cost).

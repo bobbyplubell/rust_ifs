@@ -10,6 +10,7 @@ mod db;
 mod disk;
 mod error;
 mod ga;
+mod ga_config;
 mod histio;
 mod render;
 mod routes;
@@ -61,11 +62,15 @@ async fn main() -> anyhow::Result<()> {
         // Keep gen_ms in sync with env on restart.
         conn.execute("UPDATE meta SET gen_ms = ?1 WHERE id = 0", [gen_ms as i64])?;
     }
-    ga::seed_flock(&db, &genomes_dir)
+    // The GA "personality" for this world (mutation/immigrants/selection),
+    // logged at boot so the active config is visible per world.
+    let ga_config = ga_config::GaConfig::from_env();
+
+    ga::seed_flock(&db, &genomes_dir, &ga_config)
         .map_err(|e| anyhow::anyhow!("seed flock failed: {}", e.msg))?;
 
     let disk = disk::DiskConfig::from_env();
-    let state = Arc::new(AppState { db, data_dir, disk });
+    let state = Arc::new(AppState { db, data_dir, disk, ga: ga_config });
 
     // Background GA tick: when the generation clock expires, run a tick.
     spawn_ga_loop(state.clone());
@@ -120,7 +125,7 @@ fn spawn_ga_loop(state: Arc<AppState>) {
                 }
             };
             if expired {
-                match ga::tick(&state.db) {
+                match ga::tick(&state.db, &state.ga) {
                     Ok(g) => tracing::info!("GA tick: advanced to generation {g}"),
                     Err(e) => tracing::error!("GA tick failed: {}", e.msg),
                 }

@@ -18,6 +18,7 @@ import { loadIdentity } from './identity.js';
 import { sheepName, provenance } from './names.js';
 import * as api from './api.js';
 import { Contributor } from './contribute.js';
+import { mountWorldPicker } from './world-picker.js';
 
 const $ = (s) => document.querySelector(s);
 
@@ -42,6 +43,7 @@ const selected = [];          // up to 2 sheepIds picked for breeding
 // ---- boot -------------------------------------------------------------------
 
 async function main() {
+  mountWorldPicker('#world-picker'); // header world <select> (config.js / WORLDS)
   me = await loadIdentity();
   pool = new WorkerPool();
   pool.onStatus = (status, detail) => {

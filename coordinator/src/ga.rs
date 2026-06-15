@@ -14,6 +14,7 @@ use flame_core::rng::Rng;
 
 use crate::db::Db;
 use crate::error::{ApiError, ApiResult};
+use crate::ga_config::GaConfig;
 use crate::spec;
 
 pub fn now_ms() -> u64 {
@@ -23,12 +24,21 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-/// Target flock size after a generation tick.
-const FLOCK_SIZE: usize = 8;
-/// How many top-voted sheep survive a generation outright.
-const SURVIVORS: usize = 3;
-/// How many fresh random immigrants to inject each generation.
-const IMMIGRANTS: usize = 2;
+/// Breed two parents into a child, honoring the world's GA personality
+/// (mutation rate + magnitude). This reconstructs `flame_core::breed::breed`
+/// (crossover → mutate → auto_frame) but with the mutation knobs sourced from
+/// `cfg` instead of the library's hardcoded `BREED_MUTATION_RATE`. With the
+/// default config (rate=0.15, magnitude=1) it is identical to `breed()`.
+fn breed_with(ga: &Genome, gb: &Genome, seed: u64, cfg: &GaConfig) -> Genome {
+    let mut rng = Rng::new(seed);
+    let mut child = flame_core::breed::crossover(ga, gb, &mut rng);
+    for _ in 0..cfg.mutation_magnitude.max(1) {
+        flame_core::breed::mutate(&mut child, &mut rng, cfg.mutation_rate);
+    }
+    // Re-frame on the child's own attractor so bred sheep arrive centered.
+    child.auto_frame();
+    child
+}
 
 /// Insert a sheep row from a genome. Returns its sheep_id. Idempotent on id.
 pub fn insert_sheep(
@@ -59,7 +69,7 @@ pub fn insert_sheep(
 
 /// Seed the flock from `web/genomes/` if the sheep table is empty. Falls back to
 /// generating random genomes if the directory isn't found.
-pub fn seed_flock(db: &Db, genomes_dir: &str) -> ApiResult<()> {
+pub fn seed_flock(db: &Db, genomes_dir: &str, cfg: &GaConfig) -> ApiResult<()> {
     {
         let conn = db.conn.lock().unwrap();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM sheep", [], |r| r.get(0))?;
@@ -91,7 +101,7 @@ pub fn seed_flock(db: &Db, genomes_dir: &str) -> ApiResult<()> {
     }
 
     // Top up with random immigrants if the genome dir was thin/missing.
-    while seeded < FLOCK_SIZE {
+    while seeded < cfg.flock_size as usize {
         let mut rng = Rng::new(now_ms().wrapping_add(seeded as u64 * 7919));
         let genome = Genome::random(&mut rng, 3);
         let name = format!("Sheep #{}", seeded + 1);
@@ -104,7 +114,13 @@ pub fn seed_flock(db: &Db, genomes_dir: &str) -> ApiResult<()> {
 /// Breed two parents (by sheep_id) into a child genome, render-able afterward.
 /// The breeding seed is derived from both ids so the same pairing is
 /// deterministic. Returns the child's sheep_id (already inserted, alive).
-pub fn breed_pair(db: &Db, parent_a: &str, parent_b: &str, gen: i64) -> ApiResult<String> {
+pub fn breed_pair(
+    db: &Db,
+    parent_a: &str,
+    parent_b: &str,
+    gen: i64,
+    cfg: &GaConfig,
+) -> ApiResult<String> {
     let (ga, gb) = {
         let conn = db.conn.lock().unwrap();
         let load = |id: &str| -> ApiResult<Genome> {
@@ -123,7 +139,7 @@ pub fn breed_pair(db: &Db, parent_a: &str, parent_b: &str, gen: i64) -> ApiResul
     }
     let seed = u64::from_le_bytes(seed_bytes) ^ now_ms();
 
-    let child = flame_core::breed::breed(&ga, &gb, seed);
+    let child = breed_with(&ga, &gb, seed, cfg);
     child
         .validate()
         .map_err(|e| ApiError::bad(format!("bred child invalid: {e}")))?;
@@ -141,7 +157,7 @@ fn child_name(db: &Db, gen: i64) -> ApiResult<String> {
 
 /// Run one generation tick: tally votes, select survivors, breed, inject
 /// immigrants, cull the losers, advance the gen counter. Returns the new gen.
-pub fn tick(db: &Db) -> ApiResult<i64> {
+pub fn tick(db: &Db, cfg: &GaConfig) -> ApiResult<i64> {
     let gen: i64 = {
         let conn = db.conn.lock().unwrap();
         conn.query_row("SELECT gen FROM meta WHERE id = 0", [], |r| r.get(0))?
@@ -161,7 +177,8 @@ pub fn tick(db: &Db) -> ApiResult<i64> {
         rows.filter_map(Result::ok).collect()
     };
 
-    let survivors: Vec<String> = ranked.iter().take(SURVIVORS).map(|(id, _)| id.clone()).collect();
+    let survivors: Vec<String> =
+        ranked.iter().take(cfg.survivors as usize).map(|(id, _)| id.clone()).collect();
 
     // Enshrine the gen winner into the Hall of Fame (if it earned any votes).
     if let Some((winner, backings)) = ranked.first() {
@@ -192,18 +209,18 @@ pub fn tick(db: &Db) -> ApiResult<i64> {
     // Breed survivors pairwise into children for the next gen.
     if survivors.len() >= 2 {
         for pair in survivors.windows(2) {
-            let _ = breed_pair(db, &pair[0], &pair[1], next_gen);
+            let _ = breed_pair(db, &pair[0], &pair[1], next_gen, cfg);
         }
         // Also breed first + last to add variety.
         if survivors.len() >= 3 {
-            let _ = breed_pair(db, &survivors[0], &survivors[survivors.len() - 1], next_gen);
+            let _ = breed_pair(db, &survivors[0], &survivors[survivors.len() - 1], next_gen, cfg);
         }
     }
 
     // Inject fresh-blood immigrants.
-    for i in 0..IMMIGRANTS {
+    for i in 0..cfg.immigrants {
         let mut rng = Rng::new(now_ms().wrapping_add(i as u64 * 104729));
-        let genome = Genome::random(&mut rng, 3 + (i % 3));
+        let genome = Genome::random(&mut rng, 3 + (i as usize % 3));
         let name = format!("Immigrant g{next_gen}.{i}");
         let _ = insert_sheep(db, &genome, &name, None, next_gen);
     }

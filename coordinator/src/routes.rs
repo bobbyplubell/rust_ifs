@@ -767,7 +767,7 @@ pub async fn post_breed(
 
     // Server does the crossover, inserts the child (alive). Rendering happens
     // organically as contributors get assigned its tiles.
-    let child_id = ga::breed_pair(&state.db, &parent_a, &parent_b, gen)?;
+    let child_id = ga::breed_pair(&state.db, &parent_a, &parent_b, gen, &state.ga)?;
 
     Ok(Json(json!({ "childId": child_id })))
 }
