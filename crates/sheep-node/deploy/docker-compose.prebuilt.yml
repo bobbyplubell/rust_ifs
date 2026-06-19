@@ -1,0 +1,68 @@
+# Same as docker-compose.yml but runs a PRE-BUILT image instead of building from
+# source — for the droplets (x86_64, can't compile Rust comfortably). The image
+# is built by GitHub Actions (.github/workflows/sheep-node-image.yml) on native
+# amd64 runners and published to GHCR; the droplet just pulls it:
+#   docker pull ghcr.io/<owner>/sheep-node:latest
+#   WORLD_DOMAIN=… docker compose -f docker-compose.prebuilt.yml --env-file <world>.env up -d
+# (Set IMAGE in the env / .env to pin a specific :<sha> tag if you like.)
+services:
+  sheep-node:
+    image: "${IMAGE:-ghcr.io/bobbyplubell/sheep-node:latest}"
+    restart: always
+    environment:
+      DATA_DIR: "/data"
+      GENOMES_DIR: "/app/web/genomes"
+      RUST_LOG: "${RUST_LOG:-sheep_node=info}"
+      SHEEP_LISTEN: "${SHEEP_LISTEN:-/ip4/0.0.0.0/tcp/4001}"
+      SHEEP_HTTP_ADDR: "${SHEEP_HTTP_ADDR:-0.0.0.0:8080}"
+      SHEEP_BOOTSTRAP: "${SHEEP_BOOTSTRAP:-}"
+      # World personality (§2.2 decay + §3 economy). TODO: not yet read from env
+      # by the binary — see DEPLOY.md. Mirrors docker-compose.yml.
+      SHEEP_DECAY_TIME_UNIT_MS: "${SHEEP_DECAY_TIME_UNIT_MS:-}"
+      SHEEP_DECAY_BASE: "${SHEEP_DECAY_BASE:-}"
+      SHEEP_DECAY_LINEAR: "${SHEEP_DECAY_LINEAR:-}"
+      SHEEP_DECAY_QUAD: "${SHEEP_DECAY_QUAD:-}"
+      SHEEP_DECAY_EXP_SCALE: "${SHEEP_DECAY_EXP_SCALE:-}"
+      SHEEP_DECAY_HALF_LIFE: "${SHEEP_DECAY_HALF_LIFE:-}"
+      SHEEP_HALL_MIN_LIFESPAN_MS: "${SHEEP_HALL_MIN_LIFESPAN_MS:-}"
+      SHEEP_HALL_MIN_PEAK_BACKING: "${SHEEP_HALL_MIN_PEAK_BACKING:-}"
+      SHEEP_VOTE_COST: "${SHEEP_VOTE_COST:-}"
+      SHEEP_MINT_COST: "${SHEEP_MINT_COST:-}"
+      SHEEP_BREED_COST: "${SHEEP_BREED_COST:-}"
+    volumes:
+      - sheep-data:/data
+    ports:
+      - "4001:4001"
+    expose:
+      - "8080"
+    command:
+      - "sh"
+      - "-c"
+      - |
+        set -e
+        # --http-addr makes this a SERVER/accumulator (serves flock+video to
+        # browsers via Caddy); --key-file persists a STABLE peer id across
+        # restarts (durable bootstrap multiaddr); --data-dir is the regenerable
+        # video cache on the volume. Decay/cost/flock knobs are read from env
+        # (--env-file <world>.env) by the binary directly.
+        ARGS="--listen $$SHEEP_LISTEN --http-addr $$SHEEP_HTTP_ADDR --key-file /data/id.key --data-dir /data"
+        for b in $$SHEEP_BOOTSTRAP; do ARGS="$$ARGS --bootstrap $$b"; done
+        exec sheep-node $$ARGS
+  caddy:
+    image: caddy:2
+    restart: always
+    depends_on:
+      - sheep-node
+    environment:
+      WORLD_DOMAIN: "${WORLD_DOMAIN:-localhost}"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+volumes:
+  sheep-data:
+  caddy-data:
+  caddy-config:

@@ -1,12 +1,13 @@
-// Deployment config (v2 — coordinator architecture).
+// Deployment config (v3 — node HTTP API).
 //
-// The static client (GitHub Pages) talks to a coordinator over plain HTTPS: it
-// polls GET /api/flock + GET /api/me for live state and POSTs render results /
-// votes / breed proposals. No WebSocket, no SSE, no libp2p.
+// The static client (GitHub Pages) talks to a sheep-node over plain HTTPS: it
+// polls GET /api/flock for live state, GET /api/assign for work, and POSTs
+// signed Envelopes to /api/msg (renders / votes / births). No WebSocket, no
+// SSE, no libp2p in the browser (the node bridges writes into the swarm).
 //
 // WORLD SELECTION ------------------------------------------------------------
-// A "world" is one coordinator (one flock). The client can point at any of a
-// few known worlds or a custom URL. The active world is resolved, in order:
+// A "world" is one node (one flock). The client can point at any of a few
+// known worlds or a custom URL. The active world is resolved, in order:
 //   1. `?world=<url>` query param — a shareable deep-link to a specific world,
 //   2. localStorage (`sheep-world`) — the user's last pick, persisted,
 //   3. the first WORLDS entry — the default.

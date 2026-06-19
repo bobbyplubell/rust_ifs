@@ -1,0 +1,39 @@
+name: sheep-node-image
+
+# Build the v3 `sheep-node` Docker image on GitHub's amd64 runners (native — no
+# QEMU, no cross-compile) and publish it to GHCR. The droplets (x86_64, can't
+# compile Rust comfortably) just `docker pull` it. Triggered on changes to the
+# node/renderer/proto/genomes, or manually.
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'crates/**'
+      - 'web/genomes/**'
+      - '.github/workflows/sheep-node-image.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          # Build context is the repo root (the Dockerfile copies the whole
+          # workspace: sheep-node path-depends on sheep-proto + flame-core).
+          context: .
+          file: crates/sheep-node/deploy/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/sheep-node:latest
+            ghcr.io/${{ github.repository_owner }}/sheep-node:${{ github.sha }}

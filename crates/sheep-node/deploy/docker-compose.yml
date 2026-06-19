@@ -1,0 +1,104 @@
+# proof-of-sheep v3 `sheep-node` seed (server mode) + Caddy reverse proxy
+# (auto-HTTPS). ARCHITECTURE v3 §1 (seed tier) + §12-step-9 (deploy).
+#
+# ONE compose file, EITHER world. The world's personality (decay escalation +
+# economy knobs) and its domain come from the env — pick a world by passing its
+# env file:
+#
+#   WORLD_DOMAIN=sandbox.proof-of-sheep.com \
+#     docker compose --env-file sandbox.env up -d --build
+#   WORLD_DOMAIN=gallery.proof-of-sheep.com \
+#     docker compose --env-file gallery.env up -d --build
+#
+# (Option A: one world per droplet. See DEPLOY.md.)
+#
+# A "seed" is the sheep-node binary in server mode: it LISTENS on a public
+# libp2p port (so native peers + the other world's seed can dial it as a
+# bootstrap/relay) AND runs the HTTP read/write face (so browsers can watch +
+# contribute). Caddy terminates TLS for $WORLD_DOMAIN and proxies the HTTP face;
+# the libp2p port is published directly (TLS-in-noise, not via Caddy).
+#
+# Build context is the REPO ROOT (the Dockerfile copies the whole workspace);
+# `dockerfile:` is relative to that context. Run compose from this `deploy/` dir.
+
+services:
+  sheep-node:
+    build:
+      context: ../../..
+      dockerfile: crates/sheep-node/deploy/Dockerfile
+    restart: always
+    environment:
+      DATA_DIR: "/data"
+      GENOMES_DIR: "/app/web/genomes"
+      RUST_LOG: "${RUST_LOG:-sheep_node=info}"
+      # libp2p listen multiaddr (the public swarm port peers dial).
+      SHEEP_LISTEN: "${SHEEP_LISTEN:-/ip4/0.0.0.0/tcp/4001}"
+      # HTTP read/write face bind (Caddy proxies $WORLD_DOMAIN -> here).
+      SHEEP_HTTP_ADDR: "${SHEEP_HTTP_ADDR:-0.0.0.0:8080}"
+      # Bootstrap peers (the OTHER world's seed multiaddr, space-separated). See
+      # DEPLOY.md "Bootstrap list" — these are filled in after first boot, once
+      # each seed's persisted-key peer id is known.
+      SHEEP_BOOTSTRAP: "${SHEEP_BOOTSTRAP:-}"
+      # --- World personality (ARCHITECTURE v3 §2.2 decay + §3 economy) -------
+      # Age-escalating backing-decay knobs (engine.rs DecayParams). Sandbox =
+      # steep (small half-life, big quad); Gallery = gentle. Unset = code
+      # defaults (DecayParams::DEFAULT).
+      # TODO (pending binary flags): the engine has set_decay_params() but does
+      # NOT yet read these from env — see DEPLOY.md. Setting them today is a
+      # no-op until the binary wires them up.
+      SHEEP_DECAY_TIME_UNIT_MS: "${SHEEP_DECAY_TIME_UNIT_MS:-}"
+      SHEEP_DECAY_BASE: "${SHEEP_DECAY_BASE:-}"
+      SHEEP_DECAY_LINEAR: "${SHEEP_DECAY_LINEAR:-}"
+      SHEEP_DECAY_QUAD: "${SHEEP_DECAY_QUAD:-}"
+      SHEEP_DECAY_EXP_SCALE: "${SHEEP_DECAY_EXP_SCALE:-}"
+      SHEEP_DECAY_HALF_LIFE: "${SHEEP_DECAY_HALF_LIFE:-}"
+      # Hall-of-Fame enshrinement thresholds (engine.rs HallThreshold).
+      SHEEP_HALL_MIN_LIFESPAN_MS: "${SHEEP_HALL_MIN_LIFESPAN_MS:-}"
+      SHEEP_HALL_MIN_PEAK_BACKING: "${SHEEP_HALL_MIN_PEAK_BACKING:-}"
+      # Economy / credit-sink knobs (spec.rs VOTE_COST/MINT_COST/BREED_COST).
+      SHEEP_VOTE_COST: "${SHEEP_VOTE_COST:-}"
+      SHEEP_MINT_COST: "${SHEEP_MINT_COST:-}"
+      SHEEP_BREED_COST: "${SHEEP_BREED_COST:-}"
+    volumes:
+      - sheep-data:/data
+    # The libp2p swarm port IS published (peers must dial it directly). The HTTP
+    # face (8080) is NOT published — only Caddy reaches it on the internal net.
+    ports:
+      - "4001:4001"
+    expose:
+      - "8080"
+    # The CMD listens on $SHEEP_LISTEN; append bootstrap dials. Today the binary
+    # takes --bootstrap (repeatable); SHEEP_BOOTSTRAP is space-separated and
+    # expanded into repeated flags. (--http-addr / --key <path> are TODO; see
+    # DEPLOY.md — when they land, fold them into this command.)
+    command:
+      - "sh"
+      - "-c"
+      - |
+        set -e
+        # --http-addr = server/accumulator (serves browsers via Caddy); --key-file
+        # = stable peer id across restarts; --data-dir = video cache on the volume.
+        ARGS="--listen $$SHEEP_LISTEN --http-addr $$SHEEP_HTTP_ADDR --key-file /data/id.key --data-dir /data"
+        for b in $$SHEEP_BOOTSTRAP; do ARGS="$$ARGS --bootstrap $$b"; done
+        exec sheep-node $$ARGS
+
+  caddy:
+    image: caddy:2
+    restart: always
+    depends_on:
+      - sheep-node
+    environment:
+      # The world's public hostname; Caddy auto-provisions HTTPS for it.
+      WORLD_DOMAIN: "${WORLD_DOMAIN:-localhost}"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  sheep-data:
+  caddy-data:
+  caddy-config:

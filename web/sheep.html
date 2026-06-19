@@ -59,13 +59,12 @@
   </div>
 
   <script type="module">
-    // sheep.html — fullscreen single sheep (v2).
+    // sheep.html — fullscreen single sheep (v3 node API).
     //
-    // Plays the coordinator's MERGED LOOP VIDEO (/api/video/:id) — no local
-    // render, no boomerang/preview machinery (that retired with the P2P era).
-    // Shows the lineage line, samples/tiles stats, an optional per-frame
-    // coverage heat grid (from /api/sheep/:id frames_coverage), and a contribute
-    // button that drives the same /assign → WASM pool → /submit loop as the flock.
+    // Plays the node's MERGED LOOP VIDEO (/api/video/:id). Shows the lineage
+    // line, coverage/vitality stats, an optional per-frame coverage heat grid
+    // (from /api/sheep/:id frames_coverage), and a contribute button that drives
+    // the /assign → WASM pool → POST /api/msg loop pinned to THIS sheep.
 
     import { WorkerPool } from './js/pool.js';
     import { loadIdentity } from './js/identity.js';
@@ -77,6 +76,8 @@
     const id = new URLSearchParams(location.search).get('id');
 
     let me, pool, contributor, contributing = false;
+    let myCredits = 0;
+    const genomeCache = new Map(); // sheepId -> { genomeJson, edge }
 
     async function main() {
       if (!id) { $('#info').textContent = 'no ?id= given'; return; }
@@ -84,12 +85,11 @@
       pool = new WorkerPool();
 
       $('#sheep-id').textContent = id;
-      // Play the merged loop immediately (cacheable, CDN-friendly).
       const video = $('#cv');
       video.src = api.videoUrl(id);
       video.play?.().catch(() => {});
 
-      // Full detail: flock entry + genome/coverage/stats + alive/hof flags.
+      // Full detail: flock entry + genome + frames_coverage + alive/hall flags.
       let detail;
       try {
         detail = await api.getSheep(id);
@@ -99,15 +99,16 @@
       }
 
       document.title = sheepName(detail);
-      if (detail.video) { video.src = detail.video; video.play?.().catch(() => {}); }
+      if (detail.video) { video.src = api.absoluteUrl(detail.video); video.play?.().catch(() => {}); }
+      if (detail.genome) {
+        genomeCache.set(id, { genomeJson: JSON.stringify(detail.genome), edge: detail.resolution || 384 });
+      }
 
       await renderLineage(detail);
       renderStats(detail);
       renderCoverage(detail);
 
       wireContribute();
-      refreshCredits();
-      setInterval(refreshCredits, 5000);
     }
 
     // ---- lineage line: "<p1> + <p2> : <name>" --------------------------------
@@ -169,13 +170,17 @@
       append(text(sheepName(rec), 'self'));
     }
 
-    // ---- stats: samples + tiles ----------------------------------------------
+    // ---- stats: coverage + vitality ------------------------------------------
     function renderStats(rec) {
-      if (typeof rec.samples === 'number') {
-        $('#samples').textContent = `${rec.samples.toLocaleString()} samples`;
+      if (typeof rec.accumulated_tiles === 'number') {
+        $('#samples').textContent = `${rec.accumulated_tiles.toLocaleString()} accumulated tiles`;
+      } else if (typeof rec.coverage === 'number') {
+        $('#samples').textContent = `${rec.coverage.toLocaleString()} tiles covered`;
       }
-      if (typeof rec.tiles === 'number') {
-        $('#tiles').textContent = `${rec.tiles.toLocaleString()} tiles`;
+      if (typeof rec.vitality === 'number') {
+        $('#tiles').textContent = `vitality ${rec.vitality.toFixed(2)}`;
+      } else if (rec.hall) {
+        $('#tiles').textContent = 'enshrined · perished';
       }
     }
 
@@ -207,8 +212,13 @@
         btn.textContent = contributing ? 'contributing…' : 'contribute';
         if (contributing) {
           contributor = contributor || new Contributor(pool, me, api, {
-            sheepId: id, // pin contribution to THIS sheep
-            onResult: (r) => { if (typeof r.credits === 'number') showCredits(r.credits); },
+            genomeFor: (sid) => genomeCache.get(sid) || null,
+            onResult: (reply) => {
+              const items = reply?.results || [reply];
+              for (const it of items) {
+                if (it && typeof it.credits === 'number') showCredits(it.credits);
+              }
+            },
             onError: (e) => console.warn('contribute:', e.message),
           });
           contributor.start();
@@ -218,10 +228,8 @@
       });
     }
 
-    async function refreshCredits() {
-      try { const m = await api.getMe(me.pubHex); showCredits(m.credits ?? 0); } catch { /* fresh key */ }
-    }
     function showCredits(n) {
+      myCredits = n;
       $('#credits').textContent = `${n} credit${n === 1 ? '' : 's'}`;
     }
 

@@ -111,7 +111,6 @@
 
     import { loadIdentity, exportKey, importKey } from './js/identity.js';
     import { handle } from './js/names.js';
-    import { getMe } from './js/api.js';
     import { mountWorldPicker } from './js/world-picker.js';
 
     const $ = (s) => document.querySelector(s);
@@ -128,24 +127,14 @@
       flash('#copy-pub', 'copied');
     });
 
-    // ---- standing (credits / reputation / tiles) from GET /api/me ----
-    try {
-      const m = await getMe(me.pubHex);
-      const tiles = m.tiles ?? 0;
-      const credits = m.credits ?? 0;
-      const rep = m.reputation ?? 0;
-      $('#standing').innerHTML =
-        `<span class="stat"><b>${credits}</b> credits</span> · ` +
-        `<span class="stat"><b>${rep}</b> reputation</span> · ` +
-        `<span class="stat"><b>${tiles}</b> tiles</span>`;
-    } catch (err) {
-      // A fresh key has no row on the coordinator yet → treat as all-zero.
-      $('#standing').innerHTML =
-        `<span class="stat"><b>0</b> credits</span> · ` +
-        `<span class="stat"><b>0</b> reputation</span> · ` +
-        `<span class="stat"><b>0</b> tiles</span> ` +
-        `<span class="muted">(no activity on this world yet)</span>`;
-    }
+    // ---- standing (v3) ----
+    // The v3 node has no per-key standing read endpoint: credits/coverage are
+    // log-derived and reported back on each write (POST /api/msg returns the
+    // submitter's resulting `credits`). So standing surfaces in the flock page
+    // as you contribute; here we just confirm the key + world.
+    $('#standing').innerHTML =
+      `<span class="muted">credits are earned by contributing renders on the ` +
+      `flock page; the node reports your balance on each accepted submission.</span>`;
 
     // ---- export: download a key file + copy to clipboard ----
     $('#download').addEventListener('click', async () => {

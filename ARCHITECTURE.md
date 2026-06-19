@@ -151,8 +151,8 @@ are **rate-limited / reputation-weighted** so evolution can't be brigaded.
 - **Process:** Docker `restart: always` behind **Caddy** (already on the VPS;
   auto-HTTPS). Coordinator API is plain HTTP/SSE — no WebSocket, so the v1 h2/wss
   handshake bug can't recur.
-- **Resilience across the two droplets** (relay1 `178.128.157.72`, relay2
-  `174.138.34.46` — repurposed, not destroyed): **primary + warm standby.** Because
+- **Resilience across the two droplets** (relay1 / relay2 — repurposed, not
+  destroyed): **primary + warm standby.** Because
   the canonical state is small SQLite, replicate it continuously with
   **litestream** (→ standby or object storage); rsync the histogram/video caches (or
   let the standby regenerate them from the replicated log). Failover via a

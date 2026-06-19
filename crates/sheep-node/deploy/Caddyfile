@@ -1,0 +1,36 @@
+# Caddy reverse proxy for one proof-of-sheep v3 "world" (a seed node).
+#
+# WORLD_DOMAIN is the world's hostname (e.g. sandbox.proof-of-sheep.com or
+# gallery.proof-of-sheep.com). Caddy auto-provisions HTTPS for it via Let's
+# Encrypt. The SAME Caddyfile + compose runs either world — only the env differs.
+# For a quick local/IP test, leave WORLD_DOMAIN unset and Caddy serves on
+# `localhost`.
+#
+# The browser face (ARCHITECTURE v3 §10) is two halves over plain HTTP, both
+# proxied here over auto-HTTPS:
+#   - reads  (watch):     cacheable HTTPS GET of the flock snapshot + video
+#   - writes (contribute): a 1:1 REST skin over the protocol messages
+# Both land on the node's --http-addr (the `sheep-node:8080` service below).
+
+{$WORLD_DOMAIN:localhost} {
+	encode gzip
+
+	# v1 lesson: HTTP/2 breaks the libp2p WebSocket (wss) upgrade. The browser
+	# is HTTP-only today (no js-libp2p), so this is currently harmless — but we
+	# keep it pinned so that if a wss listen multiaddr is ever proxied through
+	# here (native browsers / future wss bootstrap), the upgrade isn't broken by
+	# h2. Cheap insurance, future-proofs wss.
+	servers {
+		protocols h1
+	}
+
+	# Cache the merged loop videos at the edge (egress is the only real cost,
+	# ARCHITECTURE v3 §5). The node serves video under /api/video/*; let it pass
+	# its own Cache-Control if it sets one, else apply a short default.
+	@video path /api/video/*
+	header @video Cache-Control "public, max-age=60"
+
+	# The node's HTTP read/write face (--http-addr). CORS is handled in-app (the
+	# static GitHub Pages client is a separate origin), so Caddy just proxies.
+	reverse_proxy sheep-node:8080
+}

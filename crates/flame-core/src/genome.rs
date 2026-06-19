@@ -330,7 +330,7 @@ impl Genome {
     /// deterministic (the rng advances per try, the probe seed is fixed), so
     /// every peer derives the identical sheep.
     pub fn random(rng: &mut Rng, n: usize) -> Genome {
-        const MAX_TRIES: usize = 28;
+        const MAX_TRIES: usize = 8;
         const MIN_COVERAGE: f64 = 0.30;
         let mut best = Self::random_once(rng, n);
         let mut best_cov = best.coverage();
@@ -355,9 +355,9 @@ impl Genome {
     /// flame fills a 2-D region and scores high.
     pub fn coverage(&self) -> f64 {
         const PROBE: u64 = 0x00C0_FFEE;
-        const N: u64 = 60_000;
-        const G: usize = 48;
-        const MIN_HITS: u32 = 6; // ~0.25x the uniform-spread average (60k/2304)
+        const N: u64 = 15_000;
+        const G: usize = 24;
+        const MIN_HITS: u32 = 6; // ~0.25x the uniform-spread average (15k/576 ≈ 26)
         let mut hits = vec![0u32; G * G];
         let (cx, cy, s) = (self.camera.center_x, self.camera.center_y, self.camera.scale);
         crate::render::iterate(self, N, 30, PROBE, |x, y, _| {
@@ -435,5 +435,78 @@ impl Genome {
         }
         genome.auto_frame();
         genome
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rng::Rng;
+
+    /// Regression guard for the boot-hang fix (sheep-node was pinning the
+    /// reactor thread because `Genome::random` ran a 28×60k-sample quality
+    /// filter inline per mint). The filter is deliberately bounded now
+    /// (`MAX_TRIES`/`coverage` knobs); this asserts a single derivation stays
+    /// cheap so it can't silently regress back into a multi-second stall.
+    ///
+    /// Worst case is the all-tries path (a fog-prone seed that never reaches
+    /// `MIN_COVERAGE`). We derive 50 distinct seeds — which empirically include
+    /// such seeds — and assert the slowest is well under the budget. Measured
+    /// ~50ms/derivation on a dev machine; the 150ms ceiling leaves CI headroom
+    /// while still catching a real regression (the old path was seconds).
+    #[test]
+    fn random_derivation_is_cheap() {
+        // Warm up so first-touch page faults / icache don't skew the worst case.
+        for seed in 0..3u64 {
+            let _ = Genome::random(&mut Rng::new(seed), 3);
+        }
+        let mut worst = std::time::Duration::ZERO;
+        let mut worst_seed = 0u64;
+        // Cover both small seeds AND wall-clock-style seeds (the bootstrap mints
+        // with `ts_micros` near now, e.g. ~1.78e15, hashed into the Rng seed):
+        // those are exactly the seeds that previously rolled degenerate genomes
+        // whose chaos-game trajectory diverged to huge-but-finite coords, where
+        // libm's transcendental argument reduction stalled for seconds. With the
+        // escape-reseed guard every such trajectory restarts at a bounded point.
+        let seeds = (0..50u64).chain((0..50u64).map(|k| 1_781_000_000_000_000u64 + k));
+        for seed in seeds {
+            let mut rng = Rng::new(seed);
+            let t = std::time::Instant::now();
+            let _g = Genome::random(&mut rng, 3);
+            let d = t.elapsed();
+            if d > worst {
+                worst = d;
+                worst_seed = seed;
+            }
+        }
+        // Catches the real regression (the old escape-reseed-hang path was
+        // *seconds*); unoptimized debug builds run ~3-4x slower, so the bound is
+        // profile-aware — release stays tight, debug just rules out a hang.
+        let bound_ms = if cfg!(debug_assertions) { 1500 } else { 150 };
+        assert!(
+            worst < std::time::Duration::from_millis(bound_ms),
+            "Genome::random worst-case derivation regressed: {worst:?} (seed {worst_seed}); \
+             the quality filter must stay bounded so it can never block the node's reactor"
+        );
+    }
+
+    /// The density filter must stay *meaningful*: it should reliably yield
+    /// genomes that meet `MIN_COVERAGE` (solid, not thin "fog"), not be made
+    /// trivial by the cheaper-probe retuning. Every derived seed should clear
+    /// the bar (either by passing early or by the all-tries densest fallback
+    /// landing on a solid candidate).
+    #[test]
+    fn random_filter_keeps_solid_genomes() {
+        let mut solid = 0usize;
+        for seed in 0..50u64 {
+            let g = Genome::random(&mut Rng::new(seed), 3);
+            if g.coverage() >= 0.30 {
+                solid += 1;
+            }
+        }
+        assert!(
+            solid >= 45,
+            "density filter degraded: only {solid}/50 derived genomes are solid"
+        );
     }
 }

@@ -1,40 +1,39 @@
-// contribute.js — the render-contribution loop, v2.
+// contribute.js — the v3 render-contribution loop.
 //
-// One cycle: POST /api/assign → render each returned WorkUnit in the WASM pool
-// (the existing `render-batch` worker message) → POST /api/submit with the
-// results. The coordinator assigns DISTINCT idxs, so no two clients ever render
-// the same tile (the v1 collision problem is gone by construction); the client
-// just renders exactly what it's handed and reports back.
+// One cycle:
+//   GET /api/assign?pub=<hex>   → advisory blocks (+ audit tiles)
+//   for each block: look up the sheep's GENOME (from the cached flock), render
+//     the tile (frame,idx) in the WASM pool, deflate the histogram, and submit:
+//        - a signed PieceUpload Envelope (the heavy histogram artifact), and
+//        - a signed Coverage Envelope (the "have" / progress claim)
+//     via POST /api/msg.
+//   for each audit tile: re-render and submit a signed Attestation Envelope.
 //
-// Saturating the pool (like v1): we submit every unit in a bundle to the pool
-// at once and await them in parallel, so all workers stay busy; pool.js FIFO-
-// queues the overflow. When a bundle finishes we immediately ask for another,
-// so the loop runs back-to-back for as long as `running` holds.
+// The render is byte-deterministic, so every contributor that renders the same
+// (sheep, frame, idx, pass) produces an identical histogram + hash; the node's
+// accumulator content-addresses by that hash, so duplicate work merges (no
+// double-count) and the JS↔Rust render math is the integration contract: the
+// node re-hashes the decoded histogram and rejects any mismatch with no render.
+//
+// Render parameters (must match the node, crates/sheep-node):
+//   w = h = the sheep's resolution edge (384/512/768/1024)   [SheepView.resolution]
+//   ss = 1            (ResolutionTier supersample is 1; accumulator decodes edge×edge)
+//   spp = 200_000     (spec::SPP)
+//   nFrames = 128     (spec::N_FRAMES)
 
-// A WorkUnit (API.md) names exactly the args of render-batch, so it maps 1:1
-// onto the worker message. We pass the unit's fields straight through.
-function renderBatchMsg(unit) {
-  return {
-    type: 'render-batch',
-    genomeJson: unit.genomeJson,
-    sheepId: unit.sheepId,
-    frame: unit.frame,
-    idx: unit.idx,
-    w: unit.w,
-    h: unit.h,
-    ss: unit.ss,
-    spp: unit.spp,
-    nFrames: unit.nFrames,
-  };
-}
+import { signEnvelope, T } from './api.js';
 
-// base64(deflate(the u64 histogram buffer)). API.md: hist = base64(zstd/deflate
-// of the u64 histogram contribution). The coordinator's histio.rs decoder
-// magic-sniffs the compression — zlib/deflate (header byte 0x78) or zstd — so we
-// deflate first with the browser-native CompressionStream('deflate'), which
-// emits the zlib wrapper (magic 0x78) the coordinator accepts. The single-tile
-// histogram is overwhelmingly zeros, so this shrinks the ~4.5 MB raw buffer to a
-// few percent on the wire. Async because CompressionStream is stream-based.
+export const SPP = 200_000;     // spec::SPP
+export const N_FRAMES = 128;    // spec::N_FRAMES
+export const SS = 1;            // ResolutionTier supersample
+
+// base64(deflate(LE-u64 histogram cells)). The node decodes with
+// hist::decode_accum, which magic-sniffs zstd vs zlib/deflate; CompressionStream
+// ('deflate') emits a zlib stream (magic 0x78) the node accepts. The histogram
+// the worker hands us is a BigUint64Array whose .buffer is already the flat
+// little-endian u64 cells [r,g,b,count] per pixel — exactly what decode_accum
+// reads back — so we deflate the raw buffer with no re-layout. Async because
+// CompressionStream is stream-based.
 export async function histToBase64(arrayBuffer) {
   const cs = new CompressionStream('deflate');
   const writer = cs.writable.getWriter();
@@ -43,7 +42,7 @@ export async function histToBase64(arrayBuffer) {
   const compressed = new Uint8Array(await new Response(cs.readable).arrayBuffer());
 
   // base64 over a binary string; chunk to avoid String.fromCharCode arg-length
-  // limits / apply.call blowups on large buffers.
+  // limits on large buffers.
   let binary = '';
   const CHUNK = 0x8000;
   for (let i = 0; i < compressed.length; i += CHUNK) {
@@ -52,35 +51,95 @@ export async function histToBase64(arrayBuffer) {
   return btoa(binary);
 }
 
-/**
- * Render one WorkUnit → the API.md Result shape, with hist base64-encoded.
- * Returns null if the job was cancelled or errored.
- */
-export async function renderUnit(pool, unit) {
-  const handle = pool.submit(renderBatchMsg(unit));
-  const m = await handle.done;
-  if (m.type !== 'batch-done') return null; // cancelled / unexpected
+// Build the render-batch worker message for a block + its sheep's genome.
+function renderBatchMsg(genomeJson, sheepId, frame, idx, edge) {
   return {
-    sheepId: unit.sheepId,
-    frame: unit.frame,
-    idx: unit.idx,
-    hash: m.hash,
-    count: m.count,            // string (may exceed Number.MAX_SAFE_INTEGER)
-    hist: await histToBase64(m.hist),
+    type: 'render-batch',
+    genomeJson,
+    sheepId,
+    frame,
+    idx,
+    w: edge,
+    h: edge,
+    ss: SS,
+    spp: SPP,
+    nFrames: N_FRAMES,
   };
 }
 
 /**
- * A self-driving contribute loop. Construct, call start(); it pulls bundles and
- * submits results until stop() is called.
+ * Render ONE block and submit its PieceUpload + Coverage envelopes.
+ * Returns the node's reply for the PieceUpload (or null if cancelled/no genome).
+ * Exported so the e2e test can drive a single tile end-to-end.
+ *
+ * @param pool      WorkerPool
+ * @param identity  { pubHex, pair }
+ * @param api       the api.js module
+ * @param block     { sheep_id, frame, idx, pass, block_id }
+ * @param genomeJson the sheep's genome JSON string (from the cached flock)
+ * @param edge      the sheep's resolution edge (px)
+ */
+export async function renderAndSubmit(pool, identity, api, block, genomeJson, edge) {
+  const handle = pool.submit(renderBatchMsg(genomeJson, block.sheep_id, block.frame, block.idx, edge));
+  const m = await handle.done;
+  if (m.type !== 'batch-done') return null; // cancelled / unexpected
+  const histB64 = await histToBase64(m.hist);
+  const pass = block.pass ?? 0;
+
+  // PieceUpload (the heavy artifact) — the node accumulates + re-hashes it.
+  const pieceEnv = await signEnvelope(identity, T.PIECE, {
+    sheep_id: block.sheep_id,
+    frame: block.frame,
+    idx: block.idx,
+    pass,
+    hash: m.hash,
+    count: String(m.count),
+    hist_b64: histB64,
+  });
+  // Coverage / have (the progress claim) — earns credit toward selection.
+  const coverEnv = await signEnvelope(identity, T.PROGRESS, {
+    sheep_id: block.sheep_id,
+    frame: block.frame,
+    idx: block.idx,
+    pass,
+    hash: m.hash,
+  });
+
+  // Batch both into one POST (the node accepts an array of envelopes).
+  const reply = await api.postMsg([pieceEnv, coverEnv]);
+  return reply;
+}
+
+/**
+ * Render an assigned audit tile and submit a signed Attestation (hash only,
+ * no pixels). Returns the node reply, or null if cancelled / no genome.
+ */
+export async function renderAndAttest(pool, identity, api, audit, genomeJson, edge) {
+  const handle = pool.submit(renderBatchMsg(genomeJson, audit.sheep_id, audit.frame, audit.idx, edge));
+  const m = await handle.done;
+  if (m.type !== 'batch-done') return null;
+  const env = await signEnvelope(identity, T.ATTEST, {
+    sheep_id: audit.sheep_id,
+    frame: audit.frame,
+    idx: audit.idx,
+    pass: audit.pass ?? 0,
+    hash: m.hash,
+  });
+  return api.postMsg(env);
+}
+
+/**
+ * A self-driving contribute loop. Construct, call start(); it pulls assign
+ * bundles and submits rendered pieces until stop() is called.
  *
  * @param pool      WorkerPool (the WASM render pool)
  * @param identity  { pubHex, pair } from identity.js
- * @param api       the api.js module (assign/submit)
- * @param opts.sheepId    optional — pin contribution to one sheep
- * @param opts.onResult   ({ accepted, rejected, credits, reputation }) => void
+ * @param api       the api.js module (assign / postMsg / signEnvelope)
+ * @param opts.genomeFor  (sheepId) => { genomeJson, edge } | null — resolves a
+ *                        sheep's genome + resolution from the cached flock.
+ * @param opts.onResult   (reply) => void   per accepted submission
  * @param opts.onError    (err) => void
- * @param opts.idleMs     pause between cycles when the server has no work (default 4000)
+ * @param opts.idleMs     pause between cycles when there is no work (default 4000)
  */
 export class Contributor {
   constructor(pool, identity, api, opts = {}) {
@@ -89,7 +148,7 @@ export class Contributor {
     this.api = api;
     this.opts = opts;
     this.running = false;
-    this._inflight = new Set(); // job handles, so stop() can cancel mid-render
+    this._inflight = new Set();
   }
 
   start() {
@@ -110,7 +169,7 @@ export class Contributor {
     while (this.running) {
       let bundle;
       try {
-        bundle = await this.api.assign(this.identity, this.opts.sheepId);
+        bundle = await this.api.assign(this.identity.pubHex);
       } catch (e) {
         this.opts.onError?.(e);
         await this._sleep(this.opts.idleMs ?? 4000);
@@ -118,72 +177,45 @@ export class Contributor {
       }
       if (!this.running) return;
 
-      const units = bundle.units || [];
-      // Peer-audit tasks (ARCHITECTURE §4): each is a WorkUnit naming someone
-      // ELSE's tile (the submitter's claimed hash is withheld). We re-render it
-      // through the SAME WASM pool and report the observed hash; the coordinator
-      // grades the report (match → validate, mismatch → dispute, honeypot →
-      // graded for free) instead of re-rendering everything itself.
+      const blocks = bundle.blocks || [];
       const audits = bundle.audits || [];
-
-      if (!units.length && !audits.length) {
-        // No work right now — back off briefly, then ask again.
+      if (!blocks.length && !audits.length) {
         await this._sleep(this.opts.idleMs ?? 4000);
         continue;
       }
 
-      // Saturate the pool with our OWN render work; build Result objects.
-      const jobs = units.map((u) => {
-        const handle = this.pool.submit(renderBatchMsg(u));
-        this._inflight.add(handle);
-        return handle.done
-          .then(async (m) => {
-            this._inflight.delete(handle);
-            if (m.type !== 'batch-done') return null;
-            return {
-              sheepId: u.sheepId, frame: u.frame, idx: u.idx,
-              hash: m.hash, count: m.count, hist: await histToBase64(m.hist),
-            };
-          })
-          .catch(() => { this._inflight.delete(handle); return null; });
+      // Render + submit each block; resolve the genome from the cached flock.
+      const jobs = blocks.map(async (b) => {
+        const g = this.opts.genomeFor?.(b.sheep_id);
+        if (!g) return null; // unknown sheep (flock not yet polled) — skip
+        try {
+          return await renderAndSubmit(this.pool, this.identity, this.api, b, g.genomeJson, g.edge);
+        } catch (e) {
+          this.opts.onError?.(e);
+          return null;
+        }
       });
 
-      // Audit work: re-render each assigned audit unit and observe its hash.
-      // We do NOT upload pixels for audits — only the hash is reported. The
-      // contributor's own render work above is unchanged.
-      const auditJobs = audits.map((u) => {
-        const handle = this.pool.submit(renderBatchMsg(u));
-        this._inflight.add(handle);
-        return handle.done
-          .then((m) => {
-            this._inflight.delete(handle);
-            if (m.type !== 'batch-done') return null;
-            return { sheepId: u.sheepId, frame: u.frame, idx: u.idx, hash: m.hash };
-          })
-          .catch(() => { this._inflight.delete(handle); return null; });
+      const auditJobs = audits.map(async (a) => {
+        const g = this.opts.genomeFor?.(a.sheep_id);
+        if (!g) return null;
+        try {
+          return await renderAndAttest(this.pool, this.identity, this.api, a, g.genomeJson, g.edge);
+        } catch (e) {
+          this.opts.onError?.(e);
+          return null;
+        }
       });
 
-      const [results, auditReports] = await Promise.all([
-        Promise.all(jobs).then((r) => r.filter(Boolean)),
-        Promise.all(auditJobs).then((r) => r.filter(Boolean)),
-      ]);
+      const replies = (await Promise.all([...jobs, ...auditJobs])).filter(Boolean);
       if (!this.running) return;
-      if (!results.length && !auditReports.length) continue;
-
-      try {
-        const reply = await this.api.submit(this.identity, results, auditReports);
-        this.opts.onResult?.(reply);
-      } catch (e) {
-        this.opts.onError?.(e);
-        await this._sleep(this.opts.idleMs ?? 4000);
-      }
+      for (const r of replies) this.opts.onResult?.(r);
     }
   }
 
   _sleep(ms) {
     return new Promise((resolve) => {
       const t = setTimeout(resolve, ms);
-      // If stopped mid-sleep, resolve promptly so the loop exits.
       const check = setInterval(() => {
         if (!this.running) { clearTimeout(t); clearInterval(check); resolve(); }
       }, 200);

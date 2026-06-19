@@ -4,6 +4,8 @@ members = [
   "crates/flame-core",
   "crates/flame-cli",
   "crates/flame-wasm",
+  "crates/sheep-proto",
+  "crates/sheep-node",
   "coordinator",
 ]
 

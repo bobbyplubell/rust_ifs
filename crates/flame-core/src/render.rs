@@ -254,8 +254,14 @@ pub fn iterate(
         prev = Some(t);
         genome.transforms[t].apply_cached(&active[t], &mut x, &mut y, &mut color, &mut rng);
 
-        // Reseed if the trajectory escaped to infinity / NaN.
-        if !x.is_finite() || !y.is_finite() {
+        // Reseed if the trajectory escaped: non-finite OR diverged past a large
+        // radius. Real attractors live within ~[-50,50]; ESCAPE is far beyond
+        // that so legitimate points are never clipped. Catching huge-but-finite
+        // divergence keeps transcendental arguments bounded — libm's argument
+        // reduction is pathologically slow on astronomically large inputs, which
+        // otherwise stalls genome generation. Deterministic on every target.
+        const ESCAPE: f64 = 1.0e6;
+        if !x.is_finite() || !y.is_finite() || x.abs() > ESCAPE || y.abs() > ESCAPE {
             x = rng.range(-1.0, 1.0);
             y = rng.range(-1.0, 1.0);
             color = rng.f64();
