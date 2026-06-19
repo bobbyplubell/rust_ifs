@@ -16,8 +16,15 @@ services:
       SHEEP_LISTEN: "${SHEEP_LISTEN:-/ip4/0.0.0.0/tcp/4001}"
       SHEEP_HTTP_ADDR: "${SHEEP_HTTP_ADDR:-0.0.0.0:8080}"
       SHEEP_BOOTSTRAP: "${SHEEP_BOOTSTRAP:-}"
-      # World personality (§2.2 decay + §3 economy). TODO: not yet read from env
-      # by the binary — see DEPLOY.md. Mirrors docker-compose.yml.
+      # Founding flock minted at boot (§2.2).
+      SHEEP_BOOTSTRAP_FLOCK: "${SHEEP_BOOTSTRAP_FLOCK:-4}"
+      # Accumulator RAM budget (MB) — the disk-backed LRU keeps at most this many
+      # MB of merged frame buffers resident; the rest spill to /data/accum and
+      # stream back on demand. This is what makes a node fit ANY RAM budget
+      # (lightweight node => small number). Default 128; on the 512 MB droplets we
+      # set ~96 in the env file to leave room for render + gossip + OS.
+      SHEEP_ACCUM_RAM_MB: "${SHEEP_ACCUM_RAM_MB:-128}"
+      # World personality (§2.2 decay + §3 economy), read from env by main.rs.
       SHEEP_DECAY_TIME_UNIT_MS: "${SHEEP_DECAY_TIME_UNIT_MS:-}"
       SHEEP_DECAY_BASE: "${SHEEP_DECAY_BASE:-}"
       SHEEP_DECAY_LINEAR: "${SHEEP_DECAY_LINEAR:-}"

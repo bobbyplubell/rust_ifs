@@ -66,7 +66,7 @@ fn honest_piece(g: &Genome, sheep: &[u8; 32], frame: u32, idx: u32, pass: u32) -
 fn seeded_state(sheep_hex: &str, sheep: &[u8; 32], g: &Genome) -> (HttpState, tempdir::TempDir) {
     let dir = tempdir::TempDir::new();
 
-    let mut acc = Accumulator::new();
+    let mut acc = Accumulator::new(dir.path().to_path_buf(), 128);
     acc.register_sheep(sheep_hex, g.clone());
     // Frame 0: a few idx tiles + a 2nd pass for density. Frame 1: one tile.
     assert!(acc.ingest(&honest_piece(g, sheep, 0, 0, 0), EDGE));

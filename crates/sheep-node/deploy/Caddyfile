@@ -15,14 +15,11 @@
 {$WORLD_DOMAIN:localhost} {
 	encode gzip
 
-	# v1 lesson: HTTP/2 breaks the libp2p WebSocket (wss) upgrade. The browser
-	# is HTTP-only today (no js-libp2p), so this is currently harmless — but we
-	# keep it pinned so that if a wss listen multiaddr is ever proxied through
-	# here (native browsers / future wss bootstrap), the upgrade isn't broken by
-	# h2. Cheap insurance, future-proofs wss.
-	servers {
-		protocols h1
-	}
+	# (No `servers { protocols h1 }` pin: the v3 browser face is plain HTTPS
+	# REST + video, so HTTP/2 is fine and preferred. The h1 pin was a v1 wss
+	# upgrade workaround — and it's a GLOBAL option, not a site directive, so it
+	# can't live here anyway. If wss bootstrap is ever proxied, add it as a
+	# top-level global-options block.)
 
 	# Cache the merged loop videos at the edge (egress is the only real cost,
 	# ARCHITECTURE v3 §5). The node serves video under /api/video/*; let it pass

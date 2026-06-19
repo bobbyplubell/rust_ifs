@@ -130,6 +130,13 @@ fn build_behaviour(key: &libp2p::identity::Keypair) -> Result<SheepBehaviour, Ne
     let gs_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_millis(200))
         .validation_mode(gossipsub::ValidationMode::Permissive)
+        // A PIECE envelope carries a full-frame histogram (§5): ~4.7 MB for an
+        // R384 tile, far over gossipsub's default 64 KiB cap, so without this
+        // pieces fail to publish (`MessageTooLarge`) and never propagate. 10 MiB
+        // comfortably fits one R384 piece. STOPGAP: heavy histograms shouldn't be
+        // gossip-flooded at all — the real fix (announce-over-gossip + pull the
+        // bytes over the req/resp PIECE channel) is a Phase-2 follow-up.
+        .max_transmit_size(10 * 1024 * 1024)
         // Content-address messages by their bytes so identical re-publishes
         // (engine envelopes are deterministic) dedup in the mesh.
         .message_id_fn(|m: &gossipsub::Message| {
@@ -463,8 +470,16 @@ async fn event_loop(
     // `ServeConfig.ingest_audit` decides whether browser submissions are
     // verify-before-vouch'd or optimistically forwarded.
     let ingest_audit = serve.as_ref().map(|c| c.ingest_audit).unwrap_or(false);
-    let accum: Option<Arc<Mutex<Accumulator>>> =
-        accumulate.then(|| Arc::new(Mutex::new(Accumulator::new())));
+    // The accumulator spills its merged-frame working set under the node's
+    // data_dir (the same dir the video cache uses) and bounds RAM by
+    // `world.accum_ram_mb` (§5 memory-bounded accumulate). Only a serving node
+    // holds one — a plain worker never accumulates the heavy histograms.
+    let accum: Option<Arc<Mutex<Accumulator>>> = serve.as_ref().map(|cfg| {
+        Arc::new(Mutex::new(Accumulator::new(
+            cfg.data_dir.clone(),
+            world.accum_ram_mb,
+        )))
+    });
     let read_state: Option<Arc<Mutex<ReadState>>> =
         accumulate.then(|| Arc::new(Mutex::new(ReadState::default())));
     // Genome registration for tonemap is one-shot per sheep; track who's done.

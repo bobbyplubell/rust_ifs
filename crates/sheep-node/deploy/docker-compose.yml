@@ -39,6 +39,12 @@ services:
       # DEPLOY.md "Bootstrap list" — these are filled in after first boot, once
       # each seed's persisted-key peer id is known.
       SHEEP_BOOTSTRAP: "${SHEEP_BOOTSTRAP:-}"
+      # Founding flock minted at boot (§2.2).
+      SHEEP_BOOTSTRAP_FLOCK: "${SHEEP_BOOTSTRAP_FLOCK:-4}"
+      # Accumulator RAM budget (MB): disk-backed LRU keeps at most this many MB of
+      # merged frame buffers resident; the rest spill to /data/accum. Lets a node
+      # fit ANY RAM budget. Default 128.
+      SHEEP_ACCUM_RAM_MB: "${SHEEP_ACCUM_RAM_MB:-128}"
       # --- World personality (ARCHITECTURE v3 §2.2 decay + §3 economy) -------
       # Age-escalating backing-decay knobs (engine.rs DecayParams). Sandbox =
       # steep (small half-life, big quad); Gallery = gentle. Unset = code

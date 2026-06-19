@@ -201,7 +201,9 @@ pub struct Engine {
     /// so a dispute can slash + retract the right party's contribution.
     submitter: HashMap<(String, u32, u32, u32), String>,
     /// §6 content hashes proven fraudulent by a dispute re-render — handed to the
-    /// accumulator (`apply_disputes`/`retract`) to subtract the fraudster's work.
+    /// accumulator (`apply_disputes` → `retract_hash`) to bar the fraudster's work
+    /// from re-entry (the dispute path has only hashes, not the tile bytes, so
+    /// exact subtraction is deferred to the Phase-2 frame rebuild).
     retracted_hashes: HashSet<String>,
     /// §6 tiles already settled by a dispute, so we re-render each at most once
     /// (a dispute is the *only* re-render and it happens once per tile).
@@ -457,6 +459,12 @@ pub struct WorldConfig {
     /// How many LIVE genesis sheep a *seed* mints into the world at boot (0 =
     /// none). Only the serving/accumulator node acts on this.
     pub bootstrap_flock: usize,
+    /// RAM budget (MB = 1e6 bytes) for the accumulator's resident merged-frame
+    /// working set (§5). The merged CRDT sums spill to `data_dir/accum/` beyond
+    /// this; the small per-frame metadata stays resident regardless. Memory is
+    /// thus bounded INDEPENDENT of flock/frame count. Only the serving/accumulator
+    /// node holds an accumulator, so a plain worker ignores this.
+    pub accum_ram_mb: usize,
 }
 
 impl WorldConfig {
@@ -469,6 +477,9 @@ impl WorldConfig {
         mint_cost: MINT_COST,
         breed_cost: BREED_COST,
         bootstrap_flock: 4,
+        // 128 MB resident merged-frame working set by default — comfortably holds
+        // a handful of full-frame R384 frames while bounding total RAM.
+        accum_ram_mb: 128,
     };
 }
 
@@ -717,7 +728,8 @@ impl Engine {
     }
 
     /// Content hashes proven fraudulent by a dispute re-render (§6). The
-    /// accumulator subtracts these (`Accumulator::apply_disputes`).
+    /// accumulator bars these from re-entry (`Accumulator::apply_disputes` →
+    /// `retract_hash`); exact subtraction is deferred to the Phase-2 rebuild.
     pub fn retracted_hashes(&self) -> &HashSet<String> {
         &self.retracted_hashes
     }
