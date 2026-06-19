@@ -15,7 +15,6 @@ import { loadIdentity } from './identity.js';
 import { sheepName } from './names.js';
 import * as api from './api.js';
 import { Contributor } from './contribute.js';
-import { mountWorldPicker } from './world-picker.js';
 
 const $ = (s) => document.querySelector(s);
 
@@ -32,6 +31,15 @@ let myCredits = 0;            // last credits the node reported on a write
 let spendSeq = Date.now();    // monotonic per-key spend sequence (§7) for Vote/Breed
 let selfPub = '';             // the node's own pubkey (from /api/flock)
 
+// Contribute stats (this session). Contribution is GLOBAL — one shared loop
+// pulls /api/assign which hands out work across the whole flock, so these are
+// per-browser totals, not per-sheep.
+let renderedTiles = 0;        // blocks this browser rendered + submitted (local count)
+let acceptedLocal = 0;        // fallback Accepted count (older nodes w/o confirmed_tiles)
+let confirmedTiles = -1;      // node-authoritative running total of confirmed tiles (-1 = unseen)
+let tilesPerCredit = 0;       // node-reported tiles per credit (e.g. 128); 0 = unknown
+let contribError = '';        // last contribute error (surfaced briefly in the stats line)
+
 const cards = new Map();      // sheepId -> { record, el, video, ... }
 const flockGenomes = new Map(); // sheepId -> { genomeJson, edge } for the renderer
 const selected = [];          // up to 2 sheepIds picked for breeding
@@ -39,13 +47,13 @@ const selected = [];          // up to 2 sheepIds picked for breeding
 // ---- boot -------------------------------------------------------------------
 
 async function main() {
-  mountWorldPicker('#world-picker');
   me = await loadIdentity();
   pool = new WorkerPool();
   pool.onStatus = (status, detail) => {
     if (status === 'failed') setStatus(`renderer failed to load: ${detail || ''}`);
   };
 
+  wireContribute();
   wireNursery();
 
   await refreshFlock().catch((e) => setStatus(`flock load failed: ${e.message}`));
@@ -113,19 +121,15 @@ function buildCard(rec) {
   const tallyEl = document.createElement('span');
   tallyEl.className = 'tally';
 
-  const contribBtn = document.createElement('button');
-  contribBtn.textContent = 'contribute';
-  contribBtn.title = 'pledge idle CPU to render the flock — accepted tiles earn ' +
-    'credits to spend on selection';
-  contribBtn.addEventListener('click', toggleContribute);
-
+  // NOTE: contribution is GLOBAL — driven by the single header toggle, not a
+  // per-sheep button. The card keeps only "back ▲".
   const backBtn = document.createElement('button');
   backBtn.className = 'back';
   backBtn.textContent = 'back ▲';
   backBtn.title = 'spend an earned credit to back this sheep — backing decides survival';
   backBtn.addEventListener('click', () => doVote(rec.id));
 
-  meta.append(label, tallyEl, contribBtn, backBtn);
+  meta.append(label, tallyEl, backBtn);
 
   const bar = document.createElement('div');
   bar.className = 'bar';
@@ -137,7 +141,7 @@ function buildCard(rec) {
   tilesEl.className = 'tiles';
 
   card.append(video, bar, meta, tilesEl);
-  return { record: rec, el: card, video, tallyEl, tilesEl, backBtn, barFill, contribBtn };
+  return { record: rec, el: card, video, tallyEl, tilesEl, backBtn, barFill };
 }
 
 function updateCard(c) {
@@ -166,8 +170,6 @@ function updateCard(c) {
   c.tilesEl.title = rec.creator ? `creator ${rec.creator}\n${rec.coverage} accepted tiles` : '';
 
   c.el.classList.toggle('selected', selected.includes(rec.id));
-  c.contribBtn.classList.toggle('on', contributing);
-  c.contribBtn.textContent = contributing ? 'contributing…' : 'contribute';
   c.backBtn.disabled = myCredits <= 0;
 }
 
@@ -192,7 +194,18 @@ async function doVote(sheepId) {
   }
 }
 
-// ---- contribute toggle ------------------------------------------------------
+// ---- global contribute toggle + live stats ----------------------------------
+//
+// Contribution is GLOBAL: the single shared Contributor pulls /api/assign, which
+// hands out work across ALL living sheep. There is exactly one contribute state
+// for the whole app (one toggle, one Contributor instance), driven from the
+// header control — never per sheep.
+
+function wireContribute() {
+  const btn = $('#contribute');
+  if (btn) btn.addEventListener('click', toggleContribute);
+  renderContribStats();
+}
 
 function toggleContribute() {
   contributing = !contributing;
@@ -200,24 +213,91 @@ function toggleContribute() {
     if (!contributor) {
       contributor = new Contributor(pool, me, api, {
         genomeFor: (id) => flockGenomes.get(id) || null,
-        onResult: (reply) => {
-          // Reply may be a single result or { results:[...] }.
-          const items = reply?.results || [reply];
-          for (const it of items) {
-            if (it && typeof it.credits === 'number') myCredits = it.credits;
-          }
-          refreshAllCards();
-          setStatus();
+        onResult: onContribResult,
+        onError: (e) => {
+          contribError = e?.message || String(e);
+          console.warn('contribute:', contribError);
+          renderContribStats();
         },
-        onError: (e) => console.warn('contribute:', e.message),
       });
     }
+    contribError = '';
     contributor.start();
   } else {
     contributor?.stop();
   }
+  renderContribStats();
+  setStatus();
+}
+
+// Per-submission callback from the Contributor. `reply` is the node's /api/msg
+// result: a single object for one envelope, or `{results:[...]}` for a batch
+// (contribute.js posts [pieceEnv, coverEnv] as an array, so expect a batch).
+// Each result item carries: accepted (bool), credits (number, running total),
+// and — on newer nodes — confirmed_tiles (number, submitter's running total)
+// and tiles_per_credit (number, e.g. 128).
+function onContribResult(reply) {
+  contribError = '';
+  // One "block" was rendered + submitted regardless of acceptance.
+  renderedTiles += 1;
+
+  const items = reply?.results || [reply];
+  for (const it of items) {
+    if (!it || typeof it !== 'object') continue;
+    if (typeof it.credits === 'number') myCredits = Math.max(myCredits, it.credits);
+    if (typeof it.tiles_per_credit === 'number') tilesPerCredit = it.tiles_per_credit;
+    if (typeof it.confirmed_tiles === 'number') {
+      // Node-authoritative running total — SET to the max seen, don't increment.
+      confirmedTiles = Math.max(confirmedTiles, it.confirmed_tiles);
+    } else if (it.accepted === true) {
+      // Older node (no confirmed_tiles): fall back to a local accepted counter.
+      acceptedLocal += 1;
+    }
+  }
+
+  renderContribStats();
   refreshAllCards();
   setStatus();
+}
+
+// The authoritative Accepted count: prefer the node's confirmed_tiles total,
+// else the locally-incremented fallback.
+function acceptedCount() {
+  return confirmedTiles >= 0 ? confirmedTiles : acceptedLocal;
+}
+
+function renderContribStats() {
+  const btn = $('#contribute');
+  if (btn) {
+    btn.classList.toggle('on', contributing);
+    btn.textContent = contributing ? 'contributing…' : 'contribute';
+  }
+
+  const renderedEl = $('#stat-rendered');
+  if (renderedEl) renderedEl.textContent = String(renderedTiles);
+
+  const acceptedEl = $('#stat-accepted');
+  if (acceptedEl) acceptedEl.textContent = String(acceptedCount());
+
+  const creditsEl = $('#stat-credits');
+  if (creditsEl) {
+    let txt = String(myCredits);
+    // Progress to the next credit, when the node tells us the ratio.
+    if (tilesPerCredit > 0 && confirmedTiles >= 0) {
+      txt += ` (${confirmedTiles % tilesPerCredit}/${tilesPerCredit} to next)`;
+    }
+    creditsEl.textContent = txt;
+  }
+
+  const statusEl = $('#contrib-status');
+  if (statusEl) {
+    let s;
+    if (contribError) s = `error: ${contribError}`;
+    else if (contributing) s = 'contributing — rendering…';
+    else s = 'idle';
+    statusEl.textContent = s;
+    statusEl.classList.toggle('err', !!contribError);
+  }
 }
 
 // ---- nursery (breed two selected sheep) -------------------------------------

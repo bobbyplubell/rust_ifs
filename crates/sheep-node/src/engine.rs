@@ -669,6 +669,16 @@ impl Engine {
         self.own_confirmed_tiles
     }
 
+    /// A key's running total of **confirmed tiles** it submitted (§3, log-
+    /// derived) — the numerator of that key's earned credits
+    /// (`earned_tiles[key] / TILES_PER_CREDIT`). Convergent: every node computes
+    /// the same per-key count from the shared log. `0` for a key we've seen earn
+    /// nothing. The §10 write-face returns this so a browser contributor can show
+    /// its accepted-tile total and its progress to the next credit.
+    pub fn earned_tiles_for(&self, key: &str) -> u64 {
+        self.earned_tiles.get(key).copied().unwrap_or(0)
+    }
+
     // ---- §2.2 backing / vitality / live flock -----------------------------
 
     /// §2.2 a sheep's total backing — lifetime votes received (log-derived).

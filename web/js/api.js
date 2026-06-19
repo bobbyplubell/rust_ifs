@@ -141,8 +141,8 @@ export function videoUrl(id) {
 
 /**
  * Resolve a (possibly node-relative) url like "/api/video/:id" against the
- * active world's origin, so cross-origin dev (static page on :8000 talking to a
- * node on :8080) loads it correctly. Absolute urls pass through unchanged.
+ * active gateway's origin, so cross-origin dev (static page on :8000 talking to
+ * a node on :8080) loads it correctly. Absolute urls pass through unchanged.
  */
 export function absoluteUrl(url) {
   if (!url) return url;

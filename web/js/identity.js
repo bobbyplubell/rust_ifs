@@ -14,9 +14,10 @@
 //   store it base64 in localStorage. localStorage (not IndexedDB) so the value
 //   is a plain string the export/import flow can hand around as text.
 //
-// The identity is shared across WORLDS (all the same Pages origin → same
-// localStorage). Only per-world standing (credits/reputation) differs; the key
-// does not. See config.js / me.html.
+// The identity is shared across gateways (all the same Pages origin → same
+// localStorage), and there is one shared swarm, so your standing
+// (credits/reputation/tiles) is the same whichever gateway you use. See
+// config.js / me.html.
 
 import { hex, unhex } from './hash.js';
 

@@ -411,6 +411,12 @@ pub struct InjectResult {
     pub reason: Option<String>,
     /// The submitter's resulting credits (§3, log-derived) after applying.
     pub credits: u64,
+    /// The SUBMITTING KEY's (`env.from`) running total of confirmed tiles (§3,
+    /// log-derived) — the numerator of its earned credits
+    /// (`confirmed_tiles / TILES_PER_CREDIT`). `0` when unknown / mid-render. The
+    /// §10 write-face returns this so a browser contributor can display its
+    /// accepted-tile total + progress to the next credit.
+    pub confirmed_tiles: u64,
     /// If the message named a sheep, that sheep's resulting coverage (§4.1) and
     /// backing (§2.2) after applying — the standing the §10 skin returns.
     pub sheep_id: Option<String>,
@@ -1435,6 +1441,7 @@ fn inject_envelope(
             accepted: false,
             reason: Some("bad signature".into()),
             credits: 0,
+            confirmed_tiles: 0,
             sheep_id: None,
             coverage: 0,
             backing: 0,
@@ -1451,6 +1458,10 @@ fn inject_envelope(
                 accepted: false,
                 reason: Some(reason),
                 credits: engine.as_deref().map(|e| e.credits_of(&env.from)).unwrap_or(0),
+                confirmed_tiles: engine
+                    .as_deref()
+                    .map(|e| e.earned_tiles_for(&env.from))
+                    .unwrap_or(0),
                 sheep_id: envelope_sheep_id(env),
                 coverage: 0,
                 backing: 0,
@@ -1472,6 +1483,10 @@ fn inject_envelope(
             accepted: true,
             reason: None,
             credits: engine.as_deref().map(|e| e.credits_of(&env.from)).unwrap_or(0),
+            confirmed_tiles: engine
+                .as_deref()
+                .map(|e| e.earned_tiles_for(&env.from))
+                .unwrap_or(0),
             sheep_id: envelope_sheep_id(env),
             coverage: engine
                 .as_deref()
@@ -1490,7 +1505,7 @@ fn inject_envelope(
     // the tick-return drain if a render owns the engine. Either way we vouch by
     // re-publishing on the topic for env.t.
     let accepted;
-    let (credits, sheep, coverage, backing);
+    let (credits, confirmed_tiles, sheep, coverage, backing);
     match engine {
         Some(eng) => {
             accepted = eng.apply(env, now);
@@ -1498,6 +1513,7 @@ fn inject_envelope(
             apply_inbound_audit_only(eng, env, audited_seen);
             let s = envelope_sheep_id(env);
             credits = eng.credits_of(&env.from);
+            confirmed_tiles = eng.earned_tiles_for(&env.from);
             coverage = s.as_deref().map(|x| eng.coverage(x)).unwrap_or(0);
             backing = s.as_deref().map(|x| eng.backing(x)).unwrap_or(0);
             sheep = s;
@@ -1508,6 +1524,7 @@ fn inject_envelope(
             pending.push((env.clone(), now));
             accepted = true;
             credits = 0;
+            confirmed_tiles = 0;
             sheep = envelope_sheep_id(env);
             coverage = 0;
             backing = 0;
@@ -1520,6 +1537,7 @@ fn inject_envelope(
         accepted,
         reason: if accepted { None } else { Some("rejected by engine.apply (bad seq / overspend / unknown sheep / dup)".into()) },
         credits,
+        confirmed_tiles,
         sheep_id: sheep,
         coverage,
         backing,

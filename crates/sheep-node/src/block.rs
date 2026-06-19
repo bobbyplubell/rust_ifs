@@ -1,21 +1,36 @@
 //! Canonical work-unit enumeration + block slicing (ARCHITECTURE v3 §4).
 //!
 //! Rendering is neutral: a peer claims a **block**, a fixed-size contiguous
-//! slice of one sheep's canonical `(frame, pass, idx)` enumeration. To make a
+//! slice of one sheep's canonical `(idx, frame, pass)` enumeration. To make a
 //! block id tiny to gossip and locally re-derivable by anyone, the enumeration
 //! is a single deterministic flattening:
 //!
 //! ```text
 //! flat = 0;
 //! for pass in 0.. {
-//!     for frame in 0..N_FRAMES {
-//!         for idx in 0..IDXS_PER_FRAME {
+//!     for idx in 0..IDXS_PER_FRAME {
+//!         for frame in 0..N_FRAMES {
 //!             unit[flat] = (frame, idx, pass);
 //!             flat += 1;
 //!         }
 //!     }
 //! }
 //! ```
+//!
+//! **Breadth-first ordering (full animation visible sooner).** `frame` is the
+//! FAST dimension and `idx` the middle one, so the canonical order sweeps
+//! `idx == 0` across *every* frame `0..N_FRAMES` before it ever advances to
+//! `idx == 1` — and only after all idxs of a pass are laid down does the next
+//! pass deepen density. Since the least-covered block selection (engine
+//! `pick_block` / `pick_blocks_for`) walks block indices `0, 1, 2, …` upward,
+//! this makes the whole 0..128-frame animation acquire low-density coverage
+//! quickly (boomerang playback looks alive almost immediately) and density then
+//! deepens uniformly — rather than the old depth-first order (`idx` fast, `frame`
+//! middle), which rendered all 64 idxs of frame 0 before frame 1 started, so only
+//! ~7 of 128 frames had any data and the loop looked blank. The change is *only*
+//! advisory ordering: a unit's identity is still `(frame, idx, pass)`, so
+//! confirmed-coverage accounting, claims/collision-avoidance (§4), and
+//! convergence are untouched — they key on the tuple, never the flat index.
 //!
 //! **Block K** owns the flat units `[K*BUNDLE_SIZE .. (K+1)*BUNDLE_SIZE)`.
 //! Work is unbounded (passes never stop, §4), so block indices are unbounded
@@ -43,23 +58,26 @@ pub struct BlockId {
 /// Number of distinct `(frame, idx)` units in one pass.
 pub const UNITS_PER_PASS: u64 = (N_FRAMES as u64) * (IDXS_PER_FRAME as u64);
 
-/// Map a flat unit index to its `(frame, idx, pass)`.
+/// Map a flat unit index to its `(frame, idx, pass)`. Breadth-first within a
+/// pass: `frame` is the fast dimension, `idx` the middle one, so consecutive
+/// flat indices walk across all frames at one idx before advancing the idx.
 pub fn flat_to_unit(flat: u64) -> Unit {
     let pass = (flat / UNITS_PER_PASS) as u32;
     let within = flat % UNITS_PER_PASS;
-    let frame = (within / IDXS_PER_FRAME as u64) as u32;
-    let idx = (within % IDXS_PER_FRAME as u64) as u32;
+    let idx = (within / N_FRAMES as u64) as u32;
+    let frame = (within % N_FRAMES as u64) as u32;
     Unit { frame, idx, pass }
 }
 
 /// Map a `(frame, idx, pass)` back to its flat unit index. The inverse of
-/// [`flat_to_unit`]. (frame, idx must be in range; pass is unbounded.)
+/// [`flat_to_unit`] (breadth-first: `frame` fast, `idx` middle, `pass` slow).
+/// (frame, idx must be in range; pass is unbounded.)
 pub fn unit_to_flat(u: Unit) -> u64 {
     debug_assert!(u.frame < N_FRAMES, "frame out of range");
     debug_assert!(u.idx < IDXS_PER_FRAME, "idx out of range");
     (u.pass as u64) * UNITS_PER_PASS
-        + (u.frame as u64) * (IDXS_PER_FRAME as u64)
-        + (u.idx as u64)
+        + (u.idx as u64) * (N_FRAMES as u64)
+        + (u.frame as u64)
 }
 
 /// The flat unit range `[start, end)` a block index owns.
@@ -163,13 +181,16 @@ mod tests {
     }
 
     #[test]
-    fn enumeration_order_is_idx_then_frame_then_pass() {
+    fn enumeration_order_is_frame_then_idx_then_pass() {
+        // Breadth-first within a pass: `frame` increments fastest so the whole
+        // animation gets idx-0 coverage before any frame deepens to idx 1.
         // flat 0 = (frame 0, idx 0, pass 0)
         assert_eq!(flat_to_unit(0), Unit { frame: 0, idx: 0, pass: 0 });
-        // flat 1 = (frame 0, idx 1, pass 0)  -- idx increments fastest
-        assert_eq!(flat_to_unit(1), Unit { frame: 0, idx: 1, pass: 0 });
-        // flat 64 = (frame 1, idx 0, pass 0) -- frame increments next
-        assert_eq!(flat_to_unit(IDXS_PER_FRAME as u64), Unit { frame: 1, idx: 0, pass: 0 });
+        // flat 1 = (frame 1, idx 0, pass 0)  -- frame increments fastest
+        assert_eq!(flat_to_unit(1), Unit { frame: 1, idx: 0, pass: 0 });
+        // flat N_FRAMES = (frame 0, idx 1, pass 0) -- idx increments next, only
+        // after every frame has been touched at idx 0.
+        assert_eq!(flat_to_unit(N_FRAMES as u64), Unit { frame: 0, idx: 1, pass: 0 });
         // flat UNITS_PER_PASS = (frame 0, idx 0, pass 1) -- pass increments last
         assert_eq!(flat_to_unit(UNITS_PER_PASS), Unit { frame: 0, idx: 0, pass: 1 });
     }

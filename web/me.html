@@ -36,7 +36,6 @@
   <header>
     <div class="header-row">
       <h1>my key</h1>
-      <span id="world-picker" class="world-picker-host" title="choose a world"></span>
     </div>
     <p>
       your <em>key is your identity and your login</em>. there is no account and
@@ -63,11 +62,11 @@
       NOT the secret; the secret is the backup below.
     </p>
 
-    <h2>standing on this world</h2>
+    <h2>standing</h2>
     <p id="standing" class="muted">loading…</p>
     <p class="muted">
-      your key is shared across all worlds (same origin) — only credits,
-      reputation, and tiles differ per world. switch worlds with the picker above.
+      there is one shared flock. your credits, reputation, and tiles are the
+      same no matter which gateway node bridges your reads and writes.
     </p>
 
     <h2>export — back up this key</h2>
@@ -106,16 +105,13 @@
   <script type="module">
     // me.html — the wallet / user page. The Ed25519 key IS the identity and the
     // login (see identity.js / API.md). This page shows the user's derived name,
-    // public key, per-world standing, and lets them export (back up) / import
+    // public key, swarm standing, and lets them export (back up) / import
     // (log in as) the secret key.
 
     import { loadIdentity, exportKey, importKey } from './js/identity.js';
     import { handle } from './js/names.js';
-    import { mountWorldPicker } from './js/world-picker.js';
 
     const $ = (s) => document.querySelector(s);
-
-    mountWorldPicker('#world-picker');
 
     const me = await loadIdentity();
     $('#name').textContent = handle(me.pubHex);
@@ -131,7 +127,7 @@
     // The v3 node has no per-key standing read endpoint: credits/coverage are
     // log-derived and reported back on each write (POST /api/msg returns the
     // submitter's resulting `credits`). So standing surfaces in the flock page
-    // as you contribute; here we just confirm the key + world.
+    // as you contribute; here we just confirm the key.
     $('#standing').innerHTML =
       `<span class="muted">credits are earned by contributing renders on the ` +
       `flock page; the node reports your balance on each accepted submission.</span>`;

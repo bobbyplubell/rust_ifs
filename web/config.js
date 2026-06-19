@@ -5,33 +5,33 @@
 // signed Envelopes to /api/msg (renders / votes / births). No WebSocket, no
 // SSE, no libp2p in the browser (the node bridges writes into the swarm).
 //
-// GATEWAY SELECTION -----------------------------------------------------------
-// There is ONE swarm (one shared flock). The "worlds" list is really a list of
-// GATEWAY NODES into that single swarm — relay1 and relay2 are cross-bootstrapped
-// peers that converge on the same flock (via gossip + flock-sync), so whichever
-// you talk to shows the same sheep. The picker just chooses which node bridges
-// your reads/writes (handy as a fallback if one gateway is down). The active
-// gateway is resolved, in order:
-//   1. `?world=<url>` query param — a shareable deep-link to a specific gateway,
-//   2. localStorage (`sheep-world`) — the user's last pick, persisted,
-//   3. the first WORLDS entry — the default.
-// A `?world=` value is also written back to localStorage so it sticks.
-//
-// The IDENTITY (the Ed25519 key in identity.js) is SHARED across gateways —
-// same Pages origin, same localStorage key — and since it's one swarm your
-// credits / reputation / tiles are the same whichever gateway you use.
+// ONE SWARM, MANY GATEWAYS ----------------------------------------------------
+// There is exactly ONE swarm (one shared flock). The GATEWAYS below are NOT
+// separate worlds — they are redundant GATEWAY NODES into that single swarm.
+// relay1 and relay2 are cross-bootstrapped peers that converge on the same
+// flock (via gossip + flock-sync), so whichever you talk to shows the same
+// sheep, and your identity / credits / reputation / tiles are the same through
+// any of them (same Pages origin → same localStorage key → same Ed25519 key).
+// The list is just an ordered set of entry points for transparent failover.
 //
 // COORDINATOR is the resolved API base URL — everything in API.md hangs off
-// `${COORDINATOR}/api/...`.
+// `${COORDINATOR}/api/...`. It resolves, in order:
+//   1. `?world=<url>` query param — a HIDDEN debug override (not surfaced in the
+//      UI); written through to localStorage so it sticks across reloads,
+//   2. localStorage (`sheep-world`) — a previously-set debug override,
+//   3. localhost gateway when the page itself is served from localhost (dev),
+//   4. the first GATEWAYS entry — the default primary.
 
-// Gateway nodes into the one shared swarm. relay1 is primary; relay2 is a mirror
-// (same flock behind both). 'Local dev' is last so the deployed Pages client
-// defaults to the primary gateway; a localhost page still auto-picks dev below.
-export const WORLDS = [
-  { name: 'Flock (relay1)', url: 'https://relay.proof-of-sheep.com' },   // primary gateway — the one shared swarm
-  { name: 'Flock (relay2)', url: 'https://relay2.proof-of-sheep.com' },  // mirror gateway — same swarm, same flock
-  { name: 'Local dev', url: 'http://localhost:8080' },
+// Ordered gateway endpoints into the one shared swarm. First is primary; the
+// rest are mirrors for failover (same flock behind all of them). The localhost
+// gateway is only used when the page is itself served from localhost (./dev.sh).
+export const GATEWAYS = [
+  'https://relay.proof-of-sheep.com',   // primary gateway — the one shared swarm
+  'https://relay2.proof-of-sheep.com',  // mirror gateway — same swarm, same flock
 ];
+
+// Dev gateway: auto-selected only when the page is served from localhost.
+const LOCAL_GATEWAY = 'http://localhost:8080';
 
 const WORLD_LS_KEY = 'sheep-world';
 
@@ -39,8 +39,17 @@ function normalize(url) {
   return String(url || '').trim().replace(/\/+$/, '');
 }
 
-/** Resolve the active coordinator URL: ?world= → localStorage → first WORLDS. */
-export function resolveWorld() {
+function onLocalhost() {
+  const h = location.hostname;
+  return h === 'localhost' || h === '127.0.0.1' || h === '';
+}
+
+/**
+ * Resolve the active gateway URL into the one shared swarm:
+ *   ?world= (hidden debug override) → localStorage → localhost (dev) → primary.
+ * A `?world=` value is written through to localStorage so it persists.
+ */
+function resolveGateway() {
   const param = normalize(new URLSearchParams(location.search).get('world'));
   if (param) {
     try { localStorage.setItem(WORLD_LS_KEY, param); } catch { /* private mode */ }
@@ -49,22 +58,11 @@ export function resolveWorld() {
   let stored = null;
   try { stored = normalize(localStorage.getItem(WORLD_LS_KEY)); } catch { /* ignore */ }
   if (stored) return stored;
-  // Host-aware default: a page served from localhost (./dev.sh) defaults to the
-  // local coordinator; the deployed Pages client defaults to the first real world.
-  const h = location.hostname;
-  if (h === 'localhost' || h === '127.0.0.1' || h === '') {
-    const dev = WORLDS.find((w) => /localhost|127\.0\.0\.1/.test(w.url));
-    if (dev) return normalize(dev.url);
-  }
-  return normalize(WORLDS[0].url);
-}
-
-/** Persist a chosen world URL (the picker calls this, then reloads). */
-export function setWorld(url) {
-  const u = normalize(url);
-  try { localStorage.setItem(WORLD_LS_KEY, u); } catch { /* ignore */ }
-  return u;
+  // A page served from localhost (./dev.sh) defaults to the local gateway; the
+  // deployed Pages client defaults to the primary gateway.
+  if (onLocalhost()) return normalize(LOCAL_GATEWAY);
+  return normalize(GATEWAYS[0]);
 }
 
 // The resolved API base URL for this page load.
-export const COORDINATOR = resolveWorld();
+export const COORDINATOR = resolveGateway();

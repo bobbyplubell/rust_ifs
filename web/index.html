@@ -10,7 +10,18 @@
   <header>
     <div class="header-row">
       <h1>electric sheep</h1>
-      <span id="world-picker" class="world-picker-host" title="choose a world"></span>
+      <!-- ONE global contribute toggle + live stats. Contribution is global: the
+           shared loop pulls /api/assign, which hands out work across the whole
+           flock — there is no per-sheep contribute. -->
+      <div id="contribute-panel">
+        <button id="contribute" title="pledge idle CPU to render the flock — accepted tiles earn credits to spend on selection">contribute</button>
+        <span id="contrib-stats" class="contrib-stats">
+          <span>rendered: <b id="stat-rendered">0</b></span>
+          <span>accepted: <b id="stat-accepted">0</b></span>
+          <span>credits: <b id="stat-credits">0</b></span>
+        </span>
+        <span id="contrib-status" class="contrib-status">idle</span>
+      </div>
     </div>
     <p>
       a shepherdless flock, voting by <em>proof of sheep</em> —

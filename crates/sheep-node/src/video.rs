@@ -95,14 +95,38 @@ fn encode_video(
     let work_dir = data_dir.join("video");
     std::fs::create_dir_all(&work_dir).map_err(|e| format!("mkdir video: {e}"))?;
 
-    // One concatenated rawvideo file: missing frames are zero-filled so the
-    // stream stays exactly `n_frames * frame_bytes` and the loop length holds.
+    // Boomerang playback (§5 graceful partial render): while not every frame has
+    // rendered yet, do NOT emit blank/zero frames (an ugly black flash). Instead
+    // play the rendered frames FORWARD then BACK (ping-pong), so the loop stays
+    // smooth over only the content that exists. Once ALL frames are present we
+    // emit a plain forward loop — a complete flame animation is authored to loop
+    // frame 127 -> 0 seamlessly, so a boomerang would just slow it down.
+    let present: Vec<u32> = (0..n_frames)
+        .filter(|f| frames.rgba.get(f).is_some_and(|r| r.len() == frame_bytes))
+        .collect();
+    if present.is_empty() {
+        return Err("no rendered frames to encode".into());
+    }
+    let order: Vec<u32> = if present.len() == n_frames as usize {
+        present.clone() // complete: forward loop
+    } else if present.len() > 2 {
+        // forward over rendered frames, then back DOWN excluding the two
+        // endpoints (so the first/last frame isn't duplicated at the loop seam).
+        let mut o = present.clone();
+        o.extend(present[1..present.len() - 1].iter().rev().copied());
+        o
+    } else {
+        present.clone() // 1-2 frames: nothing to ping-pong, just loop them
+    };
+
+    // One concatenated rawvideo file in playback order; ffmpeg infers the frame
+    // count from the byte length. Every `order` entry is `present`-filtered, so
+    // each lookup is a full-length frame (no zero-fill).
     let raw_path = work_dir.join(format!("{sheep_id}.raw"));
-    let mut stream = Vec::with_capacity(frame_bytes * n_frames as usize);
-    for f in 0..n_frames {
-        match frames.rgba.get(&f) {
-            Some(rgba) if rgba.len() == frame_bytes => stream.extend_from_slice(rgba),
-            _ => stream.extend(std::iter::repeat(0u8).take(frame_bytes)),
+    let mut stream = Vec::with_capacity(frame_bytes * order.len());
+    for f in &order {
+        if let Some(rgba) = frames.rgba.get(f) {
+            stream.extend_from_slice(rgba);
         }
     }
     std::fs::write(&raw_path, &stream).map_err(|e| format!("write raw stream: {e}"))?;

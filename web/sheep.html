@@ -53,8 +53,16 @@
     <span id="sheep-id" class="id"></span>
     <span id="samples" class="id"></span>
     <span id="tiles" class="id"></span>
-    <span id="credits" class="id"></span>
+    <!-- ONE global contribute toggle + live stats (same shared loop as the flock
+         page). Contribution is global — it renders work for the whole flock, not
+         just this sheep — so there is no per-sheep contribute here. -->
     <button id="contribute">contribute</button>
+    <span id="contrib-stats" class="id">
+      rendered: <b id="stat-rendered">0</b> ·
+      accepted: <b id="stat-accepted">0</b> ·
+      credits: <b id="stat-credits">0</b>
+    </span>
+    <span id="contrib-status" class="id">idle</span>
     <a id="back" href="index.html">← flock</a>
   </div>
 
@@ -63,8 +71,10 @@
     //
     // Plays the node's MERGED LOOP VIDEO (/api/video/:id). Shows the lineage
     // line, coverage/vitality stats, an optional per-frame coverage heat grid
-    // (from /api/sheep/:id frames_coverage), and a contribute button that drives
-    // the /assign → WASM pool → POST /api/msg loop pinned to THIS sheep.
+    // (from /api/sheep/:id frames_coverage), and the GLOBAL contribute toggle —
+    // the same shared /assign → WASM pool → POST /api/msg loop the flock page
+    // runs. Contribution is global: it renders work for the WHOLE flock (not
+    // just this sheep), so we cache every living sheep's genome below.
 
     import { WorkerPool } from './js/pool.js';
     import { loadIdentity } from './js/identity.js';
@@ -78,6 +88,10 @@
     let me, pool, contributor, contributing = false;
     let myCredits = 0;
     const genomeCache = new Map(); // sheepId -> { genomeJson, edge }
+
+    // Global contribute stats (this session) — mirror app.js.
+    let renderedTiles = 0, acceptedLocal = 0, confirmedTiles = -1;
+    let tilesPerCredit = 0, contribError = '';
 
     async function main() {
       if (!id) { $('#info').textContent = 'no ?id= given'; return; }
@@ -108,7 +122,29 @@
       renderStats(detail);
       renderCoverage(detail);
 
+      // Contribution is global, so cache every living sheep's genome (not just
+      // this one) — the shared loop renders whatever /api/assign hands out.
+      cacheFlockGenomes();
+
       wireContribute();
+    }
+
+    // Cache all living sheep genomes so the global contribute loop can render
+    // any assigned tile. Best-effort: a failure just leaves us with this sheep.
+    async function cacheFlockGenomes() {
+      try {
+        const flock = await api.getFlock();
+        for (const rec of flock.sheep || []) {
+          if (rec.genome) {
+            genomeCache.set(rec.id, {
+              genomeJson: JSON.stringify(rec.genome),
+              edge: rec.resolution || 384,
+            });
+          }
+        }
+      } catch (e) {
+        console.warn('flock genome cache failed:', e.message);
+      }
     }
 
     // ---- lineage line: "<p1> + <p2> : <name>" --------------------------------
@@ -170,18 +206,27 @@
       append(text(sheepName(rec), 'self'));
     }
 
-    // ---- stats: coverage + vitality ------------------------------------------
+    // ---- stats: density (samples) + confirmed tiles + vitality ---------------
     function renderStats(rec) {
-      if (typeof rec.accumulated_tiles === 'number') {
-        $('#samples').textContent = `${rec.accumulated_tiles.toLocaleString()} accumulated tiles`;
-      } else if (typeof rec.coverage === 'number') {
-        $('#samples').textContent = `${rec.coverage.toLocaleString()} tiles covered`;
+      // Density / quality: total accumulated samples + samples-per-pixel (the
+      // flam3-style quality metric), from the node accumulator (/api/sheep
+      // `samples` + `samples_per_pixel`). Falls back to empty on older nodes.
+      if (typeof rec.samples === 'number') {
+        const spp = typeof rec.samples_per_pixel === 'number'
+          ? ` · ${rec.samples_per_pixel.toFixed(1)}/px` : '';
+        $('#samples').textContent = `${rec.samples.toLocaleString()} samples${spp}`;
+      } else {
+        $('#samples').textContent = '';
       }
-      if (typeof rec.vitality === 'number') {
-        $('#tiles').textContent = `vitality ${rec.vitality.toFixed(2)}`;
-      } else if (rec.hall) {
-        $('#tiles').textContent = 'enshrined · perished';
-      }
+      // Tiles = CONFIRMED coverage (audited + accumulated by the swarm) — the
+      // SAME global metric the flock grid shows, so home and fullscreen agree.
+      // (Not the gateway's local `accumulated_tiles`, which is per-node and
+      // confusingly larger — that mismatch was the 1600-vs-464 discrepancy.)
+      const cov = typeof rec.coverage === 'number' ? rec.coverage : 0;
+      let t = `${cov.toLocaleString()} tiles`;
+      if (typeof rec.vitality === 'number') t += ` · vitality ${rec.vitality.toFixed(2)}`;
+      else if (rec.hall) t += ' · enshrined';
+      $('#tiles').textContent = t;
     }
 
     // ---- per-frame coverage heat grid ----------------------------------------
@@ -203,34 +248,73 @@
       });
     }
 
-    // ---- contribute (same loop as the flock) ---------------------------------
+    // ---- global contribute (the same shared loop as the flock page) ----------
     function wireContribute() {
-      $('#contribute').addEventListener('click', () => {
-        contributing = !contributing;
-        const btn = $('#contribute');
-        btn.classList.toggle('on', contributing);
-        btn.textContent = contributing ? 'contributing…' : 'contribute';
-        if (contributing) {
-          contributor = contributor || new Contributor(pool, me, api, {
-            genomeFor: (sid) => genomeCache.get(sid) || null,
-            onResult: (reply) => {
-              const items = reply?.results || [reply];
-              for (const it of items) {
-                if (it && typeof it.credits === 'number') showCredits(it.credits);
-              }
-            },
-            onError: (e) => console.warn('contribute:', e.message),
-          });
-          contributor.start();
-        } else {
-          contributor?.stop();
-        }
-      });
+      $('#contribute').addEventListener('click', toggleContribute);
+      renderContribStats();
     }
 
-    function showCredits(n) {
-      myCredits = n;
-      $('#credits').textContent = `${n} credit${n === 1 ? '' : 's'}`;
+    function toggleContribute() {
+      contributing = !contributing;
+      if (contributing) {
+        contributor = contributor || new Contributor(pool, me, api, {
+          genomeFor: (sid) => genomeCache.get(sid) || null,
+          onResult: onContribResult,
+          onError: (e) => {
+            contribError = e?.message || String(e);
+            console.warn('contribute:', contribError);
+            renderContribStats();
+          },
+        });
+        contribError = '';
+        contributor.start();
+      } else {
+        contributor?.stop();
+      }
+      renderContribStats();
+    }
+
+    // Parse a /api/msg reply (single object or { results:[...] }). Each item
+    // carries accepted/credits and — on newer nodes — confirmed_tiles (running
+    // total) + tiles_per_credit (e.g. 128). See app.js onContribResult.
+    function onContribResult(reply) {
+      contribError = '';
+      renderedTiles += 1; // one block rendered + submitted, accepted or not
+      const items = reply?.results || [reply];
+      for (const it of items) {
+        if (!it || typeof it !== 'object') continue;
+        if (typeof it.credits === 'number') myCredits = Math.max(myCredits, it.credits);
+        if (typeof it.tiles_per_credit === 'number') tilesPerCredit = it.tiles_per_credit;
+        if (typeof it.confirmed_tiles === 'number') {
+          confirmedTiles = Math.max(confirmedTiles, it.confirmed_tiles); // SET to max
+        } else if (it.accepted === true) {
+          acceptedLocal += 1; // older-node fallback
+        }
+      }
+      renderContribStats();
+    }
+
+    function acceptedCount() {
+      return confirmedTiles >= 0 ? confirmedTiles : acceptedLocal;
+    }
+
+    function renderContribStats() {
+      const btn = $('#contribute');
+      btn.classList.toggle('on', contributing);
+      btn.textContent = contributing ? 'contributing…' : 'contribute';
+
+      $('#stat-rendered').textContent = String(renderedTiles);
+      $('#stat-accepted').textContent = String(acceptedCount());
+
+      let credits = String(myCredits);
+      if (tilesPerCredit > 0 && confirmedTiles >= 0) {
+        credits += ` (${confirmedTiles % tilesPerCredit}/${tilesPerCredit} to next)`;
+      }
+      $('#stat-credits').textContent = credits;
+
+      const statusEl = $('#contrib-status');
+      statusEl.textContent = contribError ? `error: ${contribError}`
+        : contributing ? 'contributing — rendering…' : 'idle';
     }
 
     main().catch((err) => { console.error(err); $('#info').textContent = 'error: ' + (err?.message || err); });

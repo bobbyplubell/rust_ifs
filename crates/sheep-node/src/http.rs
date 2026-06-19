@@ -255,20 +255,34 @@ async fn get_sheep(State(st): State<HttpState>, AxPath(id): AxPath<String>) -> R
         }
     };
 
-    // Per-frame coverage (tile density) from the accumulator's merged frames.
-    let frames_coverage: Vec<usize> = {
+    // Per-frame coverage (tile density) + total sample count from the
+    // accumulator's merged frames. `total_count` is the sum of every folded
+    // tile's sample count (density), held in always-resident metadata (no buffer
+    // load), so this stays a cheap read cache.
+    let (frames_coverage, samples): (Vec<usize>, u64) = {
         let accum = st.accum.lock().unwrap();
-        (0..st.n_frames)
-            .map(|f| accum.tile_count(&id, f))
-            .collect()
+        let fc = (0..st.n_frames).map(|f| accum.tile_count(&id, f)).collect();
+        (fc, accum.total_count(&id))
     };
     let total_tiles: usize = frames_coverage.iter().sum();
+    // §1.1 density measure: mean samples per output pixel across the whole loop
+    // (`edge*edge` pixels per frame × `N_FRAMES` frames). Higher = the "solid
+    // object" flam3 parity the render-quality work targets. Guarded against a
+    // zero-edge (degenerate) sheep so we never divide by zero.
+    let total_pixels = (edge as u64) * (edge as u64) * (crate::spec::N_FRAMES as u64);
+    let samples_per_pixel = if edge > 0 && total_pixels > 0 {
+        samples as f64 / total_pixels as f64
+    } else {
+        0.0
+    };
 
     if let Some(o) = obj.as_object_mut() {
         o.insert("alive".into(), json!(true));
         o.insert("hall".into(), json!(false));
         o.insert("frames_coverage".into(), json!(frames_coverage));
         o.insert("accumulated_tiles".into(), json!(total_tiles));
+        o.insert("samples".into(), json!(samples));
+        o.insert("samples_per_pixel".into(), json!(samples_per_pixel));
         o.insert("frame_edge".into(), json!(edge));
     }
     ([snapshot_cache()], Json(obj)).into_response()
@@ -461,6 +475,14 @@ fn inject_json(r: &InjectResult) -> Value {
     let mut o = json!({
         "accepted": r.accepted,
         "credits": r.credits,
+        // The submitting key's running confirmed-tile total + the constant
+        // tile→credit rate (§3) — so a browser contributor can show "Accepted
+        // tiles" and its progress to the next credit
+        // (`confirmed_tiles % tiles_per_credit` toward the next, `confirmed_tiles
+        // / tiles_per_credit` earned). `tiles_per_credit` is the spec.rs constant
+        // (`TILES_PER_CREDIT`), emitted directly (it never varies per result).
+        "confirmed_tiles": r.confirmed_tiles,
+        "tiles_per_credit": crate::spec::TILES_PER_CREDIT,
     });
     if let Some(reason) = &r.reason {
         o["reason"] = json!(reason);

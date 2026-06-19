@@ -10,17 +10,22 @@ body {
 header { padding: 32px 0 8px; }
 h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: 0.04em; }
 
-/* header row: title on the left, world picker pushed to the right */
+/* header row: title on the left, the global contribute control pushed right */
 .header-row {
   display: flex; flex-wrap: wrap; align-items: baseline;
   justify-content: space-between; gap: 8px 16px;
 }
-/* the world <select> reuses the button look (border/colors) for skin parity */
-select.world-picker {
-  background: #0a0a0e; border: 1px solid #33334a; color: #b9b9d6;
-  font: inherit; font-size: 12px; padding: 1px 6px; cursor: pointer;
+/* the ONE global contribute toggle + live stats (rendered/accepted/credits +
+   a status line). Contribution is global — there is no per-sheep contribute. */
+#contribute-panel {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 12px;
+  font-size: 12px; color: #8d8da4;
 }
-select.world-picker:hover { border-color: #c8b06a; }
+#contribute-panel button.on { color: #cfe; border-color: #c8b06a; }
+.contrib-stats { display: inline-flex; gap: 10px; }
+.contrib-stats b { color: #d8d8e4; font-weight: 600; }
+.contrib-status { color: #7d7d92; }
+.contrib-status.err { color: #e0a0a0; }
 header p { color: #7d7d92; max-width: 64ch; }
 code { color: #b9b9d6; }
 em { color: #c8b06a; font-style: normal; }
