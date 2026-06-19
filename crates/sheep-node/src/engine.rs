@@ -1869,6 +1869,13 @@ impl Engine {
         let audits: Vec<Coverage> = self.audit_queue.drain(..).collect();
         for tile in audits {
             if let Some(env) = self.make_attestation(&tile, now_ms) {
+                // Apply our OWN attestation to our OWN engine too. `make_attestation`
+                // only BUILDS the signed envelope; without this the node confirms
+                // others' work only in its PEERS' views (via gossip), never its own,
+                // so the audits IT performs never update its `confirmed`/`earned_tiles`
+                // — and that's exactly what /api/msg's `confirmed_tiles` reads back, so
+                // a browser submitting to this gateway would see 0 confirmed forever.
+                self.apply_attestation(&env);
                 out.push(env);
             }
         }

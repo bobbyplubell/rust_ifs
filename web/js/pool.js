@@ -48,7 +48,7 @@ export class WorkerPool {
     // We bound it: terminate + respawn the stuck worker and settle the job as
     // {type:'timeout'} so the caller moves on. Generous so a slow phone rendering
     // a legit 200k-sample tile is never killed.
-    this._jobTimeoutMs = opts.jobTimeoutMs ?? 45_000;
+    this._jobTimeoutMs = opts.jobTimeoutMs ?? 20_000;
 
     this._workers = new Array(this.size);
     for (let i = 0; i < this.size; i++) this._spawn(i);
