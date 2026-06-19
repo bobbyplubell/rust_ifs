@@ -36,6 +36,8 @@
 //! Work is unbounded (passes never stop, §4), so block indices are unbounded
 //! too — there is always a surplus of open blocks vs. active clients.
 
+use sha2::{Digest, Sha256};
+
 use crate::spec::{BUNDLE_SIZE, IDXS_PER_FRAME, N_FRAMES};
 
 /// A canonical work unit inside one sheep: which animation `frame`, which
@@ -153,8 +155,15 @@ fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
 /// - `flock_cov`: `(sheep_hex, confirmed_coverage)` for every known sheep.
 /// - `total_coverage`: the flock-wide confirmed total (the §4.1 floor's input).
 /// - `claims`: live soft claims as `(block_wire_id, expiry_ms, claimant_pub)`.
+/// - `submitted`: per-sheep set of already-SUBMITTED units (`confirmed ∪
+///   unaudited`) as `(sheep_hex, {(frame, idx, pass)})`. A block whose every
+///   unit is already in this set is "done" and is SKIPPED — the frontier
+///   advances on submission, not on (slow) confirmation, so workers move to
+///   fresh tiles (incl. the next density pass) instead of re-rendering pending
+///   ones (the duplicate-work / "0 accepted" live bug).
 /// - `worker_pub`: the requesting worker (lowercase hex); a block this worker
-///   already holds is NOT skipped (it's reassignable to its own claimant).
+///   already holds is NOT skipped (it's reassignable to its own claimant). Also
+///   the source of this worker's per-sheep START OFFSET (see below).
 /// - `want`: max blocks to return.
 /// - `now_ms`: wall clock, for claim expiry.
 ///
@@ -162,12 +171,27 @@ fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
 /// §4.1 coverage cap (`!(enforce && cov > min_cov + COVERAGE_TOLERANCE)` where
 /// `enforce = total > COVERAGE_FLOOR`), ordered least-covered first, tie-broken by
 /// sheep hex for determinism. One block per eligible sheep — the first block index
-/// not held by ANOTHER live claimant (`expiry_ms > now && claimant != worker_pub`).
+/// (scanning upward from this worker's start offset) that is NOT done (every unit
+/// already submitted) AND NOT held by ANOTHER live claimant
+/// (`expiry_ms > now && claimant != worker_pub`).
+///
+/// **Per-worker start offset (Fix 2 — diverge concurrent workers).** Two browsers
+/// asking at the same instant must not be handed byte-identical blocks (the live
+/// bug: identical assigns → both render the same tiles → all but the first
+/// submitter's are duplicates → "rendered 200, accepted ~0"). So each sheep's scan
+/// begins at `offset = u64::from_le_bytes(sha256(worker_pub)[..8]) % BLOCK_SPREAD`,
+/// derived purely from the worker pubkey — deterministic (no rng/clock, so every
+/// node computes the same answer for a given worker → convergence holds) yet
+/// distinct per worker. Workers A and B thus start at different block indices and
+/// claim distinct work. Scanning still proceeds upward (with the done/claimed
+/// skips), wrapping is unnecessary because work is unbounded.
+///
 /// Loops are capped at 1_000_000 block indices to bound a pathological search.
 pub fn pick_blocks(
     flock_cov: &[(String, u64)],
     total_coverage: u64,
     claims: &[(String, u64, String)],
+    submitted: &[(String, std::collections::HashSet<(u32, u32, u32)>)],
     worker_pub: &str,
     want: usize,
     now_ms: u64,
@@ -196,12 +220,30 @@ pub fn pick_blocks(
             .any(|(w, exp, claimant)| w == wire && *exp > now_ms && claimant != worker_pub)
     };
 
+    // This worker's deterministic per-sheep start offset (Fix 2).
+    let start_offset = worker_offset(worker_pub);
+
     let mut out = Vec::new();
     for (sheep_hex, _) in &eligible {
         let Some(identity) = decode_hex_32(sheep_hex) else {
             continue;
         };
-        let mut block_index = 0u64;
+        // This sheep's already-submitted units (`confirmed ∪ unaudited`); a block
+        // is "done" when every one of its units is in here (Fix 1).
+        let done_units: Option<&std::collections::HashSet<(u32, u32, u32)>> = submitted
+            .iter()
+            .find(|(s, _)| s == *sheep_hex)
+            .map(|(_, set)| set);
+        let is_done = |block: BlockId| -> bool {
+            let Some(set) = done_units else { return false };
+            block_units(block)
+                .iter()
+                .all(|u| set.contains(&(u.frame, u.idx, u.pass)))
+        };
+
+        let mut block_index = start_offset;
+        // Bound the per-sheep scan from the offset (still 1_000_000 indices).
+        let scan_limit = start_offset.saturating_add(1_000_000);
         loop {
             if out.len() >= want {
                 return out;
@@ -210,14 +252,14 @@ pub fn pick_blocks(
                 sheep_identity: identity,
                 block_index,
             };
-            if !claimed_by_other(&block.to_wire()) {
+            if !is_done(block) && !claimed_by_other(&block.to_wire()) {
                 out.push(block);
                 // One block per least-covered sheep per pass keeps the
                 // hand-out spread across sheep; move to the next sheep.
                 break;
             }
             block_index += 1;
-            if block_index > 1_000_000 {
+            if block_index > scan_limit {
                 break;
             }
         }
@@ -226,6 +268,23 @@ pub fn pick_blocks(
         }
     }
     out
+}
+
+/// How many block indices a worker's start offset is spread across (Fix 2). A
+/// modest band: large enough that concurrent workers reliably diverge, small
+/// enough that a lone worker still starts within the low-density frontier (so it
+/// doesn't skip far ahead into sparse high blocks). 64 ≈ a handful of bundles.
+pub const BLOCK_SPREAD: u64 = 64;
+
+/// A worker's deterministic per-sheep block-scan start offset (Fix 2):
+/// `u64::from_le_bytes(sha256(worker_pub)[..8]) % BLOCK_SPREAD`. Pure — no rng,
+/// no clock — so every node derives the same offset for a given worker, keeping
+/// selection convergent while still diverging distinct workers.
+fn worker_offset(worker_pub: &str) -> u64 {
+    let digest = Sha256::digest(worker_pub.as_bytes());
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(head) % BLOCK_SPREAD
 }
 
 impl BlockId {
@@ -311,6 +370,12 @@ mod tests {
         hex_lower(&[b; 32])
     }
 
+    /// No submitted units anywhere — the empty "submitted" slice used by the
+    /// pre-Fix-1 tests (every block is still open).
+    fn no_submitted() -> Vec<(String, std::collections::HashSet<(u32, u32, u32)>)> {
+        Vec::new()
+    }
+
     #[test]
     fn pick_blocks_least_covered_first_and_skips_others_claims() {
         // Two sheep: `lo` (less covered) should be handed out before `hi`.
@@ -321,22 +386,24 @@ mod tests {
         // Total well under the floor → no §4.1 cap; both sheep are eligible.
         let flock_cov = vec![(hi.clone(), 50u64), (lo.clone(), 10u64)];
 
-        // `other` holds `lo:0` (live), so the worker must skip to `lo:1`.
-        let lo0 = BlockId { sheep_identity: [0x01; 32], block_index: 0 }.to_wire();
-        let claims = vec![(lo0, 10_000u64, other.to_string())];
+        // This worker's deterministic per-sheep scan offset (Fix 2).
+        let off = worker_offset(worker);
+        // `other` holds `lo:off` (live), so the worker must skip to `lo:off+1`.
+        let lo_off = BlockId { sheep_identity: [0x01; 32], block_index: off }.to_wire();
+        let claims = vec![(lo_off, 10_000u64, other.to_string())];
 
         // want=2 → one block per eligible sheep, least-covered (lo) first.
-        let out = pick_blocks(&flock_cov, 60, &claims, worker, 2, 1_000);
+        let out = pick_blocks(&flock_cov, 60, &claims, &no_submitted(), worker, 2, 1_000);
         assert_eq!(out.len(), 2);
-        // First is `lo`, and it skipped index 0 (held by another peer) → index 1.
+        // First is `lo`, and it skipped its offset block (held by another peer).
         assert_eq!(out[0].sheep_hex(), lo);
-        assert_eq!(out[0].block_index, 1, "must skip the other-claimed lo:0");
+        assert_eq!(out[0].block_index, off + 1, "must skip the other-claimed lo:off");
         // Second is the more-covered sheep `hi`, its first (unclaimed) block.
         assert_eq!(out[1].sheep_hex(), hi);
-        assert_eq!(out[1].block_index, 0);
+        assert_eq!(out[1].block_index, off);
 
         // `want` is respected: only the least-covered sheep's block.
-        let one = pick_blocks(&flock_cov, 60, &claims, worker, 1, 1_000);
+        let one = pick_blocks(&flock_cov, 60, &claims, &no_submitted(), worker, 1, 1_000);
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].sheep_hex(), lo);
     }
@@ -346,20 +413,113 @@ mod tests {
         let s = hex32(0x07);
         let worker = "me";
         let flock_cov = vec![(s.clone(), 0u64)];
-        let s0 = BlockId { sheep_identity: [0x07; 32], block_index: 0 }.to_wire();
+        let off = worker_offset(worker);
+        let s_off = BlockId { sheep_identity: [0x07; 32], block_index: off }.to_wire();
 
         // A claim the WORKER itself holds does not block its own reassignment.
-        let own = vec![(s0.clone(), 10_000u64, worker.to_string())];
-        let out = pick_blocks(&flock_cov, 0, &own, worker, 1, 1_000);
-        assert_eq!(out[0].block_index, 0, "own claim is not skipped");
+        let own = vec![(s_off.clone(), 10_000u64, worker.to_string())];
+        let out = pick_blocks(&flock_cov, 0, &own, &no_submitted(), worker, 1, 1_000);
+        assert_eq!(out[0].block_index, off, "own claim is not skipped");
 
         // An EXPIRED claim by another peer is also not a block.
-        let expired = vec![(s0, 500u64, "other".to_string())];
-        let out = pick_blocks(&flock_cov, 0, &expired, worker, 1, 1_000);
-        assert_eq!(out[0].block_index, 0, "expired claim is not skipped");
+        let expired = vec![(s_off, 500u64, "other".to_string())];
+        let out = pick_blocks(&flock_cov, 0, &expired, &no_submitted(), worker, 1, 1_000);
+        assert_eq!(out[0].block_index, off, "expired claim is not skipped");
 
         // Empty flock / zero want → nothing.
-        assert!(pick_blocks(&[], 0, &[], worker, 1, 1_000).is_empty());
-        assert!(pick_blocks(&flock_cov, 0, &[], worker, 0, 1_000).is_empty());
+        assert!(pick_blocks(&[], 0, &[], &no_submitted(), worker, 1, 1_000).is_empty());
+        assert!(pick_blocks(&flock_cov, 0, &[], &no_submitted(), worker, 0, 1_000).is_empty());
+    }
+
+    #[test]
+    fn pick_blocks_skips_fully_submitted_blocks_and_advances_frontier() {
+        // Fix 1: a block whose every unit is already submitted is "done" and is
+        // skipped; the next not-done block is returned (the frontier advances on
+        // submission, not on slow confirmation).
+        let s = hex32(0x09);
+        // A single worker with offset 0 keeps the indices easy to reason about:
+        // pick a worker pubkey whose offset is 0.
+        let worker = zero_offset_worker();
+        assert_eq!(worker_offset(&worker), 0, "test fixture worker must start at block 0");
+        let flock_cov = vec![(s.clone(), 0u64)];
+        let identity = [0x09u8; 32];
+
+        // Mark EVERY unit of block 0 as submitted → block 0 is done.
+        let mut set = std::collections::HashSet::new();
+        for u in block_units(BlockId { sheep_identity: identity, block_index: 0 }) {
+            set.insert((u.frame, u.idx, u.pass));
+        }
+        let submitted = vec![(s.clone(), set)];
+
+        let out = pick_blocks(&flock_cov, 0, &[], &submitted, &worker, 1, 1_000);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].block_index, 1, "block 0 fully submitted → advance to block 1");
+
+        // Now mark block 1 submitted too (in addition to block 0): frontier → 2.
+        let mut set2 = std::collections::HashSet::new();
+        for bi in [0u64, 1] {
+            for u in block_units(BlockId { sheep_identity: identity, block_index: bi }) {
+                set2.insert((u.frame, u.idx, u.pass));
+            }
+        }
+        let submitted2 = vec![(s.clone(), set2)];
+        let out2 = pick_blocks(&flock_cov, 0, &[], &submitted2, &worker, 1, 1_000);
+        assert_eq!(out2[0].block_index, 2, "blocks 0+1 submitted → advance to block 2");
+
+        // A PARTIALLY-submitted block 0 (one unit missing) is NOT done → returned.
+        let mut partial = std::collections::HashSet::new();
+        let units0 = block_units(BlockId { sheep_identity: identity, block_index: 0 });
+        for u in units0.iter().skip(1) {
+            partial.insert((u.frame, u.idx, u.pass));
+        }
+        let submitted_partial = vec![(s.clone(), partial)];
+        let out3 = pick_blocks(&flock_cov, 0, &[], &submitted_partial, &worker, 1, 1_000);
+        assert_eq!(out3[0].block_index, 0, "partially-submitted block is still open");
+    }
+
+    #[test]
+    fn pick_blocks_diverges_distinct_workers() {
+        // Fix 2: two distinct worker pubkeys get DIFFERENT first blocks for the
+        // same flock state (so concurrent browsers don't redundantly re-render
+        // the same tiles).
+        let s = hex32(0x11);
+        let flock_cov = vec![(s.clone(), 0u64)];
+
+        // Find two workers with distinct offsets (the common case; BLOCK_SPREAD
+        // is 64 so collisions are rare). Scan a few candidate pubkeys.
+        let mut a = None;
+        let mut b = None;
+        for i in 0u8..32 {
+            let w = format!("worker_{i}");
+            let off = worker_offset(&w);
+            match a {
+                None => a = Some((w, off)),
+                Some((_, oa)) if off != oa && b.is_none() => b = Some((w, off)),
+                _ => {}
+            }
+        }
+        let (wa, _) = a.unwrap();
+        let (wb, _) = b.expect("two workers with distinct offsets exist under BLOCK_SPREAD");
+
+        let out_a = pick_blocks(&flock_cov, 0, &[], &no_submitted(), &wa, 1, 1_000);
+        let out_b = pick_blocks(&flock_cov, 0, &[], &no_submitted(), &wb, 1, 1_000);
+        assert_eq!(out_a.len(), 1);
+        assert_eq!(out_b.len(), 1);
+        assert_ne!(
+            out_a[0].block_index, out_b[0].block_index,
+            "distinct workers must get distinct first blocks (Fix 2 divergence)"
+        );
+    }
+
+    /// A worker pubkey whose [`worker_offset`] is 0 (so block scans start at 0) —
+    /// found by trial so the frontier-advance test reasons about indices easily.
+    fn zero_offset_worker() -> String {
+        for i in 0u32..10_000 {
+            let w = format!("zero_{i}");
+            if worker_offset(&w) == 0 {
+                return w;
+            }
+        }
+        panic!("no zero-offset worker found");
     }
 }

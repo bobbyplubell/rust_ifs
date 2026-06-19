@@ -441,6 +441,45 @@ fn trusted_attestor_confirms() {
     assert!(eng2.coverage(&id) >= 1, "a single rep>=32 attestor confirms alone");
 }
 
+/// Fix 3 — the explicit mutual-trust path (a): a key in `trusted_keys` confirms
+/// a tile ALONE even with rep 0 and even though it is not the local node. This is
+/// the two-seed cold-start fix: each seed lists the OTHER's pubkey, so both seeds'
+/// attestations confirm immediately with no rep warm-up between them.
+#[test]
+fn trusted_key_confirms_alone_with_zero_rep() {
+    let local = key(1);
+    let mut eng = Engine::new(local.clone());
+    let minter = key(2);
+    let (m, id) = mint(&minter, 1_000_000, ResolutionTier::R384);
+    assert!(eng.apply(&m, 1000));
+    let h = "00".repeat(32);
+
+    // A peer that is NOT the local node and has rep 0, but is explicitly trusted
+    // (e.g. the other seed). Its lone attestation must confirm the tile.
+    let other_seed = key(77);
+    eng.add_trusted_key(pub_hex(&other_seed));
+    assert_eq!(eng.reputation_of(&pub_hex(&other_seed)), 0, "trusted key has earned no rep");
+
+    let submitter = key(3);
+    let cov = Coverage { sheep_id: id.clone(), frame: 0, idx: 0, pass: 0, hash: h.clone() };
+    assert!(eng.apply(&signed(proto::PROGRESS, &submitter, 1000, serde_json::to_value(&cov).unwrap()), 1000));
+    let att = Attestation { sheep_id: id.clone(), frame: 0, idx: 0, pass: 0, hash: h.clone() };
+    assert!(eng.apply(&signed(proto::ATTEST, &other_seed, 1000, serde_json::to_value(&att).unwrap()), 1000));
+    assert!(eng.coverage(&id) >= 1, "an explicitly-trusted rep-0 attestor confirms a tile alone");
+
+    // A NON-trusted rep-0 peer's lone attestation still does NOT confirm (the
+    // trust is explicit, not a blanket free pass).
+    let stranger = key(78);
+    let cov2 = Coverage { sheep_id: id.clone(), frame: 1, idx: 0, pass: 0, hash: h.clone() };
+    assert!(eng.apply(&signed(proto::PROGRESS, &stranger, 1000, serde_json::to_value(&cov2).unwrap()), 1000));
+    let att2 = Attestation { sheep_id: id.clone(), frame: 1, idx: 0, pass: 0, hash: h.clone() };
+    assert!(eng.apply(&signed(proto::ATTEST, &stranger, 1000, serde_json::to_value(&att2).unwrap()), 1000));
+    assert!(
+        eng.coverage(&id) < 2,
+        "an untrusted rep-0 attestor does not confirm (trust stays explicit)"
+    );
+}
+
 /// The quorum path (b): two distinct attestors whose rep SUMS to >= the quorum
 /// rep-sum confirm; two rep-0 keys do not.
 #[test]

@@ -64,10 +64,10 @@ fn founding_sheep_lives_its_decay_lifetime() {
             half_life: 8.0,
         },
         bootstrap_flock: 1,
-        ..WorldConfig::DEFAULT
+        ..WorldConfig::default()
     };
 
-    let mut engine = Engine::new_with_config(SigningKey::from_bytes(&[0x42; 32]), world);
+    let mut engine = Engine::new_with_config(SigningKey::from_bytes(&[0x42; 32]), &world);
 
     // Seed one founding sheep at t=0 with 5 self-votes (backing = 5). With
     // linear≈1/s decay, vitality = 5 − ~age_s, so it should be alive at a few
@@ -116,7 +116,7 @@ fn founding_sheep_lives_its_decay_lifetime() {
 fn derive_minted_never_hangs() {
     let world = WorldConfig {
         bootstrap_flock: 1,
-        ..WorldConfig::DEFAULT
+        ..WorldConfig::default()
     };
 
     // Sweep distinct minter keys (distinct pubkeys → distinct seed streams) and a
@@ -133,7 +133,7 @@ fn derive_minted_never_hangs() {
     ];
     for (k, now) in bases.iter().enumerate() {
         let mut engine =
-            Engine::new_with_config(SigningKey::from_bytes(&[(k as u8).wrapping_add(1); 32]), world);
+            Engine::new_with_config(SigningKey::from_bytes(&[(k as u8).wrapping_add(1); 32]), &world);
         // Mint a handful of founding sheep at this clock; time the whole batch and
         // bound the PER-SHEEP cost (the batch mints `count` distinct genomes).
         let count = 4usize;

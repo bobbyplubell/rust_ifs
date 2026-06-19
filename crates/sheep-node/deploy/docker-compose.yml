@@ -45,6 +45,9 @@ services:
       # merged frame buffers resident; the rest spill to /data/accum. Lets a node
       # fit ANY RAM budget. Default 128.
       SHEEP_ACCUM_RAM_MB: "${SHEEP_ACCUM_RAM_MB:-128}"
+      # Always-trusted attestor pubkeys (hex, comma/space-separated) — §6. Set each
+      # seed to the OTHER seed's signing key so both confirm immediately.
+      SHEEP_TRUSTED_KEYS: "${SHEEP_TRUSTED_KEYS:-}"
       # --- World personality (ARCHITECTURE v3 §2.2 decay + §3 economy) -------
       # Age-escalating backing-decay knobs (engine.rs DecayParams). Sandbox =
       # steep (small half-life, big quad); Gallery = gentle. Unset = code

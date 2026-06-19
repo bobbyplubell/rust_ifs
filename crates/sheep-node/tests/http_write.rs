@@ -76,7 +76,7 @@ async fn spawn_server(
     let t = mem_transport(&key);
     let h = tokio::spawn(async move {
         let _ =
-            run_on_transport_with(key, t, listen, vec![], rx, Some(serve), WorldConfig::DEFAULT)
+            run_on_transport_with(key, t, listen, vec![], rx, Some(serve), WorldConfig::default())
                 .await;
     });
     let base = format!("http://{http_addr}");

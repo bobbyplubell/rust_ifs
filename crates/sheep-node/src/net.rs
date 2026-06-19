@@ -300,7 +300,7 @@ pub async fn run(
     eprintln!("[node] peer_id={}", swarm.local_peer_id());
     // §2.2/§3 personality knobs (decay/hall/costs) are injected at construction;
     // the engine stays pure (config is data, the clock is still passed in).
-    let engine = Engine::new_with_config(signing_key, world);
+    let engine = Engine::new_with_config(signing_key, &world);
     // The control channel is unused by `main` (no programmatic shutdown), but
     // shares the loop body with the test path. The event loop dials + re-dials
     // the bootstrap addrs itself (robust to listen/dial ordering races).
@@ -332,7 +332,7 @@ pub async fn run_tcp_reporting(
         .boxed();
     let mut swarm = build_swarm(key, tcp)?;
     swarm.listen_on(listen).map_err(|e| NetError::Listen(e.to_string()))?;
-    let engine = Engine::new_with_config(signing_key, world);
+    let engine = Engine::new_with_config(signing_key, &world);
     event_loop(swarm, engine, bootstrap, rx, serve, world, Some(listen_tx)).await;
     Ok(())
 }
@@ -353,7 +353,7 @@ pub async fn run_on_transport(
         bootstrap,
         rx,
         None,
-        WorldConfig::DEFAULT,
+        WorldConfig::default(),
     )
     .await
 }
@@ -361,7 +361,7 @@ pub async fn run_on_transport(
 /// [`run_on_transport`] with an explicit server/accumulator [`ServeConfig`] and
 /// per-world [`WorldConfig`] (decay/hall/costs + seed bootstrap-flock size) —
 /// the HTTP integration test uses this to spawn the watch face in-process on a
-/// bound ephemeral port. Pass [`WorldConfig::DEFAULT`] for the engine defaults.
+/// bound ephemeral port. Pass [`WorldConfig::default()`] for the engine defaults.
 pub async fn run_on_transport_with(
     signing_key: SigningKey,
     transport: Boxed<(PeerId, StreamMuxerBox)>,
@@ -374,7 +374,7 @@ pub async fn run_on_transport_with(
     let key = libp2p_key(&signing_key);
     let mut swarm = build_swarm(key, transport)?;
     swarm.listen_on(listen).map_err(|e| NetError::Listen(e.to_string()))?;
-    let engine = Engine::new_with_config(signing_key, world);
+    let engine = Engine::new_with_config(signing_key, &world);
     event_loop(swarm, engine, bootstrap, rx, serve, world, None).await;
     Ok(())
 }
@@ -669,6 +669,23 @@ async fn event_loop(
     // `boot_task` returns, exactly as a render tick returns it.
     let mut engine_slot: Option<Engine> = None;
     let mut tick_task: Option<tokio::task::JoinHandle<(Engine, Vec<Envelope>)>> = None;
+    // §2.x population floor — anti-extinction replenishment. ONLY a founding seed
+    // (`bootstrap_flock > 0`, the same gate the boot-mint uses) maintains the
+    // floor; a non-seeding node (`bootstrap_flock == 0`, e.g. the mirror seed)
+    // must never auto-mint or the two seeds would double-mint. On each tick, if
+    // the live flock has dipped below `bootstrap_flock`, we re-mint enough fresh
+    // founding sheep to refill it (signed Mints that converge across the swarm).
+    //
+    // Minting derives genomes (CPU-heavy, like the boot-mint), so we do it on a
+    // blocking thread with the engine checked OUT — exactly as the boot-mint and
+    // render tick do — never on the reactor. The `floor_task` slot IS the
+    // in-flight guard: a tick that finds the engine already checked out (a render
+    // or a prior floor run in flight) simply doesn't start one, so two
+    // maintenance runs never overlap. Extinction is slow under the recalibrated
+    // decay, so a coarse 30s cadence is ample.
+    let mut floor_task: Option<tokio::task::JoinHandle<(Engine, Vec<Envelope>)>> = None;
+    const FLOOR_INTERVAL: Duration = Duration::from_secs(30);
+    let mut floor_tick = tokio::time::interval(FLOOR_INTERVAL);
     let mut pending_inbound: Vec<(Envelope, u64)> = Vec::new();
     // §5 heavy artifacts (PieceUploads) awaiting ingest into the accumulator —
     // both observed-from-gossip and this node's own renders. Buffered and drained
@@ -837,6 +854,58 @@ async fn event_loop(
                     }
                 }
             }
+            // ---- a §2.x floor-maintenance mint finished: merge the engine back,
+            // register the replenishment genomes, fold them into the persistent
+            // founding-republish set, and publish them — exactly as the boot-mint
+            // does its founding envelopes (they're signed Mint/Vote births that
+            // converge across the swarm, so the mirror seed + browsers learn the
+            // refilled flock via gossip/flock-sync with no special handling).
+            res = async { floor_task.as_mut().unwrap().await }, if floor_task.is_some() => {
+                floor_task = None;
+                match res {
+                    Ok((eng, refill_envs)) => {
+                        if !refill_envs.is_empty() {
+                            eprintln!(
+                                "[node] population floor: re-minted to refill the flock ({} envelopes)",
+                                refill_envs.len()
+                            );
+                        }
+                        // Register every new sheep's genome with the accumulator so
+                        // tonemap works as their tiles land (mirrors the boot-mint).
+                        if accumulate && !refill_envs.is_empty() {
+                            if let Some(accum) = accum.as_ref() {
+                                let mut acc = accum.lock().unwrap();
+                                for (id, entry) in eng.flock().iter() {
+                                    if registered.insert(id.clone()) {
+                                        acc.register_sheep(id, entry.genome.clone());
+                                    }
+                                }
+                            }
+                            refresh_read_state(&eng, read_state.as_ref(), now_ms());
+                        }
+                        // Add to the persistent founding set so the replenishment
+                        // births re-publish on every (re)formed mesh (FLOCK/VOTES
+                        // are never re-emitted by the engine), and publish now.
+                        if !refill_envs.is_empty() {
+                            founding_envs.extend(refill_envs.iter().cloned());
+                            if connected {
+                                for env in &refill_envs {
+                                    publish_env(&mut swarm, env);
+                                }
+                            }
+                            last_snapshot = snapshot(&eng);
+                            refresh_birth_cache(&eng, &mut birth_cache);
+                            refresh_assign_cache(&eng, &mut assign_cache);
+                        }
+                        engine_slot = Some(eng);
+                    }
+                    Err(e) => {
+                        eprintln!("floor-maintenance task panicked: {e}");
+                        // Engine is lost on panic; nothing safe to do but stop.
+                        return;
+                    }
+                }
+            }
             ev = swarm.select_next_some() => {
                 if let SwarmEvent::NewListenAddr { address, .. } = &ev {
                     // The full dialable multiaddr a peer/seed bootstraps off.
@@ -994,6 +1063,32 @@ async fn event_loop(
                 tick_task = Some(tokio::task::spawn_blocking(move || {
                     let out = eng.tick(now);
                     (eng, out)
+                }));
+            }
+            // §2.x population floor: a FOUNDING seed re-mints fresh sheep whenever
+            // the live flock dips below `bootstrap_flock`. Gated on `bootstrap_flock
+            // > 0` — the SAME condition the boot-mint uses (`accumulate &&
+            // world.bootstrap_flock > 0`, folded into `bootstrap_flock` above) — so
+            // a non-seeding node (mirror seed / worker) NEVER auto-mints and the two
+            // seeds can't double-mint. Requires the engine in hand (so we don't race
+            // a render: taking it here means no tick is running), no floor run
+            // already in flight (the in-flight guard — `floor_task.is_none()`), and
+            // the boot-mint complete (`boot_task.is_none()`, so we don't replenish
+            // while the initial founding mint is still building). The maintain_floor
+            // mint runs on a BLOCKING thread with the engine checked out — never on
+            // the reactor — exactly like the boot-mint and render tick.
+            _ = floor_tick.tick(), if bootstrap_flock > 0
+                && engine_slot.is_some()
+                && floor_task.is_none()
+                && tick_task.is_none()
+                && boot_task.is_none() =>
+            {
+                let mut eng = engine_slot.take().expect("engine present");
+                let now = now_ms();
+                let floor = bootstrap_flock;
+                floor_task = Some(tokio::task::spawn_blocking(move || {
+                    let envs = eng.maintain_floor(floor, 8, now);
+                    (eng, envs)
                 }));
             }
             _ = redial.tick(), if !connected => {
@@ -1154,6 +1249,7 @@ fn dispatch_control(
                         &assign_cache.flock_cov,
                         assign_cache.total_coverage,
                         &assign_cache.claims,
+                        &assign_cache.submitted,
                         &worker_pub,
                         want.max(1) as usize,
                         now,
@@ -1209,6 +1305,13 @@ struct AssignCache {
     total_coverage: u64,
     /// Live soft claims as `(block_wire_id, expiry_ms, claimant_pub)` (§4).
     claims: Vec<(String, u64, String)>,
+    /// Per-sheep already-SUBMITTED units (`confirmed ∪ unaudited`) as
+    /// `(sheep_hex, {(frame, idx, pass)})` — the frontier-advance input to
+    /// [`crate::block::pick_blocks`] (Fix 1). Cached so the render-window cache
+    /// path skips fully-submitted blocks exactly as the in-hand path does (i.e.
+    /// cache-path == in-hand: workers always advance to fresh tiles, never
+    /// re-render pending ones). Cheap to clone (per-sheep sets of pending tiles).
+    submitted: Vec<(String, std::collections::HashSet<(u32, u32, u32)>)>,
     /// §6 audit inputs: a capped snapshot of currently-unaudited tiles tagged
     /// with each submitter's reputation `(sheep, frame, idx, pass, submitter_rep)`,
     /// so the cache path can compute a worker's audit assignments via the SAME
@@ -1227,6 +1330,7 @@ fn refresh_assign_cache(engine: &Engine, cache: &mut AssignCache) {
     cache.flock_cov = engine.assign_inputs();
     cache.total_coverage = engine.total_coverage();
     cache.claims = engine.claim_inputs();
+    cache.submitted = engine.submitted_inputs();
     cache.audit_inputs = engine.audit_inputs();
     cache.round_salt = engine.round_salt().to_vec();
 }

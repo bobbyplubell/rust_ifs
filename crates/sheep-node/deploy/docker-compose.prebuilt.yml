@@ -24,6 +24,10 @@ services:
       # (lightweight node => small number). Default 128; on the 512 MB droplets we
       # set ~96 in the env file to leave room for render + gossip + OS.
       SHEEP_ACCUM_RAM_MB: "${SHEEP_ACCUM_RAM_MB:-128}"
+      # Always-trusted attestor pubkeys (hex, comma/space-separated) — §6. Set each
+      # seed to the OTHER seed's signing key so both confirm immediately (no rep
+      # warm-up between seeds). Empty = only self + earned-rep peers are trusted.
+      SHEEP_TRUSTED_KEYS: "${SHEEP_TRUSTED_KEYS:-}"
       # World personality (§2.2 decay + §3 economy), read from env by main.rs.
       SHEEP_DECAY_TIME_UNIT_MS: "${SHEEP_DECAY_TIME_UNIT_MS:-}"
       SHEEP_DECAY_BASE: "${SHEEP_DECAY_BASE:-}"

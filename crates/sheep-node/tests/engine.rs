@@ -192,11 +192,12 @@ fn assign_cache_path_yields_blocks_without_live_engine() {
     let flock_cov = eng.assign_inputs();
     let total = eng.total_coverage();
     let claims = eng.claim_inputs();
+    let submitted = eng.submitted_inputs();
     assert_eq!(flock_cov.len(), 2, "both sheep are in the cached flock-coverage");
 
     // A fresh browser worker, no live engine — the cache path must hand out work.
     let worker = pub_hex(&key(42));
-    let blocks = pick_blocks(&flock_cov, total, &claims, &worker, 4, 2000);
+    let blocks = pick_blocks(&flock_cov, total, &claims, &submitted, &worker, 4, 2000);
     assert!(
         !blocks.is_empty(),
         "assign yields blocks from the cache for a fresh worker on a non-empty flock"

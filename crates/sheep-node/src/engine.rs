@@ -330,6 +330,14 @@ pub struct Engine {
     /// auditor's correct attestations raise its. Read by [`sample_rate`] so
     /// trusted peers are audited lightly and new/zero-rep peers heavily.
     reputation: HashMap<String, u64>,
+    /// §6 **explicit always-trusted attestor keys** (lowercase hex), seeded from
+    /// [`WorldConfig::trusted_keys`]. A key here confirms a tile alone in
+    /// [`is_confirmed_by`] exactly as the local node does (subject to the same
+    /// slashed/banned exclusion), so two seeds that list each other confirm both
+    /// their tiles immediately at cold-start — no rep warm-up between seeds.
+    /// Empty by default (non-breaking: an engine built without trusted keys
+    /// behaves exactly as before).
+    trusted_keys: HashSet<String>,
     /// §6 keys banned by a propagated/observed slash (a superset of `slashed`;
     /// `slashed` is keys WE proved cheated, `banned` also includes ones learned
     /// via `RepDelta`). Both reject the key's traffic + retract its work.
@@ -496,7 +504,7 @@ impl HallThreshold {
 /// `Sandbox` = steep decay + cheap births (churny); `Gallery` = gentle decay +
 /// dearer births (curated). Sane defaults match the engine's own defaults so an
 /// unset env is a no-op rather than a surprise.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct WorldConfig {
     /// §2.2 age-escalating backing-decay personality.
     pub decay: DecayParams,
@@ -517,27 +525,45 @@ pub struct WorldConfig {
     /// thus bounded INDEPENDENT of flock/frame count. Only the serving/accumulator
     /// node holds an accumulator, so a plain worker ignores this.
     pub accum_ram_mb: usize,
+    /// §6 **explicit mutual-trust set** (lowercase-hex ed25519 pubkeys). Keys
+    /// here are treated as always-trusted attestors (alongside the local node),
+    /// so their lone attestation confirms a tile regardless of earned rep. The
+    /// fix for cold-start divergence between two seeds: configure each seed with
+    /// the OTHER seed's pubkey here (`SHEEP_TRUSTED_KEYS`) and BOTH seeds' tiles
+    /// confirm immediately — no rep warm-up between seeds, so their coverage
+    /// stays in lockstep instead of one seed confirming and the other lagging.
+    /// Empty by default (no extra trust beyond the local node), so unset env is
+    /// a no-op. Slashed/banned keys are still excluded by `is_confirmed_by`.
+    pub trusted_keys: HashSet<String>,
 }
 
 impl WorldConfig {
     /// The default world: the engine's own defaults (gentle/Gallery-ish decay,
-    /// spec.rs credit sinks) and a 4-sheep bootstrap flock.
-    pub const DEFAULT: WorldConfig = WorldConfig {
-        decay: DecayParams::DEFAULT,
-        hall: HallThreshold::DEFAULT,
-        vote_cost: VOTE_COST,
-        mint_cost: MINT_COST,
-        breed_cost: BREED_COST,
-        bootstrap_flock: 4,
-        // 128 MB resident merged-frame working set by default — comfortably holds
-        // a handful of full-frame R384 frames while bounding total RAM.
-        accum_ram_mb: 128,
-    };
+    /// spec.rs credit sinks) and a 4-sheep bootstrap flock, with an EMPTY
+    /// `trusted_keys` set (no extra trust beyond the local node). Provided as a
+    /// function rather than an associated `const` because `trusted_keys`
+    /// (`HashSet`) has no const empty constructor on this toolchain — call sites
+    /// use `WorldConfig::default()` (and `..WorldConfig::default()` for the
+    /// struct-update form).
+    pub fn default_config() -> WorldConfig {
+        WorldConfig {
+            decay: DecayParams::DEFAULT,
+            hall: HallThreshold::DEFAULT,
+            vote_cost: VOTE_COST,
+            mint_cost: MINT_COST,
+            breed_cost: BREED_COST,
+            bootstrap_flock: 4,
+            // 128 MB resident merged-frame working set by default — comfortably
+            // holds a handful of full-frame R384 frames while bounding total RAM.
+            accum_ram_mb: 128,
+            trusted_keys: HashSet::new(),
+        }
+    }
 }
 
 impl Default for WorldConfig {
     fn default() -> Self {
-        WorldConfig::DEFAULT
+        WorldConfig::default_config()
     }
 }
 
@@ -568,6 +594,7 @@ impl Engine {
             retracted_hashes: HashSet::new(),
             disputed_tiles: HashSet::new(),
             reputation: HashMap::new(),
+            trusted_keys: HashSet::new(),
             banned: HashSet::new(),
             round_salt: DEFAULT_ROUND_SALT.to_vec(),
             honeypots: HashMap::new(),
@@ -598,19 +625,29 @@ impl Engine {
     /// Construct an engine and apply a per-world [`WorldConfig`] (decay, hall,
     /// credit sinks). The `bootstrap_flock` field is *not* consumed here — that
     /// is the transport's wall-clock-driven boot step ([`Engine::bootstrap_seed_flock`]).
-    pub fn new_with_config(signing_key: SigningKey, cfg: WorldConfig) -> Self {
+    pub fn new_with_config(signing_key: SigningKey, cfg: &WorldConfig) -> Self {
         let mut e = Engine::new(signing_key);
-        e.apply_world_config(&cfg);
+        e.apply_world_config(cfg);
         e
     }
 
-    /// Apply the §2.2/§3 personality knobs from a [`WorldConfig`] in place.
+    /// Apply the §2.2/§3 personality knobs from a [`WorldConfig`] in place,
+    /// including the §6 explicit `trusted_keys` mutual-trust set.
     pub fn apply_world_config(&mut self, cfg: &WorldConfig) {
         self.decay = cfg.decay;
         self.hall_threshold = cfg.hall;
         self.vote_cost = cfg.vote_cost;
         self.mint_cost = cfg.mint_cost;
         self.breed_cost = cfg.breed_cost;
+        // §6 mutual trust: keys we will treat as always-trusted attestors (the
+        // other seed's pubkey, typically) so both seeds confirm at cold-start.
+        self.trusted_keys = cfg.trusted_keys.clone();
+    }
+
+    /// Add an explicit always-trusted attestor key (§6) at runtime / in tests —
+    /// equivalent to listing it in [`WorldConfig::trusted_keys`]. Lowercase hex.
+    pub fn add_trusted_key(&mut self, key: impl Into<String>) {
+        self.trusted_keys.insert(key.into());
     }
 
     /// Override the §3 per-world credit sinks (base costs at the R384 tier).
@@ -926,10 +963,31 @@ impl Engine {
             &self.assign_inputs(),
             self.total_coverage(),
             &self.claim_inputs(),
+            &self.submitted_inputs(),
             worker_pub,
             want,
             now_ms,
         )
+    }
+
+    /// Per-sheep **submitted** units (`confirmed ∪ unaudited`) as
+    /// `(sheep_hex, {(frame, idx, pass)})` — the frontier-advance input to
+    /// [`crate::block::pick_blocks`] (Fix 1). A block whose every unit is in this
+    /// set has already been SUBMITTED for that sheep (even if not yet confirmed),
+    /// so `pick_blocks` skips it and hands the worker the next fresh block instead
+    /// of having it redundantly re-render a pending tile. Cloned cheaply (per-sheep
+    /// sets of the flock's currently-pending tiles; the flock is small); the run
+    /// loop caches this for the §10 assign render-window fallback so the cache path
+    /// stays byte-identical to the in-hand one.
+    pub fn submitted_inputs(&self) -> Vec<(String, HashSet<(u32, u32, u32)>)> {
+        let mut out: HashMap<String, HashSet<(u32, u32, u32)>> = HashMap::new();
+        for (sheep, set) in &self.confirmed {
+            out.entry(sheep.clone()).or_default().extend(set.iter().copied());
+        }
+        for (sheep, set) in &self.unaudited {
+            out.entry(sheep.clone()).or_default().extend(set.iter().copied());
+        }
+        out.into_iter().collect()
     }
 
     /// `(sheep_hex, confirmed_coverage)` for every known sheep — the flock-coverage
@@ -1449,7 +1507,9 @@ impl Engine {
     /// Confirmed iff EITHER:
     /// - **(a) trusted-attestor path:** at least one valid attestor is the LOCAL
     ///   node (`self.self_pub`, always trusted — preserves the gateway/seed
-    ///   confirmation path) OR has `reputation_of(attestor) >= TRUSTED_ATTESTOR_REP`; OR
+    ///   confirmation path), OR is in the explicit `trusted_keys` mutual-trust set
+    ///   (§6, e.g. the other seed's pubkey — confirms at cold-start with rep 0),
+    ///   OR has `reputation_of(attestor) >= TRUSTED_ATTESTOR_REP`; OR
     /// - **(b) quorum path:** there are `>= CONFIRM_QUORUM` distinct valid
     ///   attestors AND the SUM of their `reputation_of(...)` is `>= CONFIRM_QUORUM_REP_SUM`.
     ///
@@ -1469,8 +1529,12 @@ impl Engine {
                 continue;
             }
             // (a) trusted-attestor path: the local node is always trusted (the
-            // gateway/seed confirmation path), else a peer at/above the bar.
-            if a == &self.self_pub || self.reputation_of(a) >= TRUSTED_ATTESTOR_REP {
+            // gateway/seed confirmation path), as is any explicitly-configured
+            // mutual-trust key (§6 — the other seed), else a peer at/above the bar.
+            if a == &self.self_pub
+                || self.trusted_keys.contains(a)
+                || self.reputation_of(a) >= TRUSTED_ATTESTOR_REP
+            {
                 return true;
             }
             distinct += 1;
@@ -1694,6 +1758,48 @@ impl Engine {
             }
         }
         out
+    }
+
+    /// §2.x **population floor — anti-extinction replenishment.** Guarantee the
+    /// LIVE flock never empties: if fewer than `floor` sheep are alive at
+    /// `now_ms`, mint exactly enough FRESH founding sheep to bring the live count
+    /// back up to `floor`, returning their signed Mint/Vote envelopes (ready to
+    /// publish — they are applied locally here too).
+    ///
+    /// This does NOT override "loved or dead" (§2.2): individual sheep still
+    /// decay and die on their own merits, and an over-floor flock is left
+    /// untouched. The floor only protects the POPULATION — without it a fully
+    /// decayed world spirals dead (no sheep → nothing to render → no
+    /// contribution → no new mints), leaving an empty gallery. With it, a seed
+    /// silently re-mints a fresh founding cohort the moment the live count dips
+    /// below `floor`, so there is always something live to watch and build on.
+    ///
+    /// Pure-ish (clock injected): the caller passes the real `now_ms`. Reuses
+    /// [`bootstrap_seed_flock`] for the actual minting, so the replenishment
+    /// sheep are produced by exactly the same signed-Mint path as the boot flock
+    /// — distinct genomes (the per-sheep `now_micros + i` seed) and, because the
+    /// mint seed is wall-clock-derived, top-ups at different `now_ms` yield
+    /// distinct identities (no duplicate genomes across replenishments).
+    ///
+    /// Caller contract (transport): only a FOUNDING seed
+    /// (`world.bootstrap_flock > 0`) should call this, on a timer; a node that
+    /// never seeds (`bootstrap_flock == 0`, e.g. a mirror seed or a plain worker)
+    /// must NOT — otherwise two seeds double-mint. Returns `vec![]` (a no-op)
+    /// when the live flock already meets or exceeds `floor`.
+    pub fn maintain_floor(
+        &mut self,
+        floor: usize,
+        initial_backing: u64,
+        now_ms: u64,
+    ) -> Vec<Envelope> {
+        let live = self.live_flock(now_ms).len();
+        let need = floor.saturating_sub(live);
+        if need == 0 {
+            return Vec::new();
+        }
+        // Reuse the boot-mint path: signed Mints with deterministically-derived,
+        // per-sheep-distinct genomes, applied locally and returned for gossip.
+        self.bootstrap_seed_flock(need, initial_backing, now_ms)
     }
 
     // ---- contribute loop (§4 tick) ----------------------------------------

@@ -93,7 +93,7 @@ impl Drop for TempDir {
 fn small_world(bootstrap_flock: usize) -> WorldConfig {
     WorldConfig {
         bootstrap_flock,
-        ..WorldConfig::DEFAULT
+        ..WorldConfig::default()
     }
 }
 

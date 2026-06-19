@@ -52,7 +52,7 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
 fn world_config_from_env() -> WorldConfig {
     let d = DecayParams::DEFAULT;
     let h = HallThreshold::DEFAULT;
-    let base = WorldConfig::DEFAULT;
+    let base = WorldConfig::default();
     WorldConfig {
         decay: DecayParams {
             time_unit_ms: env_or("SHEEP_DECAY_TIME_UNIT_MS", d.time_unit_ms),
@@ -76,7 +76,25 @@ fn world_config_from_env() -> WorldConfig {
         // set; the rest spills to `data_dir/accum/`. Default 128 (bounds RAM
         // independent of flock size). Only the serving/accumulator node uses it.
         accum_ram_mb: env_or("SHEEP_ACCUM_RAM_MB", base.accum_ram_mb),
+        // §6 explicit mutual-trust attestor keys: a comma/space-separated list of
+        // lowercase-hex ed25519 pubkeys treated as always-trusted (so their lone
+        // attestation confirms a tile). Configure each seed with the OTHER seed's
+        // pubkey so BOTH seeds confirm at cold-start without rep warm-up between
+        // them (the two-seed coverage-divergence fix). Empty/unset → no extra
+        // trust beyond the local node (a no-op, matching prior behavior).
+        trusted_keys: parse_trusted_keys(&std::env::var("SHEEP_TRUSTED_KEYS").unwrap_or_default()),
     }
+}
+
+/// Parse `SHEEP_TRUSTED_KEYS` (§6): comma- and/or whitespace-separated
+/// lowercase-hex ed25519 pubkeys. Tokens are lowercased and length-validated
+/// (64 hex chars); anything malformed is silently dropped so a stray separator
+/// or comment can't take the node down. Empty input → empty set (no-op).
+fn parse_trusted_keys(raw: &str) -> std::collections::HashSet<String> {
+    raw.split(|c: char| c == ',' || c.is_whitespace())
+        .map(|t| t.trim().to_ascii_lowercase())
+        .filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit()))
+        .collect()
 }
 
 fn parse_key_hex(s: &str) -> Option<SigningKey> {
