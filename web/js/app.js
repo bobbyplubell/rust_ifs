@@ -48,6 +48,7 @@ const selected = [];          // up to 2 sheepIds picked for breeding
 
 async function main() {
   me = await loadIdentity();
+  loadContribStats();   // restore this browser's contribute totals across reloads
   pool = new WorkerPool();
   pool.onStatus = (status, detail) => {
     if (status === 'failed') setStatus(`renderer failed to load: ${detail || ''}`);
@@ -201,6 +202,32 @@ async function doVote(sheepId) {
 // for the whole app (one toggle, one Contributor instance), driven from the
 // header control — never per sheep.
 
+// Persist this browser's contribute totals across reloads, keyed by identity so
+// the counters don't reset to 0 on refresh. The node remains authoritative —
+// `credits`/`confirmed_tiles` from any /api/msg reply overwrite these (via max),
+// and tiles confirmed while the tab was closed appear on the next contribution.
+function contribStoreKey() { return `sheep-contrib-${me?.pubHex || 'anon'}`; }
+
+function loadContribStats() {
+  try {
+    const s = JSON.parse(localStorage.getItem(contribStoreKey()) || '{}');
+    if (Number.isFinite(s.rendered)) renderedTiles = s.rendered;
+    if (Number.isFinite(s.accepted)) acceptedLocal = s.accepted;
+    if (Number.isFinite(s.confirmed)) confirmedTiles = s.confirmed;
+    if (Number.isFinite(s.credits)) myCredits = s.credits;
+    if (Number.isFinite(s.tilesPerCredit)) tilesPerCredit = s.tilesPerCredit;
+  } catch { /* corrupt/absent — start fresh */ }
+}
+
+function saveContribStats() {
+  try {
+    localStorage.setItem(contribStoreKey(), JSON.stringify({
+      rendered: renderedTiles, accepted: acceptedLocal,
+      confirmed: confirmedTiles, credits: myCredits, tilesPerCredit,
+    }));
+  } catch { /* private mode / quota — non-fatal */ }
+}
+
 function wireContribute() {
   const btn = $('#contribute');
   if (btn) btn.addEventListener('click', toggleContribute);
@@ -255,6 +282,7 @@ function onContribResult(reply) {
     }
   }
 
+  saveContribStats();
   renderContribStats();
   refreshAllCards();
   setStatus();

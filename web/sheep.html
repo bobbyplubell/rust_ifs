@@ -96,6 +96,7 @@
     async function main() {
       if (!id) { $('#info').textContent = 'no ?id= given'; return; }
       me = await loadIdentity();
+      loadContribStats();   // restore contribute totals across reloads (shared w/ flock page)
       pool = new WorkerPool();
 
       $('#sheep-id').textContent = id;
@@ -291,11 +292,35 @@
           acceptedLocal += 1; // older-node fallback
         }
       }
+      saveContribStats();
       renderContribStats();
     }
 
     function acceptedCount() {
       return confirmedTiles >= 0 ? confirmedTiles : acceptedLocal;
+    }
+
+    // Persist/restore contribute totals across reloads, keyed by identity and
+    // SHARED with the flock page (same localStorage key as app.js). The node
+    // stays authoritative — replies overwrite via max.
+    function contribStoreKey() { return `sheep-contrib-${me?.pubHex || 'anon'}`; }
+    function loadContribStats() {
+      try {
+        const s = JSON.parse(localStorage.getItem(contribStoreKey()) || '{}');
+        if (Number.isFinite(s.rendered)) renderedTiles = s.rendered;
+        if (Number.isFinite(s.accepted)) acceptedLocal = s.accepted;
+        if (Number.isFinite(s.confirmed)) confirmedTiles = s.confirmed;
+        if (Number.isFinite(s.credits)) myCredits = s.credits;
+        if (Number.isFinite(s.tilesPerCredit)) tilesPerCredit = s.tilesPerCredit;
+      } catch { /* corrupt/absent */ }
+    }
+    function saveContribStats() {
+      try {
+        localStorage.setItem(contribStoreKey(), JSON.stringify({
+          rendered: renderedTiles, accepted: acceptedLocal,
+          confirmed: confirmedTiles, credits: myCredits, tilesPerCredit,
+        }));
+      } catch { /* private mode / quota */ }
     }
 
     function renderContribStats() {
