@@ -11,7 +11,7 @@
 //                      with {type:'cancelled'} either way.
 
 export class WorkerPool {
-  constructor(size) {
+  constructor(size, opts = {}) {
     // Rendering is embarrassingly parallel across batches, so more workers =
     // proportionally faster accumulation. The old flat cap of 4 left cores idle
     // on capable machines. Raise the cap only where it's safe: gate on
@@ -41,6 +41,14 @@ export class WorkerPool {
     this._readyTimeoutMs = 20_000;
     this._maxAttempts = 5;     // respawn attempts per slot before giving up
     this._backoffMs = [500, 1000, 2000, 4000, 8000];
+    // Per-job render timeout. A pathological tile can drive the chaos game into a
+    // non-terminating path; the worker is then stuck in a SYNCHRONOUS wasm loop
+    // and will never process a {type:'cancel'} message, so `handle.done` would
+    // hang forever and freeze a caller that awaits it (e.g. the contribute loop).
+    // We bound it: terminate + respawn the stuck worker and settle the job as
+    // {type:'timeout'} so the caller moves on. Generous so a slow phone rendering
+    // a legit 200k-sample tile is never killed.
+    this._jobTimeoutMs = opts.jobTimeoutMs ?? 45_000;
 
     this._workers = new Array(this.size);
     for (let i = 0; i < this.size; i++) this._spawn(i);
@@ -194,7 +202,29 @@ export class WorkerPool {
       job.slot = slot;
       this.running++;
       slot.worker.postMessage(job.message);
+      // Bound this job's wall-clock so a hung render can't freeze the caller.
+      job._timer = setTimeout(() => this._onJobTimeout(slot, job), this._jobTimeoutMs);
     }
+    this._stats();
+  }
+
+  // A job exceeded its render budget — almost certainly a worker stuck in a
+  // synchronous wasm loop (which can't honor a cancel message). Terminate +
+  // respawn the worker and settle the job as {type:'timeout'} so the awaiting
+  // caller continues. (NOT re-queued — re-running the same hanging tile would
+  // just hang again.)
+  _onJobTimeout(slot, job) {
+    if (job.settled || slot.job !== job) return;
+    job._timer = null;
+    job.settled = true;
+    job.slot = null;
+    this.running--;
+    slot.job = null;
+    if (slot.worker) { try { slot.worker.terminate(); } catch { /* already gone */ } slot.worker = null; }
+    job._resolve({ type: 'timeout', jobId: job.id });
+    // Fresh worker in this slot (attempts reset — a job hang isn't a load fault).
+    slot.attempts = 0;
+    this._spawn(slot.index);
     this._stats();
   }
 
@@ -232,10 +262,13 @@ export class WorkerPool {
     const job = slot.job;
     slot.job = null;
     this.running--;
-    if (job && !job.settled) {
-      job.settled = true;
-      if (error) job._reject(error);
-      else job._resolve(result);
+    if (job) {
+      if (job._timer) { clearTimeout(job._timer); job._timer = null; }
+      if (!job.settled) {
+        job.settled = true;
+        if (error) job._reject(error);
+        else job._resolve(result);
+      }
     }
     this._pump();
   }
