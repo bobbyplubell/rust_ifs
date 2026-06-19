@@ -152,27 +152,43 @@ fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
 /// byte-identical to the in-hand one for the same inputs.
 ///
 /// Inputs (all engine-derived, so this stays a pure read with no engine state):
-/// - `flock_cov`: `(sheep_hex, confirmed_coverage)` for every known sheep.
-/// - `total_coverage`: the flock-wide confirmed total (the §4.1 floor's input).
+/// - `flock_cov`: `(sheep_hex, confirmed_coverage)` for every known sheep. **Only
+///   the sheep ROSTER (the `sheep_hex` keys) is load-bearing now** — the cap and
+///   least-covered ordering no longer key on the confirmed coverage value (see
+///   the eligibility note below). It is kept (rather than dropped) because it is
+///   the one input that enumerates *every* known sheep, including sheep with zero
+///   submitted tiles (which are absent from `submitted`); the cap/ordering read
+///   each sheep's **submitted** count instead.
 /// - `claims`: live soft claims as `(block_wire_id, expiry_ms, claimant_pub)`.
 /// - `submitted`: per-sheep set of already-SUBMITTED units (`confirmed ∪
 ///   unaudited`) as `(sheep_hex, {(frame, idx, pass)})`. A block whose every
 ///   unit is already in this set is "done" and is SKIPPED — the frontier
 ///   advances on submission, not on (slow) confirmation, so workers move to
 ///   fresh tiles (incl. the next density pass) instead of re-rendering pending
-///   ones (the duplicate-work / "0 accepted" live bug).
+///   ones (the duplicate-work / "0 accepted" live bug). **This set's per-sheep
+///   `.len()` is ALSO the cap + ordering input now** (see below).
 /// - `worker_pub`: the requesting worker (lowercase hex); a block this worker
 ///   already holds is NOT skipped (it's reassignable to its own claimant). Also
 ///   the source of this worker's per-sheep START OFFSET (see below).
 /// - `want`: max blocks to return.
 /// - `now_ms`: wall clock, for claim expiry.
 ///
+/// **Eligibility on SUBMITTED, not confirmed coverage.** The §4.1 cap and the
+/// least-covered ordering key on each sheep's `sub_count(sheep) =
+/// submitted[sheep].len()` (its `confirmed ∪ unaudited` tile count), NOT its
+/// confirmed coverage. This decouples the work frontier from slow confirmation:
+/// as soon as work is *submitted* the per-sheep count rises, so the cap/min lift
+/// and the frontier keeps moving even while attestations lag. (Previously the cap
+/// read confirmed coverage, so under a confirmation backlog every sheep stayed
+/// near min_cov and the hand-out stalled waiting on the seeds.)
+///
 /// Selection rule (must match `pick_block`): eligible sheep are those under the
-/// §4.1 coverage cap (`!(enforce && cov > min_cov + COVERAGE_TOLERANCE)` where
-/// `enforce = total > COVERAGE_FLOOR`), ordered least-covered first, tie-broken by
-/// sheep hex for determinism. One block per eligible sheep — the first block index
-/// (scanning upward from this worker's start offset) that is NOT done (every unit
-/// already submitted) AND NOT held by ANOTHER live claimant
+/// §4.1 coverage cap (`!(enforce && sub_cov > min_sub + COVERAGE_TOLERANCE)` where
+/// `sub_cov = sub_count(sheep)`, `min_sub` is the least submitted count, and
+/// `enforce = total_submitted > COVERAGE_FLOOR`), ordered least-SUBMITTED first,
+/// tie-broken by sheep hex for determinism. One block per eligible sheep — the
+/// first block index (scanning upward from this worker's start offset) that is NOT
+/// done (every unit already submitted) AND NOT held by ANOTHER live claimant
 /// (`expiry_ms > now && claimant != worker_pub`).
 ///
 /// **Per-worker start offset (Fix 2 — diverge concurrent workers).** Two browsers
@@ -189,7 +205,7 @@ fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
 /// Loops are capped at 1_000_000 block indices to bound a pathological search.
 pub fn pick_blocks(
     flock_cov: &[(String, u64)],
-    total_coverage: u64,
+    _total_coverage: u64,
     claims: &[(String, u64, String)],
     submitted: &[(String, std::collections::HashSet<(u32, u32, u32)>)],
     worker_pub: &str,
@@ -201,15 +217,36 @@ pub fn pick_blocks(
     if flock_cov.is_empty() || want == 0 {
         return Vec::new();
     }
-    let min_cov = flock_cov.iter().map(|(_, c)| *c).min().unwrap_or(0);
-    let enforce = total_coverage > COVERAGE_FLOOR;
 
-    // Eligible sheep (under the §4.1 cap), least-covered first, tie-broken by
-    // identity hex for determinism — same ordering as `pick_block`.
-    let mut eligible: Vec<(&String, u64)> = flock_cov
+    // Per-sheep SUBMITTED count (`|confirmed ∪ unaudited|`) — the cap + ordering
+    // input now (NOT confirmed coverage; see the doc-comment). A sheep absent from
+    // `submitted` has submitted nothing → count 0. `_total_coverage` (the old
+    // confirmed-total floor input) is intentionally unused: the floor is now the
+    // SUMMED submitted counts, so the cap engages on real outstanding work rather
+    // than lagging behind confirmation.
+    let sub_count = |sheep: &str| -> u64 {
+        submitted
+            .iter()
+            .find(|(s, _)| s == sheep)
+            .map_or(0, |(_, set)| set.len() as u64)
+    };
+    // Roster = every known sheep (from `flock_cov`'s keys), each tagged with its
+    // submitted count. `flock_cov` is the only input that lists sheep with zero
+    // submitted work (those are absent from `submitted`).
+    let roster: Vec<(&String, u64)> =
+        flock_cov.iter().map(|(s, _)| (s, sub_count(s))).collect();
+    let min_sub = roster.iter().map(|(_, c)| *c).min().unwrap_or(0);
+    let total_submitted: u64 = roster.iter().map(|(_, c)| *c).sum();
+    let enforce = total_submitted > COVERAGE_FLOOR;
+
+    // Eligible sheep (under the §4.1 cap on SUBMITTED count), least-submitted
+    // first, tie-broken by identity hex for determinism — same shape as
+    // `pick_block`, but keyed on submitted (frontier-advancing) rather than
+    // confirmed (confirmation-lagging) counts.
+    let mut eligible: Vec<(&String, u64)> = roster
         .iter()
-        .map(|(s, c)| (s, *c))
-        .filter(|(_, cov)| !(enforce && *cov > min_cov + COVERAGE_TOLERANCE))
+        .copied()
+        .filter(|(_, sub)| !(enforce && *sub > min_sub + COVERAGE_TOLERANCE))
         .collect();
     eligible.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
 
@@ -509,6 +546,66 @@ mod tests {
             out_a[0].block_index, out_b[0].block_index,
             "distinct workers must get distinct first blocks (Fix 2 divergence)"
         );
+    }
+
+    #[test]
+    fn pick_blocks_cap_uses_submitted() {
+        // The §4.1 cap + least-covered ordering key on SUBMITTED count (confirmed ∪
+        // unaudited), NOT confirmed coverage — so eligibility advances on submission
+        // even while confirmation lags. We give two sheep:
+        //  - `busy`: LOW confirmed coverage (0) but HIGH submitted (many units).
+        //  - `lazy`: also low confirmed, but FEW submitted units.
+        // Under the OLD confirmed-keyed cap both look equal (cov 0). Under the new
+        // submitted-keyed rule `busy` is the MORE-covered sheep, so `lazy` is handed
+        // out first and — once `busy` runs past the tolerance band — `busy` is capped
+        // out entirely. This proves the cap/ordering read submitted, not confirmed.
+        let busy = hex32(0x21);
+        let lazy = hex32(0x22);
+        let busy_id = [0x21u8; 32];
+        let worker = zero_offset_worker();
+
+        // `flock_cov` confirmed values are IDENTICAL (both 0) — if the cap still read
+        // these, the two sheep would be indistinguishable. The new rule ignores them.
+        let flock_cov = vec![(busy.clone(), 0u64), (lazy.clone(), 0u64)];
+
+        // `busy` has submitted enough units to clear COVERAGE_FLOOR and exceed
+        // `min_sub + COVERAGE_TOLERANCE`. Fill whole blocks so the counts are exact:
+        // enough blocks that busy's submitted count > 0 (lazy's min) + tolerance, and
+        // the total clears the floor so `enforce` is on.
+        use crate::engine::{COVERAGE_FLOOR, COVERAGE_TOLERANCE};
+        let blocks_needed =
+            ((COVERAGE_FLOOR + COVERAGE_TOLERANCE) / BUNDLE_SIZE as u64) + 2;
+        let mut busy_set = std::collections::HashSet::new();
+        for bi in 0..blocks_needed {
+            for u in block_units(BlockId { sheep_identity: busy_id, block_index: bi }) {
+                busy_set.insert((u.frame, u.idx, u.pass));
+            }
+        }
+        let busy_count = busy_set.len() as u64;
+        // `lazy` has submitted nothing → submitted count 0 (it's absent from the slice).
+        let submitted = vec![(busy.clone(), busy_set)];
+
+        // Sanity: enforce is on (total submitted > floor) and busy is past the band.
+        assert!(busy_count > COVERAGE_FLOOR, "busy clears the §4.1 floor on submitted count");
+        assert!(
+            busy_count > 0 + COVERAGE_TOLERANCE,
+            "busy exceeds min(0) + tolerance on submitted, so it is capped out"
+        );
+
+        // want=2, but only ONE sheep is eligible now (busy is capped on SUBMITTED).
+        let out = pick_blocks(&flock_cov, /*total ignored*/ 0, &[], &submitted, &worker, 2, 1_000);
+        assert_eq!(out.len(), 1, "busy is capped out by its submitted count; only lazy is eligible");
+        assert_eq!(out[0].sheep_hex(), lazy, "the least-SUBMITTED sheep is handed out");
+
+        // Control: with `busy` submitting only a TINY amount (within tolerance), both
+        // sheep stay eligible and lazy (still least-submitted) leads.
+        let mut small = std::collections::HashSet::new();
+        small.insert((0u32, 0u32, 0u32));
+        let submitted_small = vec![(busy.clone(), small)];
+        let out2 = pick_blocks(&flock_cov, 0, &[], &submitted_small, &worker, 2, 1_000);
+        assert_eq!(out2.len(), 2, "within tolerance both sheep are eligible");
+        assert_eq!(out2[0].sheep_hex(), lazy, "lazy (0 submitted) is still least-covered first");
+        assert_eq!(out2[1].sheep_hex(), busy);
     }
 
     /// A worker pubkey whose [`worker_offset`] is 0 (so block scans start at 0) —

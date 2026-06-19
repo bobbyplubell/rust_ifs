@@ -19,7 +19,7 @@ use sheep_node::engine::{
     assigned_to_audit, sample_rate, Engine, CONFIRM_QUORUM_REP_SUM, DEFAULT_ROUND_SALT,
     SAMPLE_FLOOR, TRUSTED_ATTESTOR_REP, TRUST_REP,
 };
-use sheep_node::spec::{N_FRAMES, SPP};
+use sheep_node::spec::{IDXS_PER_FRAME, N_FRAMES, SPP};
 use sheep_proto::derive::derive_minted;
 use sheep_proto::identity::{sheep_identity, ResolutionTier};
 use sheep_proto::msg::{Attestation, Coverage, Mint, RepDelta};
@@ -65,6 +65,65 @@ fn mint(k: &SigningKey, ts_micros: u64, tier: ResolutionTier) -> (Envelope, Stri
         id_hex.push_str(&format!("{b:02x}"));
     }
     (env, id_hex)
+}
+
+/// A high reputation that drives `sample_rate` to the 5% floor, so audit
+/// assignment for this submitter is RARE — used by the rep-gating tests to pin a
+/// specific attestor/tile to NOT-assigned (so confirmation must come from the
+/// rep/trust path under test, not the optimistic assigned path).
+const SPARSE_SUBMITTER_REP: u64 = 100_000;
+
+/// Find a `(frame, idx)` tile on `sheep` for which `attestor` is NOT assigned to
+/// audit a submitter of rep `SPARSE_SUBMITTER_REP` — i.e. `assigned_to_audit`
+/// returns false. At the 5% floor ~95% of tiles qualify, so this resolves almost
+/// immediately. Pure + deterministic (a hash of public facts), so the chosen tile
+/// is the same on every run / node.
+fn unassigned_tile(attestor: &str, sheep: &str) -> (u32, u32) {
+    for idx in 0..IDXS_PER_FRAME {
+        for frame in 0..N_FRAMES {
+            if !assigned_to_audit(
+                attestor,
+                (sheep, frame, idx, 0),
+                SPARSE_SUBMITTER_REP,
+                DEFAULT_ROUND_SALT,
+            ) {
+                return (frame, idx);
+            }
+        }
+    }
+    panic!("no unassigned tile found (assignment too dense?)");
+}
+
+/// Find a `(frame, idx)` tile on `sheep` that NEITHER `a` nor `b` is assigned to
+/// audit for a `SPARSE_SUBMITTER_REP` submitter — used to isolate the rep-sum
+/// quorum path (c) from the optimistic assigned path (b). At the 5% floor a tile
+/// unassigned for BOTH keys is ~90% likely, so this resolves almost immediately.
+fn unassigned_for_both(a: &str, b: &str, sheep: &str) -> (u32, u32) {
+    for idx in 0..IDXS_PER_FRAME {
+        for frame in 0..N_FRAMES {
+            let t = (sheep, frame, idx, 0u32);
+            if !assigned_to_audit(a, t, SPARSE_SUBMITTER_REP, DEFAULT_ROUND_SALT)
+                && !assigned_to_audit(b, t, SPARSE_SUBMITTER_REP, DEFAULT_ROUND_SALT)
+            {
+                return (frame, idx);
+            }
+        }
+    }
+    panic!("no tile unassigned for both keys found");
+}
+
+/// Find a `(frame, idx)` tile on `sheep` for which `attestor` IS assigned to audit
+/// a REP-0 submitter (rate ~1.0, so this is the first tile or close to it). Used to
+/// prove the `A != S` bar holds even when the submitter is assigned to its own tile.
+fn assigned_tile_rep0(attestor: &str, sheep: &str) -> (u32, u32) {
+    for idx in 0..IDXS_PER_FRAME {
+        for frame in 0..N_FRAMES {
+            if assigned_to_audit(attestor, (sheep, frame, idx, 0), 0, DEFAULT_ROUND_SALT) {
+                return (frame, idx);
+            }
+        }
+    }
+    panic!("no rep-0-assigned tile found");
 }
 
 // ---- §6 audit assignment: verifiable, unpredictable, unselectable -----------
@@ -381,33 +440,62 @@ fn honeypot_catches_lazy_auditor() {
 // CONFIRM_QUORUM_REP_SUM. Rep-0 disposable keys add 0 to the sum, so Sybils
 // can't self-confirm.
 
-/// A submitter + N fresh rep-0 keys attest their OWN tile → it does NOT confirm
-/// (neither the trusted-attestor path (a) nor the quorum-rep-sum path (b) is met:
-/// every key is rep-0, so the sum stays 0 no matter how many keys flood in).
+/// **Retargeted for the optimistic posture (was `sybil_self_confirm_is_rejected`).**
+/// Under the old rep-gating rule the assertion was "no rep-0 key confirms", but the
+/// scaling fix lets any *assigned non-submitter* rep-0 key confirm (1:1 audit↔render).
+/// So that blanket assertion no longer holds. What survives — and is the load-bearing
+/// invariant — is that the SUBMITTER ITSELF can never confirm its own tile, even when
+/// it (and a flood of its own disposable keys) is assigned. We pin the submitter to a
+/// tile it IS assigned to audit, prove its self-attestation does NOT confirm, and then
+/// prove the *only* way a fresh self-submitted tile gets retracted is the dispute path
+/// (a conflicting honest attestation → re-render → slash) — i.e. fraud is caught
+/// optimistically, not prevented up front.
 #[test]
-fn sybil_self_confirm_is_rejected() {
+fn submitter_cannot_self_confirm() {
     let mut eng = Engine::new(key(1));
     let minter = key(2);
     let (m, id) = mint(&minter, 1_000_000, ResolutionTier::R384);
     assert!(eng.apply(&m, 1000));
 
     let h = "00".repeat(32);
-    // The submitter gossips a Coverage.
     let submitter = key(50);
-    let cov = Coverage { sheep_id: id.clone(), frame: 0, idx: 0, pass: 0, hash: h.clone() };
-    assert!(eng.apply(&signed(proto::PROGRESS, &submitter, 1000, serde_json::to_value(&cov).unwrap()), 1000));
+    let sub_pub = pub_hex(&submitter);
 
-    // The submitter + 6 fresh disposable rep-0 keys all attest the SAME tile.
-    // (None is the local node; none has earned standing.)
-    for seed in [50u8, 51, 52, 53, 54, 55, 56] {
-        let k = key(seed);
-        let att = Attestation { sheep_id: id.clone(), frame: 0, idx: 0, pass: 0, hash: h.clone() };
-        eng.apply(&signed(proto::ATTEST, &k, 1000, serde_json::to_value(&att).unwrap()), 1000);
-    }
+    // Pick a tile the submitter IS assigned to audit (rep-0 submitter ⇒ assigned
+    // at rate ~1.0, so almost any tile qualifies — assert it explicitly so the
+    // test proves the `A != S` bar holds *despite* assignment, not by luck).
+    let (frame, idx) = assigned_tile_rep0(&sub_pub, &id);
+    assert!(
+        eng.is_assigned(&sub_pub, (id.as_str(), frame, idx, 0), &sub_pub),
+        "submitter is assigned to audit its own tile (so only the A != S bar stops it)"
+    );
+
+    // The submitter gossips Coverage for the tile, then attests it itself, several
+    // times over from its own key — none of which may confirm (A == S barred).
+    let cov = Coverage { sheep_id: id.clone(), frame, idx, pass: 0, hash: h.clone() };
+    assert!(eng.apply(&signed(proto::PROGRESS, &submitter, 1000, serde_json::to_value(&cov).unwrap()), 1000));
+    let self_att = Attestation { sheep_id: id.clone(), frame, idx, pass: 0, hash: h.clone() };
+    eng.apply(&signed(proto::ATTEST, &submitter, 1000, serde_json::to_value(&self_att).unwrap()), 1000);
     assert_eq!(
         eng.coverage(&id), 0,
-        "a Sybil flood of rep-0 keys (incl. the submitter) cannot self-confirm a tile"
+        "the submitter's own (even assigned) attestation can never confirm its own tile"
     );
+
+    // The optimistic defense in action: a fraudulent self-submitted tile is caught
+    // only when an HONEST auditor attests a CONFLICTING (true) hash → dispute → the
+    // submitter is slashed. (Reuses the dispute machinery the dispute test exercises;
+    // here we just confirm the fraudster's hash is the one retracted, not the truth.)
+    let entry = eng.flock().get(&id).unwrap();
+    let identity = sheep_identity(&entry.genome, entry.resolution);
+    let edge = entry.resolution.edge() as usize;
+    let truth = hist_hash_hex(&render_batch(&entry.genome, &identity, frame, idx, edge, edge, 1, SPP, N_FRAMES));
+    assert_ne!(truth, h, "the submitter's bogus hash differs from ground truth");
+    let honest = key(60);
+    let honest_att = Attestation { sheep_id: id.clone(), frame, idx, pass: 0, hash: truth.clone() };
+    assert!(eng.apply(&signed(proto::ATTEST, &honest, 1000, serde_json::to_value(&honest_att).unwrap()), 1000));
+    let _ = eng.tick(2000);
+    assert!(eng.slashed().contains(&sub_pub), "the dispute slashes the fraudulent self-submitter");
+    assert!(eng.retracted_hashes().contains(&h), "the fraudster's hash is retracted, not the truth");
 }
 
 /// The trusted-attestor path (a): the LOCAL node always confirms (gateway/seed
@@ -480,8 +568,12 @@ fn trusted_key_confirms_alone_with_zero_rep() {
     );
 }
 
-/// The quorum path (b): two distinct attestors whose rep SUMS to >= the quorum
-/// rep-sum confirm; two rep-0 keys do not.
+/// The quorum path (c): two distinct attestors whose rep SUMS to >= the quorum
+/// rep-sum confirm; two rep-0 keys do not. **Posture note:** under the scaling fix
+/// an *assigned* attestor confirms alone via path (b), which would mask the quorum
+/// path. To isolate path (c) we give the tile a HIGH-REP recorded submitter (so the
+/// audit lottery is at its 5% floor) and place it on a tile NEITHER attestor is
+/// assigned to — then only the rep-sum quorum can confirm it.
 #[test]
 fn quorum_of_established_confirms() {
     let mut eng = Engine::new(key(1));
@@ -491,7 +583,7 @@ fn quorum_of_established_confirms() {
     let h = "00".repeat(32);
 
     // Two established peers, each BELOW the trusted bar (so neither confirms via
-    // path (a)), but summing to >= CONFIRM_QUORUM_REP_SUM (path (b)).
+    // path (a)), but summing to >= CONFIRM_QUORUM_REP_SUM (path (c)).
     let p1 = key(20);
     let p2 = key(21);
     let half = CONFIRM_QUORUM_REP_SUM / 2 + 1; // each < TRUSTED_ATTESTOR_REP (32); sum >= 24
@@ -499,31 +591,45 @@ fn quorum_of_established_confirms() {
     eng.grant_rep(pub_hex(&p1), half);
     eng.grant_rep(pub_hex(&p2), half);
 
-    // First attestor alone does NOT confirm (only one, sub-trusted).
-    let a1 = Attestation { sheep_id: id.clone(), frame: 0, idx: 0, pass: 0, hash: h.clone() };
+    // A HIGH-REP submitter records the tile (drives the audit rate to the floor),
+    // and we pick a tile NEITHER p1 nor p2 is assigned to — so path (b) can't fire
+    // and only the rep-sum quorum (c) can confirm.
+    let submitter = key(19);
+    eng.grant_rep(pub_hex(&submitter), SPARSE_SUBMITTER_REP);
+    let (frame, idx) = unassigned_for_both(&pub_hex(&p1), &pub_hex(&p2), &id);
+    let cov = Coverage { sheep_id: id.clone(), frame, idx, pass: 0, hash: h.clone() };
+    assert!(eng.apply(&signed(proto::PROGRESS, &submitter, 1000, serde_json::to_value(&cov).unwrap()), 1000));
+
+    // First attestor alone does NOT confirm (only one, sub-trusted, unassigned).
+    let a1 = Attestation { sheep_id: id.clone(), frame, idx, pass: 0, hash: h.clone() };
     assert!(eng.apply(&signed(proto::ATTEST, &p1, 1000, serde_json::to_value(&a1).unwrap()), 1000));
-    assert_eq!(eng.coverage(&id), 0, "one sub-trusted attestor is not a quorum");
+    assert_eq!(eng.coverage(&id), 0, "one sub-trusted unassigned attestor is not a quorum");
 
     // Second distinct attestor brings the count to 2 and the rep-sum over the
-    // threshold → confirmed.
-    let a2 = Attestation { sheep_id: id.clone(), frame: 0, idx: 0, pass: 0, hash: h.clone() };
+    // threshold → confirmed via path (c).
+    let a2 = Attestation { sheep_id: id.clone(), frame, idx, pass: 0, hash: h.clone() };
     assert!(eng.apply(&signed(proto::ATTEST, &p2, 1000, serde_json::to_value(&a2).unwrap()), 1000));
     assert!(eng.coverage(&id) >= 1, "two distinct attestors summing past the rep-sum confirm");
 
-    // Control: two FRESH rep-0 keys on a DIFFERENT tile do NOT confirm it (count
-    // 2, but rep-sum stays under the threshold). Coverage must not grow.
+    // Control: two FRESH rep-0 keys on a DIFFERENT tile, again recorded by the
+    // high-rep submitter and unassigned to both, do NOT confirm it (count 2, but
+    // rep-sum stays under the threshold). Coverage must not grow.
     let cov_before = eng.coverage(&id);
     let z1 = key(22);
     let z2 = key(23);
-    let b1 = Attestation { sheep_id: id.clone(), frame: 5, idx: 0, pass: 0, hash: h.clone() };
-    let b2 = Attestation { sheep_id: id.clone(), frame: 5, idx: 0, pass: 0, hash: h.clone() };
+    let (f2, i2) = unassigned_for_both(&pub_hex(&z1), &pub_hex(&z2), &id);
+    assert!((f2, i2) != (frame, idx), "control tile differs from the confirmed one");
+    let cov2 = Coverage { sheep_id: id.clone(), frame: f2, idx: i2, pass: 0, hash: h.clone() };
+    assert!(eng.apply(&signed(proto::PROGRESS, &submitter, 1000, serde_json::to_value(&cov2).unwrap()), 1000));
+    let b1 = Attestation { sheep_id: id.clone(), frame: f2, idx: i2, pass: 0, hash: h.clone() };
+    let b2 = Attestation { sheep_id: id.clone(), frame: f2, idx: i2, pass: 0, hash: h.clone() };
     eng.apply(&signed(proto::ATTEST, &z1, 1000, serde_json::to_value(&b1).unwrap()), 1000);
     eng.apply(&signed(proto::ATTEST, &z2, 1000, serde_json::to_value(&b2).unwrap()), 1000);
     // NB: each attestation bumps the attestor's rep by 1 (the bootstrap), so after
     // both, z1/z2 have rep 1 each → sum 2, still well under CONFIRM_QUORUM_REP_SUM.
     assert_eq!(
         eng.coverage(&id), cov_before,
-        "two rep-0 keys (quorum count met, rep-sum not) do not confirm a new tile"
+        "two rep-0 unassigned keys (quorum count met, rep-sum not) do not confirm a new tile"
     );
 }
 
@@ -540,27 +646,79 @@ fn attestor_earns_rep_then_can_confirm() {
     let h = "00".repeat(32);
 
     let browser = key(40);
-    assert_eq!(eng.reputation_of(&pub_hex(&browser)), 0, "starts with no standing");
+    let browser_pub = pub_hex(&browser);
+    assert_eq!(eng.reputation_of(&browser_pub), 0, "starts with no standing");
 
-    // The browser attests TRUSTED_ATTESTOR_REP distinct tiles. Each valid
-    // attestation bumps its rep by 1 (rep-earning is unchanged from the old
-    // model). None of these early attestations confirms (it is sub-trusted and
-    // the lone attestor), but it accrues standing.
-    for i in 0..TRUSTED_ATTESTOR_REP {
-        let frame = (i % (N_FRAMES as u64)) as u32;
-        let idx = (i / (N_FRAMES as u64)) as u32;
+    // A HIGH-REP submitter records each warm-up tile (drives the audit rate to the
+    // floor) AND we pick tiles the browser is NOT assigned to — so none of the
+    // browser's warm-up attestations can confirm via the optimistic assigned path
+    // (b); they only accrue standing. (Under the scaling fix an assigned attestor
+    // confirms alone, which would mask the rep climb this test is about.)
+    let submitter = key(41);
+    eng.grant_rep(pub_hex(&submitter), SPARSE_SUBMITTER_REP);
+
+    // Collect TRUSTED_ATTESTOR_REP - 1 distinct tiles the browser is NOT assigned
+    // to. We warm up to exactly ONE BELOW the bar: each valid attestation bumps the
+    // browser's rep by 1 (the bootstrap), and `bump_rep` runs BEFORE the confirm
+    // test, so the attestation that *crosses* the bar would confirm its own tile.
+    // Stopping at rep == TRUSTED_ATTESTOR_REP - 1 keeps every warm-up tile
+    // sub-trusted + unassigned ⇒ none confirms — then the next (fresh-tile)
+    // attestation crosses the bar and confirms via path (a).
+    let warmup_n = TRUSTED_ATTESTOR_REP - 1;
+    let mut warmup: Vec<(u32, u32)> = Vec::new();
+    'outer: for idx in 0..IDXS_PER_FRAME {
+        for frame in 0..N_FRAMES {
+            if !assigned_to_audit(&browser_pub, (id.as_str(), frame, idx, 0), SPARSE_SUBMITTER_REP, DEFAULT_ROUND_SALT) {
+                warmup.push((frame, idx));
+                if warmup.len() as u64 == warmup_n {
+                    break 'outer;
+                }
+            }
+        }
+    }
+    assert_eq!(warmup.len() as u64, warmup_n, "enough unassigned warm-up tiles");
+
+    // The browser attests each unassigned tile (recorded by the high-rep submitter
+    // so the browser is provably unassigned). Each valid attestation bumps its rep
+    // by 1; none confirms (sub-trusted, lone, unassigned), but it accrues standing.
+    for &(frame, idx) in &warmup {
+        let cov = Coverage { sheep_id: id.clone(), frame, idx, pass: 0, hash: h.clone() };
+        eng.apply(&signed(proto::PROGRESS, &submitter, 1000, serde_json::to_value(&cov).unwrap()), 1000);
         let att = Attestation { sheep_id: id.clone(), frame, idx, pass: 0, hash: h.clone() };
         eng.apply(&signed(proto::ATTEST, &browser, 1000, serde_json::to_value(&att).unwrap()), 1000);
     }
-    assert!(
-        eng.reputation_of(&pub_hex(&browser)) >= TRUSTED_ATTESTOR_REP,
-        "the browser climbed past the trusted bar by honest attestation: {}",
-        eng.reputation_of(&pub_hex(&browser))
+    assert_eq!(eng.coverage(&id), 0, "no warm-up tile confirmed (browser sub-trusted + unassigned)");
+    assert_eq!(
+        eng.reputation_of(&browser_pub),
+        TRUSTED_ATTESTOR_REP - 1,
+        "the browser is exactly one short of the trusted bar after warm-up"
     );
 
-    // Now its attestation of a FRESH tile confirms it alone (path (a)).
+    // Now its attestation of a FRESH tile (one NOT in the warm-up set, so it isn't
+    // deduped) confirms it alone via path (a): this attestation bumps the browser's
+    // rep from 31 to TRUSTED_ATTESTOR_REP (32) BEFORE the confirm test, crossing the
+    // bar. We pick a fresh unassigned tile distinct from every warm-up tile.
     let cov_before = eng.coverage(&id);
-    let att = Attestation { sheep_id: id.clone(), frame: 100, idx: 0, pass: 0, hash: h.clone() };
+    let (ff, fi) = {
+        let used: std::collections::HashSet<(u32, u32)> = warmup.iter().copied().collect();
+        let mut found = None;
+        'f: for idx in 0..IDXS_PER_FRAME {
+            for frame in 0..N_FRAMES {
+                if !used.contains(&(frame, idx))
+                    && !assigned_to_audit(&browser_pub, (id.as_str(), frame, idx, 0), SPARSE_SUBMITTER_REP, DEFAULT_ROUND_SALT)
+                {
+                    found = Some((frame, idx));
+                    break 'f;
+                }
+            }
+        }
+        found.expect("a fresh unassigned tile outside the warm-up set")
+    };
+    let fresh_sub = key(42);
+    eng.grant_rep(pub_hex(&fresh_sub), SPARSE_SUBMITTER_REP);
+    let cov = Coverage { sheep_id: id.clone(), frame: ff, idx: fi, pass: 0, hash: h.clone() };
+    eng.apply(&signed(proto::PROGRESS, &fresh_sub, 1000, serde_json::to_value(&cov).unwrap()), 1000);
+    let att = Attestation { sheep_id: id.clone(), frame: ff, idx: fi, pass: 0, hash: h.clone() };
     assert!(eng.apply(&signed(proto::ATTEST, &browser, 1000, serde_json::to_value(&att).unwrap()), 1000));
     assert_eq!(
         eng.coverage(&id),
@@ -570,46 +728,114 @@ fn attestor_earns_rep_then_can_confirm() {
 }
 
 /// A slashed attestor (caught on a honeypot) no longer counts toward the §6
-/// confirmation quorum, even if it previously attested the tile.
+/// confirmation quorum, even if it previously attested the tile. **Posture note:**
+/// the target tile is recorded by a HIGH-REP submitter and chosen UNASSIGNED for
+/// both attestors, so neither confirms via the optimistic assigned path (b) — only
+/// the rep-sum quorum (c) could, and the slash must keep it from completing.
 #[test]
-fn slashed_attestor_does_not_count() {
+fn slashed_assigned_attestor_excluded() {
     let mut eng = Engine::new(key(1));
     let minter = key(2);
     let (m, id) = mint(&minter, 1_000_000, ResolutionTier::R384);
     assert!(eng.apply(&m, 1000));
     let h = "00".repeat(32);
 
-    // One established sub-trusted attestor (below the bar) attests the tile —
-    // not enough alone.
     let good = key(30);
+    let liar = key(31);
+    // A high-rep submitter records the target tile (rate → floor) and we pick a
+    // tile UNASSIGNED to both attestors so the assigned path (b) can't fire.
+    let submitter = key(29);
+    eng.grant_rep(pub_hex(&submitter), SPARSE_SUBMITTER_REP);
+    let (frame, idx) = unassigned_for_both(&pub_hex(&good), &pub_hex(&liar), &id);
+    assert!((frame, idx) != (7, 7), "target tile must differ from the honeypot tile (7,7)");
+    let cov = Coverage { sheep_id: id.clone(), frame, idx, pass: 0, hash: h.clone() };
+    assert!(eng.apply(&signed(proto::PROGRESS, &submitter, 1000, serde_json::to_value(&cov).unwrap()), 1000));
+
+    // One established sub-trusted attestor (below the bar) attests the tile —
+    // not enough alone (lone, unassigned).
     eng.grant_rep(pub_hex(&good), CONFIRM_QUORUM_REP_SUM); // sub-trusted? ensure < 32
     assert!(CONFIRM_QUORUM_REP_SUM < TRUSTED_ATTESTOR_REP);
-    let a_good = Attestation { sheep_id: id.clone(), frame: 0, idx: 0, pass: 0, hash: h.clone() };
+    let a_good = Attestation { sheep_id: id.clone(), frame, idx, pass: 0, hash: h.clone() };
     assert!(eng.apply(&signed(proto::ATTEST, &good, 1000, serde_json::to_value(&a_good).unwrap()), 1000));
     // rep(good) == CONFIRM_QUORUM_REP_SUM after the +1 bump; but it's a LONE
     // attestor (count 1 < quorum) so the tile is not yet confirmed.
-    assert_eq!(eng.coverage(&id), 0, "one sub-trusted attestor is not a quorum");
+    assert_eq!(eng.coverage(&id), 0, "one sub-trusted unassigned attestor is not a quorum");
 
     // A second peer would normally complete the quorum — but this one gets
     // SLASHED first (caught lying on a honeypot), so it must NOT count.
     let truth = eng.plant_honeypot(&id, 7, 7, 0).expect("plant honeypot");
     assert_ne!(truth, "ff".repeat(32));
-    let liar = key(31);
     eng.grant_rep(pub_hex(&liar), CONFIRM_QUORUM_REP_SUM);
     // The liar attests the honeypot with a WRONG hash → slashed.
     let hp = Attestation { sheep_id: id.clone(), frame: 7, idx: 7, pass: 0, hash: "ff".repeat(32) };
     assert!(eng.apply(&signed(proto::ATTEST, &liar, 1000, serde_json::to_value(&hp).unwrap()), 1000));
     assert!(eng.slashed().contains(&pub_hex(&liar)), "liar slashed on the honeypot");
 
-    // Now the slashed liar ALSO attests the original tile (frame 0). Even though
-    // count would be 2 and the naive rep-sum would clear the threshold, the
-    // slashed key is discarded from the valid-attestor set → still not confirmed.
-    let a_liar = Attestation { sheep_id: id.clone(), frame: 0, idx: 0, pass: 0, hash: h.clone() };
+    // Now the slashed liar ALSO attests the original tile. Even though count would
+    // be 2 and the naive rep-sum would clear the threshold, the slashed key is
+    // discarded from the valid-attestor set → still not confirmed.
+    let a_liar = Attestation { sheep_id: id.clone(), frame, idx, pass: 0, hash: h.clone() };
     // (apply may return false because the key is now banned/slashed and rejected
     // wholesale — either way it must not push the tile to confirmed.)
     let _ = eng.apply(&signed(proto::ATTEST, &liar, 2000, serde_json::to_value(&a_liar).unwrap()), 2000);
     assert_eq!(
         eng.coverage(&id), 0,
         "a slashed attestor does not count toward the confirmation quorum"
+    );
+}
+
+/// **The scaling fix.** A rep-0 attestor that is neither the local node, nor
+/// trusted, nor the submitter, but IS assigned by the §6 audit lottery, confirms a
+/// tile immediately (1:1 audit↔render). The SAME key, on a tile it is NOT assigned
+/// to, does NOT confirm — so confirmation tracks assignment, not standing.
+#[test]
+fn assigned_auditor_confirms_zero_rep() {
+    let mut eng = Engine::new(key(1));
+    let minter = key(2);
+    let (m, id) = mint(&minter, 1_000_000, ResolutionTier::R384);
+    assert!(eng.apply(&m, 1000));
+    let h = "00".repeat(32);
+
+    // The attestor: a fresh rep-0 key, not the local node, not trusted.
+    let auditor = key(70);
+    let auditor_pub = pub_hex(&auditor);
+    assert_ne!(auditor_pub, *eng.self_pub());
+    assert_eq!(eng.reputation_of(&auditor_pub), 0, "auditor has no earned standing");
+
+    // --- POSITIVE: assigned tile, REP-0 submitter → assigned ~always → confirms ---
+    // A distinct rep-0 submitter records the tile (so A != S holds and the lottery
+    // runs at rate ~1.0). Pick a tile the auditor IS assigned to (rep-0 submitter).
+    let submitter = key(71);
+    let (af, ai) = assigned_tile_rep0(&auditor_pub, &id);
+    assert!(
+        eng.is_assigned(&auditor_pub, (id.as_str(), af, ai, 0), &pub_hex(&submitter)),
+        "auditor is assigned to the positive tile (rep-0 submitter)"
+    );
+    let cov = Coverage { sheep_id: id.clone(), frame: af, idx: ai, pass: 0, hash: h.clone() };
+    assert!(eng.apply(&signed(proto::PROGRESS, &submitter, 1000, serde_json::to_value(&cov).unwrap()), 1000));
+    let att = Attestation { sheep_id: id.clone(), frame: af, idx: ai, pass: 0, hash: h.clone() };
+    assert!(eng.apply(&signed(proto::ATTEST, &auditor, 1000, serde_json::to_value(&att).unwrap()), 1000));
+    assert_eq!(
+        eng.coverage(&id), 1,
+        "an assigned, non-submitter rep-0 auditor confirms the tile immediately (the scaling fix)"
+    );
+
+    // --- NEGATIVE: a tile the auditor is NOT assigned to → no confirm. Use a
+    // HIGH-REP submitter (rate → floor) so a NOT-assigned tile exists for this key. ---
+    let hi_submitter = key(72);
+    eng.grant_rep(pub_hex(&hi_submitter), SPARSE_SUBMITTER_REP);
+    let (uf, ui) = unassigned_tile(&auditor_pub, &id);
+    assert!(
+        !eng.is_assigned(&auditor_pub, (id.as_str(), uf, ui, 0), &pub_hex(&hi_submitter)),
+        "auditor is NOT assigned to the negative tile (high-rep submitter)"
+    );
+    let cov2 = Coverage { sheep_id: id.clone(), frame: uf, idx: ui, pass: 0, hash: h.clone() };
+    assert!(eng.apply(&signed(proto::PROGRESS, &hi_submitter, 1000, serde_json::to_value(&cov2).unwrap()), 1000));
+    let cov_before = eng.coverage(&id);
+    let att2 = Attestation { sheep_id: id.clone(), frame: uf, idx: ui, pass: 0, hash: h.clone() };
+    eng.apply(&signed(proto::ATTEST, &auditor, 1000, serde_json::to_value(&att2).unwrap()), 1000);
+    assert_eq!(
+        eng.coverage(&id), cov_before,
+        "a NOT-assigned rep-0 auditor does not confirm the tile (confirmation tracks assignment)"
     );
 }

@@ -1497,30 +1497,56 @@ impl Engine {
         newly || was_new
     }
 
-    /// §6 **reputation-anchored confirmation predicate (the Sybil fix).** Is the
-    /// tile `key = (sheep, frame, idx, pass)` confirmed by its current set of
-    /// **valid distinct attestors** — those recorded in `attestors[key]` that are
-    /// NOT slashed/banned? A slashed/banned attestor's word is worth nothing here,
-    /// so a key caught lying (honeypot/dispute) is dropped from the tally even if
-    /// it previously attested.
+    /// §6 **assignment-anchored, optimistic confirmation predicate (the scaling
+    /// fix).** Is the tile `key = (sheep, frame, idx, pass)` confirmed by its
+    /// current set of **valid distinct attestors** — those recorded in
+    /// `attestors[key]` that are NOT slashed/banned? A slashed/banned attestor's
+    /// word is worth nothing here, so a key caught lying (honeypot/dispute) is
+    /// dropped from the tally even if it previously attested.
     ///
-    /// Confirmed iff EITHER:
-    /// - **(a) trusted-attestor path:** at least one valid attestor is the LOCAL
-    ///   node (`self.self_pub`, always trusted — preserves the gateway/seed
-    ///   confirmation path), OR is in the explicit `trusted_keys` mutual-trust set
-    ///   (§6, e.g. the other seed's pubkey — confirms at cold-start with rep 0),
-    ///   OR has `reputation_of(attestor) >= TRUSTED_ATTESTOR_REP`; OR
-    /// - **(b) quorum path:** there are `>= CONFIRM_QUORUM` distinct valid
-    ///   attestors AND the SUM of their `reputation_of(...)` is `>= CONFIRM_QUORUM_REP_SUM`.
+    /// Let `S = submitter[key]` (the key whose `Coverage` first carried the tile;
+    /// possibly unknown). The tile is confirmed iff there exists a valid attestor
+    /// `A` such that **`A != S`** (a submitter can NEVER confirm its own tile —
+    /// the one absolute invariant, enforced even on the assigned path), AND EITHER:
+    /// - **(a) trusted path:** `A` is the LOCAL node (`self.self_pub`, always
+    ///   trusted — preserves the gateway/seed confirmation path), OR is in the
+    ///   explicit `trusted_keys` mutual-trust set (§6, e.g. the other seed's
+    ///   pubkey), OR has `reputation_of(A) >= TRUSTED_ATTESTOR_REP`; OR
+    /// - **(b) assigned path (the scaling fix):** `A` is *assigned* to audit this
+    ///   tile under the §6 audit lottery — `is_assigned(A, tile, S)` is true
+    ///   (`sha256(A ‖ tile ‖ round_salt) < threshold(sample_rate(rep(S)))`). When
+    ///   `S` is unknown its rep is taken as 0 (so an assigned non-self attestor
+    ///   still confirms). OR
+    /// - **(c) quorum path (kept, harmless):** `>= CONFIRM_QUORUM` distinct valid
+    ///   attestors (each `!= S`) whose summed `reputation_of(...)` reaches
+    ///   `CONFIRM_QUORUM_REP_SUM`.
     ///
-    /// Rep-0 disposable keys add `0` to the quorum sum, so a Sybil with any number
-    /// of fresh keys can never reach the sum: only earned standing confirms.
-    /// Pure read over log-derived state (rep + slash sets) → deterministic across
-    /// nodes given the same log.
+    /// **Why the posture changed (rep-gating → assignment).** The old rule confirmed
+    /// only via earned standing (rep `>= 32` or a rep-sum quorum), so a fresh
+    /// browser's audits never confirmed anything until it ground out rep 32 — every
+    /// confirmation funnelled through the seeds and the seeds became the bottleneck.
+    /// The assigned path makes confirmation **scale 1:1 with participation**: any
+    /// honest auditor the verifiable lottery assigned to a tile confirms it
+    /// immediately, so the swarm confirms its own work and hand-out no longer
+    /// stalls on slow confirmation. Fraud is now caught **optimistically** —
+    /// honeypots (`grade_honeypot`) and disputes (conflicting-hash → re-render →
+    /// slash) detect-and-slash bad attestations after the fact — rather than being
+    /// *prevented* by rep-gating up front. Trade-off (accepted): because a rep-0
+    /// submitter is audited at rate ~1.0, almost any assigned key confirms its
+    /// tile, so a 2-key Sybil (one submits, one attests) can briefly self-confirm;
+    /// that window is closed by the honeypot/dispute slash machinery, which the
+    /// `A != S` invariant + the unselectable lottery keep from being gamed cheaply.
+    ///
+    /// Pure read over log-derived state (rep + slash sets + submitter + round salt)
+    /// → deterministic across nodes given the same log (`is_assigned` is itself a
+    /// hash of public log facts).
     fn is_confirmed_by(&self, key: &(String, u32, u32, u32)) -> bool {
         let Some(attestors) = self.attestors.get(key) else {
             return false;
         };
+        let submitter = self.submitter.get(key); // None if the submitter is unknown.
+        let (sheep, frame, idx, pass) = (key.0.as_str(), key.1, key.2, key.3);
+
         let mut distinct = 0usize;
         let mut rep_sum: u64 = 0;
         for a in attestors {
@@ -1528,19 +1554,36 @@ impl Engine {
             if self.slashed.contains(a) || self.banned.contains(a) {
                 continue;
             }
-            // (a) trusted-attestor path: the local node is always trusted (the
-            // gateway/seed confirmation path), as is any explicitly-configured
-            // mutual-trust key (§6 — the other seed), else a peer at/above the bar.
+            // The submitter can NEVER confirm its own tile — the one invariant that
+            // survives the optimistic posture (even an assigned submitter is barred).
+            if submitter.is_some_and(|s| s == a) {
+                continue;
+            }
+            // (a) trusted path: the local node is always trusted (the gateway/seed
+            // confirmation path), as is any explicitly-configured mutual-trust key
+            // (§6 — the other seed), else a peer at/above the rep bar.
             if a == &self.self_pub
                 || self.trusted_keys.contains(a)
                 || self.reputation_of(a) >= TRUSTED_ATTESTOR_REP
             {
                 return true;
             }
+            // (b) assigned path (the scaling fix): the §6 audit lottery picked `A`
+            // to audit THIS tile for THIS submitter. `is_assigned` reads the
+            // submitter's rep (0 when the submitter is unknown — `reputation_of`
+            // returns 0 for an empty/unknown key), so an assigned non-self attestor
+            // confirms a fresh (rep-0) submitter's tile immediately — 1:1 with
+            // participation. Verifiable + unselectable, so it can't be gamed without
+            // grinding the auditor's own key (which throws away its standing).
+            let submitter_key = submitter.map(|s| s.as_str()).unwrap_or("");
+            if self.is_assigned(a, (sheep, frame, idx, pass), submitter_key) {
+                return true;
+            }
             distinct += 1;
             rep_sum = rep_sum.saturating_add(self.reputation_of(a));
         }
-        // (b) quorum path: enough distinct EARNED-rep attestors by count + sum.
+        // (c) quorum path (kept, harmless): enough distinct EARNED-rep attestors
+        // (none of them the submitter) by count + summed rep.
         distinct >= CONFIRM_QUORUM && rep_sum >= CONFIRM_QUORUM_REP_SUM
     }
 
