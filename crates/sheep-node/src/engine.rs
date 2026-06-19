@@ -64,6 +64,30 @@ pub const TRUST_REP: u64 = 64;
 /// trusted a submitter is (so reputation is never a full free pass).
 pub const SAMPLE_FLOOR: f64 = 0.05;
 
+/// §6 **reputation-anchored confirmation thresholds (the Sybil fix).** A tile is
+/// confirmed by a *reputation-weighted* rule rather than the old "any one
+/// attestation confirms", so a flood of disposable zero-rep keys can never
+/// self-confirm a peer's own (possibly bogus) tile — only EARNED standing
+/// counts toward confirmation.
+///
+/// A single attestor at or above this reputation confirms a tile alone (the
+/// "trusted-attestor" path). The local node is always treated as trusted
+/// regardless of this value, so the gateway/seed confirmation path is preserved.
+/// Set at half of [`TRUST_REP`]: a peer must have a meaningful body of
+/// log-derived useful work behind it before its lone word is load-bearing.
+pub const TRUSTED_ATTESTOR_REP: u64 = 32;
+
+/// §6 quorum size for the fallback "quorum" confirmation path: when no single
+/// trusted attestor exists, this many DISTINCT valid attestors are required…
+pub const CONFIRM_QUORUM: usize = 2;
+
+/// §6 …and the SUM of those distinct attestors' reputations must reach this.
+/// Because a fresh disposable key contributes `0` to the sum, a Sybil holding
+/// any number `K` of zero-rep keys can never satisfy the quorum — the sum stays
+/// `0`. Only keys that have earned standing (by honest attestation / confirmed
+/// work) move the sum, so confirmation is anchored to real, log-derived effort.
+pub const CONFIRM_QUORUM_REP_SUM: u64 = 24;
+
 /// §6 reputation-graduated sample rate for a submitter of standing `rep`.
 /// `max(SAMPLE_FLOOR, TRUST_REP / (TRUST_REP + rep))`. Pure; anyone recomputes
 /// it from a peer's log-derived rep, so two nodes agree on how heavily to audit.
@@ -116,6 +140,34 @@ pub fn assigned_to_audit(
     draw_bytes.copy_from_slice(&digest[..8]);
     let draw = u64::from_be_bytes(draw_bytes);
     draw < assign_threshold(sample_rate(submitter_rep))
+}
+
+/// §6 **pure audit-assignment over a snapshot of unaudited tiles.** Given a
+/// worker and a list of currently-unaudited tiles each tagged with its
+/// submitter's reputation `(sheep, frame, idx, pass, submitter_rep)`, return the
+/// subset this worker is assigned to audit under `round_salt`, applying the SAME
+/// [`assigned_to_audit`] rule the in-hand [`Engine::assign_for`] uses. Sharing
+/// this one implementation keeps the live (engine-in-hand) and cached (engine
+/// checked out) assign paths byte-identical (DRY).
+///
+/// Output is sorted by `(sheep, frame, idx, pass)` so two nodes hand out the same
+/// advisory set for the same inputs (the caller's snapshot map order is unstable).
+pub fn audits_for(
+    worker_pub: &str,
+    unaudited: &[(String, u32, u32, u32, u64)],
+    round_salt: &[u8],
+) -> Vec<(String, u32, u32, u32)> {
+    let mut out: Vec<(String, u32, u32, u32)> = unaudited
+        .iter()
+        .filter(|(sheep, frame, idx, pass, submitter_rep)| {
+            assigned_to_audit(worker_pub, (sheep.as_str(), *frame, *idx, *pass), *submitter_rep, round_salt)
+        })
+        .map(|(sheep, frame, idx, pass, _)| (sheep.clone(), *frame, *idx, *pass))
+        .collect();
+    out.sort_by(|a, b| {
+        (a.0.as_str(), a.1, a.2, a.3).cmp(&(b.0.as_str(), b.1, b.2, b.3))
+    });
+    out
 }
 
 /// The `[0, 2^64)` threshold a uniform draw must fall below to be "assigned"
@@ -602,6 +654,17 @@ impl Engine {
         *self.earned_tiles.entry(key.into()).or_insert(0) += tiles;
     }
 
+    /// Grant a key `rep` log-derived reputation directly (test / bootstrap
+    /// support). Equivalent to the key having earned `rep` standing via honest
+    /// attestation / confirmed work (§6), without re-running the render+attest
+    /// loop — lets a test stand up a "trusted" or "established" attestor for the
+    /// §6 confirmation rule without minutes of rendering. Banned keys never
+    /// accrue standing (mirrors the internal `bump_rep`). Production rep is
+    /// always log-derived from real attestations.
+    pub fn grant_rep(&mut self, key: impl Into<String>, rep: u64) {
+        self.bump_rep(&key.into(), rep);
+    }
+
     /// Override the audit round salt (§6). The transport/seed sets this swarm-
     /// wide; tests use it to prove assignment changes with the salt. It must
     /// stay outside any single auditor's control to preserve unselectability.
@@ -797,40 +860,58 @@ impl Engine {
     ) -> (Vec<crate::block::BlockId>, Vec<Coverage>) {
         let blocks = self.pick_blocks_for(worker_pub, want.max(1) as usize, now_ms);
 
-        // Audit assignments (§6): among observed-but-unconfirmed tiles, the
-        // ones THIS worker is assigned to (unpredictable, unselectable, verifiable).
-        let mut audits = Vec::new();
-        for (sheep, set) in &self.unaudited {
-            for &(frame, idx, pass) in set {
-                let tile = (sheep.as_str(), frame, idx, pass);
-                let submitter = self
-                    .submitter
-                    .get(&(sheep.clone(), frame, idx, pass))
-                    .map(|s| s.as_str())
-                    .unwrap_or("");
-                if self.is_assigned(worker_pub, tile, submitter) {
-                    audits.push(Coverage {
-                        sheep_id: sheep.clone(),
-                        frame,
-                        idx,
-                        pass,
-                        hash: String::new(),
-                    });
-                }
-            }
-        }
-        // Deterministic order (the maps above are unordered) so two nodes hand
-        // out the same advisory set for the same log.
-        audits.sort_by(|a, b| {
-            (a.sheep_id.as_str(), a.frame, a.idx, a.pass).cmp(&(
-                b.sheep_id.as_str(),
-                b.frame,
-                b.idx,
-                b.pass,
-            ))
-        });
+        // Audit assignments (§6): among observed-but-unconfirmed tiles, the ones
+        // THIS worker is assigned to (unpredictable, unselectable, verifiable).
+        // Delegate to the ONE canonical rule ([`audits_for`]) over the SAME cheap
+        // snapshot the cache path in `net` feeds it (`audit_inputs`), so both
+        // answers are byte-identical (DRY). `round_salt` is this engine's salt —
+        // a public, log-derived swarm-wide value, NOT random.
+        let audits = audits_for(worker_pub, &self.audit_inputs(), &self.round_salt)
+            .into_iter()
+            .map(|(sheep_id, frame, idx, pass)| Coverage {
+                sheep_id,
+                frame,
+                idx,
+                pass,
+                hash: String::new(),
+            })
+            .collect();
         (blocks, audits)
     }
+
+    /// §6 **cheap snapshot of the currently-unaudited tiles** as
+    /// `(sheep, frame, idx, pass, submitter_rep)` — the inputs [`audits_for`]
+    /// needs to compute a worker's audit assignments WITHOUT the live engine. The
+    /// in-hand [`assign_for`] and the cache path in `net` both run `audits_for`
+    /// over this, so the cached assign answer is byte-identical to the in-hand one.
+    ///
+    /// **Capped at [`Self::AUDIT_INPUTS_CAP`] tiles** to keep the cache cheap to
+    /// clone every refresh: a node may observe many unconfirmed tiles, but the
+    /// advisory hand-out only needs a representative working set (the missing tail
+    /// is picked up on a later refresh as the head confirms + drains). Tiles are
+    /// taken in a deterministic order (sorted by `(sheep, frame, idx, pass)`) so
+    /// the cap selects the same subset on every node, preserving convergence.
+    pub fn audit_inputs(&self) -> Vec<(String, u32, u32, u32, u64)> {
+        let mut all: Vec<(String, u32, u32, u32, u64)> = Vec::new();
+        for (sheep, set) in &self.unaudited {
+            for &(frame, idx, pass) in set {
+                let submitter_rep = self
+                    .submitter
+                    .get(&(sheep.clone(), frame, idx, pass))
+                    .map(|s| self.reputation_of(s))
+                    .unwrap_or(0);
+                all.push((sheep.clone(), frame, idx, pass, submitter_rep));
+            }
+        }
+        // Deterministic order so the cap below selects the same subset everywhere.
+        all.sort_by(|a, b| (a.0.as_str(), a.1, a.2, a.3).cmp(&(b.0.as_str(), b.1, b.2, b.3)));
+        all.truncate(Self::AUDIT_INPUTS_CAP);
+        all
+    }
+
+    /// Cap on [`Self::audit_inputs`] — the most-relevant unaudited tiles cached
+    /// for the §10 assign hand-out (keeps the per-refresh clone cheap).
+    pub const AUDIT_INPUTS_CAP: usize = 256;
 
     /// Pick up to `want` least-covered, uncapped, unclaimed-by-others blocks for
     /// `worker_pub` — the multi-block generalization of [`pick_block`] used by
@@ -1285,12 +1366,45 @@ impl Engine {
                 .insert(env.from.clone());
         }
 
-        // Confirm the tile (>=1 valid attestation) — convergent, no quorum.
-        let was_new = self
+        // §6 reputation ("proof of useful work"): an attestor that re-rendered
+        // and corroborates the standing consensus hash earns standing; the
+        // submitter whose tile is being attested earns standing too. Both are
+        // log-derived, so every node computes the same rep. **Done BEFORE the
+        // confirmation test** so this attestation's own rep bump (and that of
+        // any prior attestors) is reflected when we evaluate `is_confirmed_by`:
+        // an attestor that crosses [`TRUSTED_ATTESTOR_REP`] on THIS attestation
+        // confirms the tile on the same event. Rep-earning is UNCHANGED from the
+        // old model — this is the bootstrap by which honest auditors climb past
+        // the trust bar even before any of their attestations confirm anything.
+        if !att.hash.is_empty() {
+            self.bump_rep(&env.from, 1);
+            if let Some(sub) = self.submitter.get(&key).cloned() {
+                if sub != env.from {
+                    self.bump_rep(&sub, 1);
+                }
+            }
+        }
+
+        // §6 **reputation-anchored confirmation (the Sybil fix).** Confirm the
+        // tile iff its set of valid (non-slashed/banned) distinct attestors now
+        // satisfies the trusted-attestor OR quorum-rep-sum rule — recomputed from
+        // current log-derived rep on every attestation, so it is deterministic
+        // across nodes given the same log. CONVERGENCE NOTE: a tile attested only
+        // by browsers who become trusted LATER confirms on their NEXT attestation
+        // / a re-attest, NOT retroactively on the rep-change event — we do not
+        // rescan all tiles when a key's rep changes (no expensive global rescan).
+        // Acceptable for v1: a re-render under the audit lottery re-attests it.
+        let confirm_now = self.is_confirmed_by(&key);
+        let already = self
             .confirmed
-            .entry(att.sheep_id.clone())
-            .or_default()
-            .insert((att.frame, att.idx, att.pass));
+            .get(&att.sheep_id)
+            .is_some_and(|s| s.contains(&(att.frame, att.idx, att.pass)));
+        let was_new = confirm_now && !already && {
+            self.confirmed
+                .entry(att.sheep_id.clone())
+                .or_default()
+                .insert((att.frame, att.idx, att.pass))
+        };
         if was_new {
             // No longer merely unaudited.
             if let Some(u) = self.unaudited.get_mut(&att.sheep_id) {
@@ -1322,20 +1436,48 @@ impl Engine {
             }
         }
 
-        // §6 reputation ("proof of useful work"): an attestor that re-rendered
-        // and corroborates the standing consensus hash earns standing; the
-        // submitter whose tile is being confirmed earns standing too. Both are
-        // log-derived, so every node computes the same rep.
-        if !att.hash.is_empty() {
-            self.bump_rep(&env.from, 1);
-            if let Some(sub) = self.submitter.get(&key).cloned() {
-                if sub != env.from {
-                    self.bump_rep(&sub, 1);
-                }
-            }
-        }
-
         newly || was_new
+    }
+
+    /// §6 **reputation-anchored confirmation predicate (the Sybil fix).** Is the
+    /// tile `key = (sheep, frame, idx, pass)` confirmed by its current set of
+    /// **valid distinct attestors** — those recorded in `attestors[key]` that are
+    /// NOT slashed/banned? A slashed/banned attestor's word is worth nothing here,
+    /// so a key caught lying (honeypot/dispute) is dropped from the tally even if
+    /// it previously attested.
+    ///
+    /// Confirmed iff EITHER:
+    /// - **(a) trusted-attestor path:** at least one valid attestor is the LOCAL
+    ///   node (`self.self_pub`, always trusted — preserves the gateway/seed
+    ///   confirmation path) OR has `reputation_of(attestor) >= TRUSTED_ATTESTOR_REP`; OR
+    /// - **(b) quorum path:** there are `>= CONFIRM_QUORUM` distinct valid
+    ///   attestors AND the SUM of their `reputation_of(...)` is `>= CONFIRM_QUORUM_REP_SUM`.
+    ///
+    /// Rep-0 disposable keys add `0` to the quorum sum, so a Sybil with any number
+    /// of fresh keys can never reach the sum: only earned standing confirms.
+    /// Pure read over log-derived state (rep + slash sets) → deterministic across
+    /// nodes given the same log.
+    fn is_confirmed_by(&self, key: &(String, u32, u32, u32)) -> bool {
+        let Some(attestors) = self.attestors.get(key) else {
+            return false;
+        };
+        let mut distinct = 0usize;
+        let mut rep_sum: u64 = 0;
+        for a in attestors {
+            // Only valid attestors count (slashed/banned keys are discarded).
+            if self.slashed.contains(a) || self.banned.contains(a) {
+                continue;
+            }
+            // (a) trusted-attestor path: the local node is always trusted (the
+            // gateway/seed confirmation path), else a peer at/above the bar.
+            if a == &self.self_pub || self.reputation_of(a) >= TRUSTED_ATTESTOR_REP {
+                return true;
+            }
+            distinct += 1;
+            rep_sum = rep_sum.saturating_add(self.reputation_of(a));
+        }
+        // (b) quorum path: enough distinct EARNED-rep attestors by count + sum.
+        distinct >= CONFIRM_QUORUM && rep_sum >= CONFIRM_QUORUM_REP_SUM
     }
 
     /// An inbound `RepDelta` (§6): consume reputation/ban news so the swarm

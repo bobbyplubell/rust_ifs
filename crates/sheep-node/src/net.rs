@@ -1143,10 +1143,13 @@ fn dispatch_control(
                     }
                 }
                 None => {
-                    // Render window: compute blocks from the cached inputs. Audits
-                    // are a §6 advisory nicety needing heavier state (the observed-
-                    // but-unconfirmed set); empty during a render is acceptable —
-                    // the gateway ingest-audits browser submissions independently.
+                    // Render window (the common case — a render owns the engine
+                    // almost continuously): compute BOTH blocks and audits from the
+                    // cached inputs via the SAME pure rules the in-hand path uses,
+                    // so a browser reliably gets audit work (the offload that lets
+                    // peers confirm each other's tiles, not just the seeds). Blocks
+                    // via `pick_blocks`; audits via `audits_for` over the cached
+                    // unaudited snapshot + the engine's (log-derived) round salt.
                     let blocks = crate::block::pick_blocks(
                         &assign_cache.flock_cov,
                         assign_cache.total_coverage,
@@ -1155,9 +1158,14 @@ fn dispatch_control(
                         want.max(1) as usize,
                         now,
                     );
+                    let audits = crate::engine::audits_for(
+                        &worker_pub,
+                        &assign_cache.audit_inputs,
+                        &assign_cache.round_salt,
+                    );
                     AssignResult {
                         blocks: block_tuples(&blocks),
-                        audits: Vec::new(),
+                        audits,
                     }
                 }
             };
@@ -1201,14 +1209,26 @@ struct AssignCache {
     total_coverage: u64,
     /// Live soft claims as `(block_wire_id, expiry_ms, claimant_pub)` (§4).
     claims: Vec<(String, u64, String)>,
+    /// §6 audit inputs: a capped snapshot of currently-unaudited tiles tagged
+    /// with each submitter's reputation `(sheep, frame, idx, pass, submitter_rep)`,
+    /// so the cache path can compute a worker's audit assignments via the SAME
+    /// pure [`Engine::audit_inputs`]/`audits_for` rule the in-hand path uses.
+    audit_inputs: Vec<(String, u32, u32, u32, u64)>,
+    /// §6 the audit round salt in force on the engine — a public, log-derived,
+    /// swarm-wide value (NOT random). Cached so cache-path assignments reproduce
+    /// the in-hand `assigned_to_audit(... round_salt)` exactly.
+    round_salt: Vec<u8>,
 }
 
 /// Refresh the assign cache from the in-hand engine. Cheap: clones a handful of
-/// sheep + the live-claim set. Called at every site `last_snapshot` is refreshed.
+/// sheep + the live-claim set + a capped unaudited-tile snapshot. Called at every
+/// site `last_snapshot` is refreshed.
 fn refresh_assign_cache(engine: &Engine, cache: &mut AssignCache) {
     cache.flock_cov = engine.assign_inputs();
     cache.total_coverage = engine.total_coverage();
     cache.claims = engine.claim_inputs();
+    cache.audit_inputs = engine.audit_inputs();
+    cache.round_salt = engine.round_salt().to_vec();
 }
 
 /// Build a read-only snapshot from the engine.
@@ -1635,11 +1655,26 @@ fn apply_inbound_audit_only(
 
 /// §6.1 ingest-audit gate: for a render submission (Coverage / PieceUpload),
 /// decide whether to reject it before vouching. Returns `Some(reason)` to reject,
-/// `None` to accept. Reputation-graduated *sampling* (reusing the engine's
-/// unpredictable `is_assigned` with this node as the auditor): if sampled, the
-/// node re-renders the tile and rejects on a hash mismatch; if not sampled, it
-/// accepts (the swarm peer-audits downstream). A submission for an unknown sheep
-/// is left to `engine.apply` to reject (it can't be re-rendered without a genome).
+/// `None` to accept.
+///
+/// **The offload (reputation-graduated sampling, NOT 100%).** The gateway does
+/// not re-render every browser write — it SAMPLES, reusing the engine's
+/// unpredictable, reputation-graduated `is_assigned` lottery with THIS node as
+/// the auditor and the SUBMITTER's log-derived rep graduating the rate. When a
+/// submission IS sampled, the node re-renders and rejects on a hash mismatch
+/// (verify-before-vouch, unchanged). When it is NOT sampled, the node accepts
+/// WITHOUT re-rendering — it just relays the envelope; the tile enters as
+/// unaudited and is confirmed later by peer auditors under the §6 reputation-
+/// anchored quorum. This is the actual offload: proven contributors stop forcing
+/// the gateway to redo their droplets. (The `--ingest-audit off` escape disables
+/// the gate entirely; ON, it is now SAMPLED, not all-of-it.)
+///
+/// **Safe bootstrap.** A new/low-rep submitter has `sample_rate(rep) ≈ 1.0`, so
+/// it is still re-rendered on ~every tile — a disposable browser key cannot slip
+/// a bogus tile past the gateway until it has *earned* standing, and even a fully-
+/// trusted submitter never drops below the sampling floor (no full free pass). A
+/// submission for an unknown sheep is left to `engine.apply` to reject (it can't
+/// be re-rendered without a genome).
 fn ingest_audit_reject(engine: Option<&Engine>, env: &Envelope) -> Option<String> {
     let eng = engine?;
     let (sheep, frame, idx, pass, hash) = match env.t.as_str() {

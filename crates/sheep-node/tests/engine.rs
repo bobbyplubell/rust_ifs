@@ -10,7 +10,7 @@
 use ed25519_dalek::SigningKey;
 use flame_core::chunked::{hist_hash_hex, render_batch};
 use sheep_node::block::{block_units, BlockId, Unit};
-use sheep_node::engine::{Engine, COVERAGE_FLOOR, COVERAGE_TOLERANCE};
+use sheep_node::engine::{Engine, COVERAGE_FLOOR, COVERAGE_TOLERANCE, TRUSTED_ATTESTOR_REP};
 use sheep_node::spec::{N_FRAMES, SPP};
 use sheep_proto::derive::derive_minted;
 use sheep_proto::identity::{sheep_identity, ResolutionTier};
@@ -139,8 +139,12 @@ fn least_covered_selection_and_cap() {
 
     // Drive sheep A's confirmed coverage well above B's, past the floor+tol so
     // the cap engages. Each confirmed tile = one attestation on a distinct
-    // (frame, idx). We use a separate auditor key.
+    // (frame, idx). We use a separate auditor key, granted trusted standing so a
+    // single attestation confirms (§6 trusted-attestor path) — this test is about
+    // the §4.1 coverage cap, not the new §6 quorum, so we keep "one attestation =
+    // one confirmed tile" by making the lone auditor a trusted (rep >= 32) one.
     let auditor = key(8);
+    eng.grant_rep(pub_hex(&auditor), TRUSTED_ATTESTOR_REP);
     let n_a = (COVERAGE_FLOOR + COVERAGE_TOLERANCE + 4) as u32; // plenty over the cap
     for i in 0..n_a {
         let frame = i / 64;
@@ -206,6 +210,54 @@ fn assign_cache_path_yields_blocks_without_live_engine() {
     // `Engine::assign_for` (the `Some` branch) selects the very same blocks.
     let (in_hand, _audits) = eng.assign_for(&worker, 4, 2000);
     assert_eq!(in_hand, blocks, "cache path matches the in-hand assign exactly");
+}
+
+// ---- §6 advisory assign: cache path also hands out AUDIT tiles ---------------
+
+#[test]
+fn assign_cache_path_yields_audits_without_live_engine() {
+    // Part 1: the assign cache must serve AUDIT tiles too (not just blocks) while
+    // the engine is checked out for a render — otherwise browsers never audit and
+    // only the seeds confirm. Mirror `assign_cache_path_yields_blocks_without_live_engine`:
+    // derive the cached audit inputs from a populated engine, then compute a
+    // worker's audits via the SAME pure `audits_for` the cache path in `net` uses.
+    use sheep_node::engine::audits_for;
+
+    let mut eng = Engine::new(key(1));
+    let minter = key(2);
+    let (m, id) = mint(&minter, 1_000_000, ResolutionTier::R384);
+    assert!(eng.apply(&m, 1000));
+
+    // Populate the unaudited set: a submitter gossips many Coverage tiles (a fresh
+    // rep-0 submitter → sampled at ~100%, so the worker is assigned a healthy set).
+    let submitter = key(7);
+    for i in 0..64u32 {
+        let cov = Coverage { sheep_id: id.clone(), frame: i, idx: 0, pass: 0, hash: "ab".repeat(32) };
+        let env = signed(proto::PROGRESS, &submitter, 1000, serde_json::to_value(&cov).unwrap());
+        assert!(eng.apply(&env, 1000));
+    }
+
+    // These are exactly what `refresh_assign_cache` snapshots while in hand.
+    let audit_inputs = eng.audit_inputs();
+    let salt = eng.round_salt().to_vec();
+    assert!(!audit_inputs.is_empty(), "the unaudited tiles are cached for the assign hand-out");
+
+    // A worker computes its audit assignments from the cache WITHOUT the engine.
+    let worker = pub_hex(&key(42));
+    let cached_audits = audits_for(&worker, &audit_inputs, &salt);
+    assert!(
+        !cached_audits.is_empty(),
+        "the cache path hands out audit tiles for an assigned worker on observed tiles"
+    );
+
+    // Byte-identical to the in-hand path for the same worker (the `Some` branch of
+    // `Control::Assign` calls `assign_for`, whose audit half is `audits_for` too).
+    let (_blocks, in_hand_audits) = eng.assign_for(&worker, 4, 2000);
+    let in_hand: Vec<(String, u32, u32, u32)> = in_hand_audits
+        .iter()
+        .map(|c| (c.sheep_id.clone(), c.frame, c.idx, c.pass))
+        .collect();
+    assert_eq!(in_hand, cached_audits, "cache path audits match the in-hand assign exactly");
 }
 
 // ---- claim lifecycle + equivocation (§4, §7) --------------------------------
@@ -301,8 +353,12 @@ fn credits_accrue_at_tiles_per_credit() {
 
     // Render enough blocks (16 units each) that our own submissions exceed
     // TILES_PER_CREDIT (128). 128/16 = 8 full blocks. We render, then have an
-    // auditor confirm each rendered (frame, idx) so the tile is credited.
+    // auditor confirm each rendered (frame, idx) so the tile is credited. The
+    // auditor is granted trusted standing (§6) so its lone attestation confirms —
+    // this test exercises the credit ledger (confirmed → earned), not the §6
+    // quorum, so we keep one trusted attestation = one confirmed tile.
     let auditor = key(8);
+    eng.grant_rep(pub_hex(&auditor), TRUSTED_ATTESTOR_REP);
     let mut now = 2000u64;
     let mut confirmed_units: std::collections::HashSet<(u32, u32, u32)> = Default::default();
     for _ in 0..10 {
@@ -337,8 +393,11 @@ fn apply_is_idempotent_under_replay() {
     assert!(!eng.apply(&m, 1000), "duplicate delivery is a no-op (dedup)");
     assert_eq!(eng.flock().len(), 1, "flock has exactly one sheep after replay");
 
-    // An attestation, then its duplicate, must not double-count coverage.
+    // An attestation, then its duplicate, must not double-count coverage. The
+    // auditor is granted trusted standing (§6) so a single attestation confirms —
+    // this test is about gossip dedup/idempotency, not the §6 quorum.
     let auditor = key(8);
+    eng.grant_rep(pub_hex(&auditor), TRUSTED_ATTESTOR_REP);
     let att = Attestation { sheep_id: id_hex.clone(), frame: 0, idx: 0, pass: 0, hash: "00".into() };
     let aenv = signed(proto::ATTEST, &auditor, 1000, serde_json::to_value(&att).unwrap());
     assert!(eng.apply(&aenv, 1000));
@@ -355,7 +414,10 @@ fn second_pass_over_same_frame_idx_grows_coverage() {
     let minter = key(2);
     let (m, id_hex) = mint(&minter, 1_000_000, ResolutionTier::R384);
     assert!(eng.apply(&m, 1000));
+    // Granted trusted standing (§6) so a single attestation confirms — this test
+    // is about pass-aware density (a later pass = fresh coverage), not the quorum.
     let auditor = key(8);
+    eng.grant_rep(pub_hex(&auditor), TRUSTED_ATTESTOR_REP);
 
     // Confirm (frame 3, idx 7, pass 0).
     let a0 = Attestation { sheep_id: id_hex.clone(), frame: 3, idx: 7, pass: 0, hash: "00".into() };
