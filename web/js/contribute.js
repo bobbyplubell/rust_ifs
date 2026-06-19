@@ -27,6 +27,12 @@ export const SPP = 200_000;     // spec::SPP
 export const N_FRAMES = 128;    // spec::N_FRAMES
 export const SS = 1;            // ResolutionTier supersample
 
+// Max tiles rendered per assign cycle (the node may hand out a big bundle). Keep
+// each cycle short so counters update live and the loop re-assigns often (fresh
+// frontier + latest standing). Audits ~match blocks for roughly 1:1 audit↔render.
+export const MAX_BLOCKS_PER_CYCLE = 12;
+export const MAX_AUDITS_PER_CYCLE = 12;
+
 // base64(deflate(LE-u64 histogram cells)). The node decodes with
 // hist::decode_accum, which magic-sniffs zstd vs zlib/deflate; CompressionStream
 // ('deflate') emits a zlib stream (magic 0x78) the node accepts. The histogram
@@ -177,39 +183,46 @@ export class Contributor {
       }
       if (!this.running) return;
 
-      const blocks = bundle.blocks || [];
-      const audits = bundle.audits || [];
+      // Cap work per cycle. The node may hand out a large bundle (dozens of
+      // blocks + audits); processing it all before re-assigning makes the UI
+      // look frozen and starves standing updates. Take a small slice, render it
+      // (updating the counters PER tile as it lands), then loop — which re-pulls
+      // a fresh advancing frontier and the latest credits/confirmed_tiles. Audits
+      // are capped to ~match blocks (roughly 1:1 audit↔render, §6).
+      const blocks = (bundle.blocks || []).slice(0, MAX_BLOCKS_PER_CYCLE);
+      const audits = (bundle.audits || []).slice(0, MAX_AUDITS_PER_CYCLE);
       if (!blocks.length && !audits.length) {
         await this._sleep(this.opts.idleMs ?? 4000);
         continue;
       }
 
-      // Render + submit each block; resolve the genome from the cached flock.
+      // Fire onResult AS EACH tile completes (not after the whole bundle) so the
+      // Rendered/Accepted/Credits counters climb live instead of jumping once the
+      // entire batch finishes.
+      const emit = (r) => { if (r && this.running) this.opts.onResult?.(r); };
+
       const jobs = blocks.map(async (b) => {
         const g = this.opts.genomeFor?.(b.sheep_id);
-        if (!g) return null; // unknown sheep (flock not yet polled) — skip
+        if (!g) return; // unknown sheep (flock not yet polled) — skip
         try {
-          return await renderAndSubmit(this.pool, this.identity, this.api, b, g.genomeJson, g.edge);
+          emit(await renderAndSubmit(this.pool, this.identity, this.api, b, g.genomeJson, g.edge));
         } catch (e) {
           this.opts.onError?.(e);
-          return null;
         }
       });
 
       const auditJobs = audits.map(async (a) => {
         const g = this.opts.genomeFor?.(a.sheep_id);
-        if (!g) return null;
+        if (!g) return;
         try {
-          return await renderAndAttest(this.pool, this.identity, this.api, a, g.genomeJson, g.edge);
+          emit(await renderAndAttest(this.pool, this.identity, this.api, a, g.genomeJson, g.edge));
         } catch (e) {
           this.opts.onError?.(e);
-          return null;
         }
       });
 
-      const replies = (await Promise.all([...jobs, ...auditJobs])).filter(Boolean);
+      await Promise.all([...jobs, ...auditJobs]);
       if (!this.running) return;
-      for (const r of replies) this.opts.onResult?.(r);
     }
   }
 
