@@ -837,63 +837,38 @@ impl Engine {
     /// [`assign_for`]. Pure (no state mutation); skips blocks another live peer
     /// holds (§4 soft claims) and ones this worker already holds.
     fn pick_blocks_for(&self, worker_pub: &str, want: usize, now_ms: u64) -> Vec<BlockId> {
-        if self.flock.is_empty() || want == 0 {
-            return Vec::new();
-        }
-        let total = self.total_coverage();
-        let min_cov = self
-            .flock
-            .keys()
-            .map(|s| self.coverage(s))
-            .min()
-            .unwrap_or(0);
-        let enforce = total > COVERAGE_FLOOR;
+        // Delegate to the ONE canonical selection rule ([`crate::block::pick_blocks`]),
+        // passing the engine-derived inputs it needs (the live cache path in `net`
+        // feeds it the SAME shapes, so both answers are byte-identical). Cheap: the
+        // flock is a handful of sheep and the claim set is the live-claim count.
+        crate::block::pick_blocks(
+            &self.assign_inputs(),
+            self.total_coverage(),
+            &self.claim_inputs(),
+            worker_pub,
+            want,
+            now_ms,
+        )
+    }
 
-        // Eligible sheep (under the §4.1 cap), least-covered first, tie-broken
-        // by identity hex for determinism — same ordering as `pick_block`.
-        let mut eligible: Vec<(&String, u64)> = self
-            .flock
+    /// `(sheep_hex, confirmed_coverage)` for every known sheep — the flock-coverage
+    /// input to [`crate::block::pick_blocks`]. Cloned cheaply (a handful of sheep);
+    /// the run loop caches this for the §10 assign render-window fallback.
+    pub fn assign_inputs(&self) -> Vec<(String, u64)> {
+        self.flock
             .keys()
-            .map(|s| (s, self.coverage(s)))
-            .filter(|(_, cov)| !(enforce && *cov > min_cov + COVERAGE_TOLERANCE))
-            .collect();
-        eligible.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+            .map(|s| (s.clone(), self.coverage(s)))
+            .collect()
+    }
 
-        let mut out = Vec::new();
-        for (sheep_hex, _) in &eligible {
-            let Some(identity) = decode_hex_32(sheep_hex) else {
-                continue;
-            };
-            let mut block_index = 0u64;
-            loop {
-                if out.len() >= want {
-                    return out;
-                }
-                let block = BlockId {
-                    sheep_identity: identity,
-                    block_index,
-                };
-                let wire = block.to_wire();
-                let claimed_by_other = self
-                    .claims
-                    .get(&wire)
-                    .is_some_and(|c| c.expiry_ms > now_ms && c.claimant != worker_pub);
-                if !claimed_by_other {
-                    out.push(block);
-                    // One block per least-covered sheep per pass keeps the
-                    // hand-out spread across sheep; move to the next sheep.
-                    break;
-                }
-                block_index += 1;
-                if block_index > 1_000_000 {
-                    break;
-                }
-            }
-            if out.len() >= want {
-                break;
-            }
-        }
-        out
+    /// Live soft claims as `(block_wire_id, expiry_ms, claimant_pub)` — the claim
+    /// input to [`crate::block::pick_blocks`]. Cloned cheaply (the live-claim set);
+    /// the run loop caches this for the §10 assign render-window fallback.
+    pub fn claim_inputs(&self) -> Vec<(String, u64, String)> {
+        self.claims
+            .iter()
+            .map(|(wire, c)| (wire.clone(), c.expiry_ms, c.claimant.clone()))
+            .collect()
     }
 
     /// §6.1 **gateway ingest-audit re-render check.** Re-render the tile a

@@ -691,6 +691,11 @@ async fn event_loop(
         credits: 0,
         live_claims: Vec::new(),
     };
+    // A cached assign input set, refreshed alongside `last_snapshot` whenever we
+    // hold the engine. `Control::Assign` is answered from this even while a render
+    // owns the engine — otherwise advisory hand-out returns empty for nearly the
+    // whole life of a busy node and browser contributors never get work to render.
+    let mut assign_cache = AssignCache::default();
 
     // §10 convergence — a transport-side mirror of the engine's `birth_log`
     // (every accepted Mint/Breed + Vote envelope), refreshed whenever we hold the
@@ -775,6 +780,7 @@ async fn event_loop(
                         }
                         last_snapshot = snapshot(&eng);
                         refresh_birth_cache(&eng, &mut birth_cache);
+                        refresh_assign_cache(&eng, &mut assign_cache);
                         engine_slot = Some(eng);
                     }
                     Err(e) => {
@@ -821,6 +827,7 @@ async fn event_loop(
                         }
                         last_snapshot = snapshot(&eng);
                         refresh_birth_cache(&eng, &mut birth_cache);
+                        refresh_assign_cache(&eng, &mut assign_cache);
                         engine_slot = Some(eng);
                     }
                     Err(e) => {
@@ -967,6 +974,7 @@ async fn event_loop(
                 // just applied.
                 if let Some(eng) = engine_slot.as_ref() {
                     refresh_birth_cache(eng, &mut birth_cache);
+                    refresh_assign_cache(eng, &mut assign_cache);
                 }
                 // If the engine is in hand (no render in flight), drain any newly
                 // buffered pieces + refresh the snapshot immediately so the watch
@@ -1010,7 +1018,7 @@ async fn event_loop(
                         c, &mut swarm, &mut engine_slot, &mut pending_inbound,
                         &mut audited_seen, accum.as_ref(), read_state.as_ref(),
                         &mut pending_pieces, &mut registered, &mut retracted_seen,
-                        accumulate, ingest_audit, &mut last_snapshot,
+                        accumulate, ingest_audit, &mut last_snapshot, &assign_cache,
                     ),
                     None => true,
                 };
@@ -1028,7 +1036,7 @@ async fn event_loop(
                         c, &mut swarm, &mut engine_slot, &mut pending_inbound,
                         &mut audited_seen, accum.as_ref(), read_state.as_ref(),
                         &mut pending_pieces, &mut registered, &mut retracted_seen,
-                        accumulate, ingest_audit, &mut last_snapshot,
+                        accumulate, ingest_audit, &mut last_snapshot, &assign_cache,
                     );
                     if shutdown { return; }
                     if let Some(eng) = engine_slot.as_ref() {
@@ -1060,6 +1068,7 @@ fn dispatch_control(
     accumulate: bool,
     ingest_audit: bool,
     last_snapshot: &mut Snapshot,
+    assign_cache: &AssignCache,
 ) -> bool {
     match ctl {
         Control::Snapshot(reply) => {
@@ -1100,30 +1109,57 @@ fn dispatch_control(
             let _ = reply.send(result);
         }
         Control::Assign(worker_pub, want, reply) => {
-            // §10 advisory hand-out (read-only). Answerable from the in-hand
-            // engine; if a render owns it, answer empty (the browser retries —
-            // advisory, never load-bearing).
+            // §10 advisory hand-out (read-only). Always answerable, just like
+            // `Control::Snapshot`: serve full blocks+audits from the in-hand engine
+            // if present; else serve BLOCKS from the assign cache (refreshed every
+            // time we held the engine) via the SAME pure selection rule. A render
+            // owns the engine for nearly the whole life of a busy node, so without
+            // this the advisory hand-out returns empty almost always and a browser
+            // contributor gets NO work and never renders (the live-deploy bug).
             let now = now_ms();
+            // Expand a list of advisory blocks into the §10 AssignResp tuples —
+            // `(block_wire_id, sheep_hex, frame, idx, pass)` per unit. Shared by
+            // both branches so the wire shape is identical in-hand and cached.
+            let block_tuples = |blocks: &[crate::block::BlockId]| {
+                blocks
+                    .iter()
+                    .flat_map(|b| {
+                        let sheep = b.sheep_hex();
+                        crate::block::block_units(*b)
+                            .into_iter()
+                            .map(move |u| (b.to_wire(), sheep.clone(), u.frame, u.idx, u.pass))
+                    })
+                    .collect::<Vec<_>>()
+            };
             let result = match engine_slot.as_ref() {
                 Some(eng) => {
                     let (blocks, audits) = eng.assign_for(&worker_pub, want, now);
                     AssignResult {
-                        blocks: blocks
-                            .iter()
-                            .flat_map(|b| {
-                                let sheep = b.sheep_hex();
-                                crate::block::block_units(*b).into_iter().map(move |u| {
-                                    (b.to_wire(), sheep.clone(), u.frame, u.idx, u.pass)
-                                })
-                            })
-                            .collect(),
+                        blocks: block_tuples(&blocks),
                         audits: audits
                             .iter()
                             .map(|c| (c.sheep_id.clone(), c.frame, c.idx, c.pass))
                             .collect(),
                     }
                 }
-                None => AssignResult { blocks: Vec::new(), audits: Vec::new() },
+                None => {
+                    // Render window: compute blocks from the cached inputs. Audits
+                    // are a §6 advisory nicety needing heavier state (the observed-
+                    // but-unconfirmed set); empty during a render is acceptable —
+                    // the gateway ingest-audits browser submissions independently.
+                    let blocks = crate::block::pick_blocks(
+                        &assign_cache.flock_cov,
+                        assign_cache.total_coverage,
+                        &assign_cache.claims,
+                        &worker_pub,
+                        want.max(1) as usize,
+                        now,
+                    );
+                    AssignResult {
+                        blocks: block_tuples(&blocks),
+                        audits: Vec::new(),
+                    }
+                }
             };
             let _ = reply.send(result);
         }
@@ -1148,6 +1184,31 @@ fn refresh_birth_cache(engine: &Engine, cache: &mut Vec<Envelope>) {
     }
     let start = log.len().saturating_sub(FLOCK_SYNC_MAX);
     *cache = log[start..].to_vec();
+}
+
+/// §10 advisory-assign cache: the small, cheap-to-clone inputs
+/// [`crate::block::pick_blocks`] needs, refreshed whenever we hold the engine.
+/// `Control::Assign` is answered from this even while a render owns the engine on
+/// its blocking thread — otherwise, since the engine renders almost continuously,
+/// assign requests would (correctly) be dropped and a browser contributor would
+/// get NO work and never render (the live-deploy bug). Mirrors `last_snapshot`.
+/// Empty until the boot-mint returns the engine.
+#[derive(Default)]
+struct AssignCache {
+    /// `(sheep_hex, confirmed_coverage)` per known sheep.
+    flock_cov: Vec<(String, u64)>,
+    /// Flock-wide confirmed total (the §4.1 floor's input).
+    total_coverage: u64,
+    /// Live soft claims as `(block_wire_id, expiry_ms, claimant_pub)` (§4).
+    claims: Vec<(String, u64, String)>,
+}
+
+/// Refresh the assign cache from the in-hand engine. Cheap: clones a handful of
+/// sheep + the live-claim set. Called at every site `last_snapshot` is refreshed.
+fn refresh_assign_cache(engine: &Engine, cache: &mut AssignCache) {
+    cache.flock_cov = engine.assign_inputs();
+    cache.total_coverage = engine.total_coverage();
+    cache.claims = engine.claim_inputs();
 }
 
 /// Build a read-only snapshot from the engine.

@@ -164,6 +164,50 @@ fn least_covered_selection_and_cap() {
     let _ = id_b;
 }
 
+// ---- §10 advisory assign: cache path serves work without the live engine ----
+
+#[test]
+fn assign_cache_path_yields_blocks_without_live_engine() {
+    // The live-deploy bug: a busy node holds the engine in a render almost
+    // continuously, so `Control::Assign`'s `Some(engine)` branch is rarely taken.
+    // The fix serves blocks from a cache of the small selection inputs
+    // (`assign_inputs`/`total_coverage`/`claim_inputs`) via the SAME pure
+    // `pick_blocks` the in-hand path uses. Here we simulate the cache path: derive
+    // the cached inputs from a populated engine, then select WITHOUT the engine.
+    use sheep_node::block::pick_blocks;
+
+    let mut eng = Engine::new(key(1));
+    let minter = key(2);
+    let (m_a, id_a) = mint(&minter, 1_000_000, ResolutionTier::R384);
+    let (m_b, id_b) = mint(&minter, 2_000_000, ResolutionTier::R384);
+    assert!(eng.apply(&m_a, 1000));
+    assert!(eng.apply(&m_b, 1000));
+
+    // These are exactly what `refresh_assign_cache` snapshots while the engine is
+    // in hand — cheap clones of a handful of sheep + the live-claim set.
+    let flock_cov = eng.assign_inputs();
+    let total = eng.total_coverage();
+    let claims = eng.claim_inputs();
+    assert_eq!(flock_cov.len(), 2, "both sheep are in the cached flock-coverage");
+
+    // A fresh browser worker, no live engine — the cache path must hand out work.
+    let worker = pub_hex(&key(42));
+    let blocks = pick_blocks(&flock_cov, total, &claims, &worker, 4, 2000);
+    assert!(
+        !blocks.is_empty(),
+        "assign yields blocks from the cache for a fresh worker on a non-empty flock"
+    );
+    // Spread across the two least-covered (here equal-coverage) sheep.
+    let sheep_seen: std::collections::HashSet<String> =
+        blocks.iter().map(|b| b.sheep_hex()).collect();
+    assert!(sheep_seen.contains(&id_a) || sheep_seen.contains(&id_b));
+
+    // The cache path is byte-identical to the in-hand path for the same inputs:
+    // `Engine::assign_for` (the `Some` branch) selects the very same blocks.
+    let (in_hand, _audits) = eng.assign_for(&worker, 4, 2000);
+    assert_eq!(in_hand, blocks, "cache path matches the in-hand assign exactly");
+}
+
 // ---- claim lifecycle + equivocation (§4, §7) --------------------------------
 
 #[test]

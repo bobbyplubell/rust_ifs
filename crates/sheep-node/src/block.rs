@@ -142,6 +142,92 @@ fn decode_hex_32(s: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
+/// §4/§4.1 **pure block-selection** — the single canonical implementation of
+/// "which least-covered, uncapped, unclaimed-by-others blocks should this worker
+/// render next". Both the live in-hand path ([`crate::engine::Engine::pick_blocks_for`])
+/// and the cache path (the `Control::Assign` render-window fallback in `net`) call
+/// THIS, so there is exactly one selection rule (DRY) and the cached answer is
+/// byte-identical to the in-hand one for the same inputs.
+///
+/// Inputs (all engine-derived, so this stays a pure read with no engine state):
+/// - `flock_cov`: `(sheep_hex, confirmed_coverage)` for every known sheep.
+/// - `total_coverage`: the flock-wide confirmed total (the §4.1 floor's input).
+/// - `claims`: live soft claims as `(block_wire_id, expiry_ms, claimant_pub)`.
+/// - `worker_pub`: the requesting worker (lowercase hex); a block this worker
+///   already holds is NOT skipped (it's reassignable to its own claimant).
+/// - `want`: max blocks to return.
+/// - `now_ms`: wall clock, for claim expiry.
+///
+/// Selection rule (must match `pick_block`): eligible sheep are those under the
+/// §4.1 coverage cap (`!(enforce && cov > min_cov + COVERAGE_TOLERANCE)` where
+/// `enforce = total > COVERAGE_FLOOR`), ordered least-covered first, tie-broken by
+/// sheep hex for determinism. One block per eligible sheep — the first block index
+/// not held by ANOTHER live claimant (`expiry_ms > now && claimant != worker_pub`).
+/// Loops are capped at 1_000_000 block indices to bound a pathological search.
+pub fn pick_blocks(
+    flock_cov: &[(String, u64)],
+    total_coverage: u64,
+    claims: &[(String, u64, String)],
+    worker_pub: &str,
+    want: usize,
+    now_ms: u64,
+) -> Vec<BlockId> {
+    use crate::engine::{COVERAGE_FLOOR, COVERAGE_TOLERANCE};
+
+    if flock_cov.is_empty() || want == 0 {
+        return Vec::new();
+    }
+    let min_cov = flock_cov.iter().map(|(_, c)| *c).min().unwrap_or(0);
+    let enforce = total_coverage > COVERAGE_FLOOR;
+
+    // Eligible sheep (under the §4.1 cap), least-covered first, tie-broken by
+    // identity hex for determinism — same ordering as `pick_block`.
+    let mut eligible: Vec<(&String, u64)> = flock_cov
+        .iter()
+        .map(|(s, c)| (s, *c))
+        .filter(|(_, cov)| !(enforce && *cov > min_cov + COVERAGE_TOLERANCE))
+        .collect();
+    eligible.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+
+    // A live claim held by ANOTHER peer (§4 soft-claim collision avoidance).
+    let claimed_by_other = |wire: &str| -> bool {
+        claims
+            .iter()
+            .any(|(w, exp, claimant)| w == wire && *exp > now_ms && claimant != worker_pub)
+    };
+
+    let mut out = Vec::new();
+    for (sheep_hex, _) in &eligible {
+        let Some(identity) = decode_hex_32(sheep_hex) else {
+            continue;
+        };
+        let mut block_index = 0u64;
+        loop {
+            if out.len() >= want {
+                return out;
+            }
+            let block = BlockId {
+                sheep_identity: identity,
+                block_index,
+            };
+            if !claimed_by_other(&block.to_wire()) {
+                out.push(block);
+                // One block per least-covered sheep per pass keeps the
+                // hand-out spread across sheep; move to the next sheep.
+                break;
+            }
+            block_index += 1;
+            if block_index > 1_000_000 {
+                break;
+            }
+        }
+        if out.len() >= want {
+            break;
+        }
+    }
+    out
+}
+
 impl BlockId {
     /// The wire string form: `"<sheep_identity_hex>:<block_index>"`.
     pub fn to_wire(&self) -> String {
@@ -219,5 +305,61 @@ mod tests {
         assert_eq!(BlockId::from_wire(&wire), Some(block));
         assert_eq!(BlockId::from_wire("nope"), None);
         assert_eq!(BlockId::from_wire("ab:notanumber"), None);
+    }
+
+    fn hex32(b: u8) -> String {
+        hex_lower(&[b; 32])
+    }
+
+    #[test]
+    fn pick_blocks_least_covered_first_and_skips_others_claims() {
+        // Two sheep: `lo` (less covered) should be handed out before `hi`.
+        let lo = hex32(0x01);
+        let hi = hex32(0x02);
+        let worker = "worker_a";
+        let other = "worker_b";
+        // Total well under the floor → no §4.1 cap; both sheep are eligible.
+        let flock_cov = vec![(hi.clone(), 50u64), (lo.clone(), 10u64)];
+
+        // `other` holds `lo:0` (live), so the worker must skip to `lo:1`.
+        let lo0 = BlockId { sheep_identity: [0x01; 32], block_index: 0 }.to_wire();
+        let claims = vec![(lo0, 10_000u64, other.to_string())];
+
+        // want=2 → one block per eligible sheep, least-covered (lo) first.
+        let out = pick_blocks(&flock_cov, 60, &claims, worker, 2, 1_000);
+        assert_eq!(out.len(), 2);
+        // First is `lo`, and it skipped index 0 (held by another peer) → index 1.
+        assert_eq!(out[0].sheep_hex(), lo);
+        assert_eq!(out[0].block_index, 1, "must skip the other-claimed lo:0");
+        // Second is the more-covered sheep `hi`, its first (unclaimed) block.
+        assert_eq!(out[1].sheep_hex(), hi);
+        assert_eq!(out[1].block_index, 0);
+
+        // `want` is respected: only the least-covered sheep's block.
+        let one = pick_blocks(&flock_cov, 60, &claims, worker, 1, 1_000);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].sheep_hex(), lo);
+    }
+
+    #[test]
+    fn pick_blocks_ignores_own_and_expired_claims() {
+        let s = hex32(0x07);
+        let worker = "me";
+        let flock_cov = vec![(s.clone(), 0u64)];
+        let s0 = BlockId { sheep_identity: [0x07; 32], block_index: 0 }.to_wire();
+
+        // A claim the WORKER itself holds does not block its own reassignment.
+        let own = vec![(s0.clone(), 10_000u64, worker.to_string())];
+        let out = pick_blocks(&flock_cov, 0, &own, worker, 1, 1_000);
+        assert_eq!(out[0].block_index, 0, "own claim is not skipped");
+
+        // An EXPIRED claim by another peer is also not a block.
+        let expired = vec![(s0, 500u64, "other".to_string())];
+        let out = pick_blocks(&flock_cov, 0, &expired, worker, 1, 1_000);
+        assert_eq!(out[0].block_index, 0, "expired claim is not skipped");
+
+        // Empty flock / zero want → nothing.
+        assert!(pick_blocks(&[], 0, &[], worker, 1, 1_000).is_empty());
+        assert!(pick_blocks(&flock_cov, 0, &[], worker, 0, 1_000).is_empty());
     }
 }
