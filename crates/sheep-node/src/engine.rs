@@ -1865,8 +1865,9 @@ impl Engine {
         // raw flock map is kept for history; `live_flock` filters the dead.)
         self.reap(now_ms);
 
-        // 1) Audits first — cheap, and they confirm others' work (§6).
+        // 1) Audits first — they confirm others' work (§6).
         let audits: Vec<Coverage> = self.audit_queue.drain(..).collect();
+        let busy_auditing = !audits.is_empty();
         for tile in audits {
             if let Some(env) = self.make_attestation(&tile, now_ms) {
                 // Apply our OWN attestation to our OWN engine too. `make_attestation`
@@ -1880,11 +1881,19 @@ impl Engine {
             }
         }
 
-        // 2) Work: render the held claim, or claim a new block.
-        if self.active.is_some() {
-            self.render_active(now_ms, &mut out);
-        } else if let Some(block) = self.pick_block(now_ms) {
-            out.push(self.emit_claim(block, now_ms));
+        // 2) Work: render new tiles ONLY when NOT busy auditing. A seed's
+        // highest-value job is CONFIRMING others' work (it is trusted), so while
+        // contributors are submitting (audit queue non-empty) it audits instead of
+        // competing for the same fresh tiles — otherwise the seed, being native-fast,
+        // wins the render race and is recorded as the tile's submitter, so the
+        // contributor's identical render earns NO credit. With no audit backlog
+        // (e.g. an empty swarm at bootstrap) the seed renders to grow the flock.
+        if !busy_auditing {
+            if self.active.is_some() {
+                self.render_active(now_ms, &mut out);
+            } else if let Some(block) = self.pick_block(now_ms) {
+                out.push(self.emit_claim(block, now_ms));
+            }
         }
 
         // 3) Drain any reputation/ban news this node decided to broadcast (§6).
