@@ -19,29 +19,25 @@ jobs:
       - name: cargo test (native render goldens)
         run: cargo test -p flame-core --lib
 
-  e2e:
+  browser-determinism:
     runs-on: ubuntu-latest
-    # Playwright image ships the browsers; matches e2e/run.sh.
+    # Playwright image ships the browsers. Drives web/determinism.html in real
+    # Chromium and asserts every browser WASM chunk hash is byte-identical to the
+    # native goldens (web/genomes/expected-hashes.txt) — the v3 trust boundary
+    # (auditors re-render and compare hashes). Matches e2e/run-determinism.sh.
     container: mcr.microsoft.com/playwright:v1.53.0-noble
     steps:
       - uses: actions/checkout@v4
-      # Full stack in real Chromium, including:
-      #  - render_batch browser == native golden
-      #  - render_chunk browser == native expected-hashes.txt
-      #  - sync / verify gate / fraud / generation engine / vote-credit economy
-      - name: e2e (browser determinism + stack)
+      - name: browser render == native goldens
         working-directory: e2e
         run: |
           npm install --no-audit --no-fund
-          node test.js
+          node determinism.mjs
 
-  connectivity:
-    runs-on: ubuntu-latest
-    # Real relay (libp2p) + Caddy (wss) + headless-Chromium peers, all in docker —
-    # so this runs on a docker-capable runner, NOT inside the Playwright container.
-    # Guards the recurring P2P connectivity regressions (0 peers / clear-data /
-    # relay mesh=0) before a deploy. See e2e/connectivity/README.md.
-    steps:
-      - uses: actions/checkout@v4
-      - name: connectivity integration test
-        run: ./e2e/connectivity/run.sh
+  # NOTE: the v2-era `e2e` (full batch/community-render stack: in-browser libp2p
+  # peers, generation/breeding engine, swarm page) and `connectivity` (in-browser
+  # libp2p mesh) jobs were retired with the v3 rewrite — browsers are now thin
+  # HTTP clients to a sheep-node, so those suites tested removed behavior and were
+  # permanently red. Native swarm/engine coverage lives in `cargo test -p
+  # sheep-node` (run locally / pre-deploy); re-add a v3 integration job here if a
+  # headless gateway+browser harness is built. See e2e/test.js (kept for history).
