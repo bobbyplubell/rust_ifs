@@ -1252,7 +1252,7 @@ struct AssignCache {
     /// with each submitter's reputation `(sheep, frame, idx, pass, submitter_rep)`,
     /// so the cache path can compute a worker's audit assignments via the SAME
     /// pure [`Engine::audit_inputs`]/`audits_for` rule the in-hand path uses.
-    audit_inputs: Vec<(String, u32, u32, u32, u64)>,
+    audit_inputs: Vec<(String, u32, u32, u32, u64, String)>,
     /// §6 the audit round salt in force on the engine — a public, log-derived,
     /// swarm-wide value (NOT random). Cached so cache-path assignments reproduce
     /// the in-hand `assigned_to_audit(... round_salt)` exactly.

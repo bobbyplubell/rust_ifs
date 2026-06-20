@@ -237,15 +237,21 @@ pub fn assigned_to_audit(
 /// advisory set for the same inputs (the caller's snapshot map order is unstable).
 pub fn audits_for(
     worker_pub: &str,
-    unaudited: &[(String, u32, u32, u32, u64)],
+    unaudited: &[(String, u32, u32, u32, u64, String)],
     round_salt: &[u8],
 ) -> Vec<(String, u32, u32, u32)> {
     let mut out: Vec<(String, u32, u32, u32)> = unaudited
         .iter()
-        .filter(|(sheep, frame, idx, pass, submitter_rep)| {
-            assigned_to_audit(worker_pub, (sheep.as_str(), *frame, *idx, *pass), *submitter_rep, round_salt)
+        .filter(|(sheep, frame, idx, pass, submitter_rep, submitter)| {
+            // A worker must NEVER audit its OWN submitted tile: it can't confirm
+            // its own work (the §6 non-submitter rule), so the tile would stay
+            // unaudited, be re-offered forever, and every re-attest is a 422 "dup"
+            // — wasting the worker's whole audit budget on un-confirmable self-tiles
+            // instead of auditing OTHERS (the bug that froze browser "accepted").
+            submitter != worker_pub
+                && assigned_to_audit(worker_pub, (sheep.as_str(), *frame, *idx, *pass), *submitter_rep, round_salt)
         })
-        .map(|(sheep, frame, idx, pass, _)| (sheep.clone(), *frame, *idx, *pass))
+        .map(|(sheep, frame, idx, pass, _, _)| (sheep.clone(), *frame, *idx, *pass))
         .collect();
     out.sort_by(|a, b| {
         (a.0.as_str(), a.1, a.2, a.3).cmp(&(b.0.as_str(), b.1, b.2, b.3))
@@ -1127,8 +1133,8 @@ impl Engine {
     /// is picked up on a later refresh as the head confirms + drains). Tiles are
     /// taken in a deterministic order (sorted by `(sheep, frame, idx, pass)`) so
     /// the cap selects the same subset on every node, preserving convergence.
-    pub fn audit_inputs(&self) -> Vec<(String, u32, u32, u32, u64)> {
-        let mut all: Vec<(String, u32, u32, u32, u64)> = Vec::new();
+    pub fn audit_inputs(&self) -> Vec<(String, u32, u32, u32, u64, String)> {
+        let mut all: Vec<(String, u32, u32, u32, u64, String)> = Vec::new();
         for (sheep, set) in &self.unaudited {
             // Never hand out an audit for a sheep this node hasn't learned: an
             // auditor would re-render it and `apply_attestation` would reject the
@@ -1141,12 +1147,13 @@ impl Engine {
                 continue;
             }
             for &(frame, idx, pass) in set {
-                let submitter_rep = self
+                let submitter = self
                     .submitter
                     .get(&(sheep.clone(), frame, idx, pass))
-                    .map(|s| self.reputation_of(s))
-                    .unwrap_or(0);
-                all.push((sheep.clone(), frame, idx, pass, submitter_rep));
+                    .cloned()
+                    .unwrap_or_default();
+                let submitter_rep = self.reputation_of(&submitter);
+                all.push((sheep.clone(), frame, idx, pass, submitter_rep, submitter));
             }
         }
         // Deterministic order so the cap below selects the same subset everywhere.

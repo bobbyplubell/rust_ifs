@@ -264,6 +264,35 @@ fn assign_cache_path_yields_audits_without_live_engine() {
     assert_eq!(in_hand, cached_audits, "cache path audits match the in-hand assign exactly");
 }
 
+// ---- a worker is never assigned to audit its OWN tiles (§6) ------------------
+
+#[test]
+fn worker_not_assigned_to_audit_own_tiles() {
+    use sheep_node::engine::audits_for;
+    let mut eng = Engine::new(key(1));
+    let (m, id) = mint(&key(2), 1_000_000, ResolutionTier::R384);
+    assert!(eng.apply(&m, 1000));
+
+    // A worker submits Coverage for many tiles.
+    let worker = key(7);
+    let wpub = pub_hex(&worker);
+    for f in 0..40u32 {
+        let cov = Coverage { sheep_id: id.clone(), frame: f, idx: 0, pass: 0, hash: "ab".repeat(32) };
+        let env = signed(proto::PROGRESS, &worker, 1000, serde_json::to_value(&cov).unwrap());
+        assert!(eng.apply(&env, 1000));
+    }
+
+    // It is NEVER offered its OWN tiles to audit (it can't confirm its own work →
+    // re-attesting just yields 422 "dup" and wastes its audit budget).
+    let mine = audits_for(&wpub, &eng.audit_inputs(), eng.round_salt());
+    assert!(mine.is_empty(), "a worker is never assigned its own tiles, got {}", mine.len());
+
+    // A DIFFERENT worker IS assigned a healthy subset of those same tiles.
+    let other = pub_hex(&key(42));
+    let theirs = audits_for(&other, &eng.audit_inputs(), eng.round_salt());
+    assert!(!theirs.is_empty(), "another worker audits the submitter's tiles");
+}
+
 // ---- claim lifecycle + equivocation (§4, §7) --------------------------------
 
 #[test]
