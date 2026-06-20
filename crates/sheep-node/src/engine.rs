@@ -12,7 +12,7 @@
 //! handled by per-key sequence equivocation (§7): two live claims from one key
 //! at the same `seq` are rejected and the key is flagged.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use ed25519_dalek::SigningKey;
 use flame_core::chunked::{hist_hash_hex, render_batch};
@@ -59,12 +59,51 @@ pub const COVERAGE_FLOOR: u64 = 4 * BUNDLE_SIZE as u64;
 /// browser keeps the seed in audit-only mode without flapping.
 pub const CONTRIBUTOR_IDLE_MS: u64 = 30_000;
 
-/// §1 `N_base` — the deterministic genesis flock size. These founders are
-/// immortal ([`Engine::is_alive`]) and identical on every node, so the gallery
-/// is never empty and the seeds can never disagree about the founding flock
-/// (no per-node minting, no gossip). The v4 replacement for `bootstrap_flock` +
-/// `maintain_floor`.
+/// §1 `N_base` — the deterministic genesis flock size, and the floor on
+/// [`Engine::n_target`]. The founders are identical on every node (fixed genesis
+/// key, derived not gossiped) so the seeds can never disagree about the founding
+/// flock, and the `n_target >= N_base` floor keeps the top-`N_base` sheep live so
+/// the gallery is never empty — including at cold start, when the genesis flock
+/// IS the live flock (4 candidates, 4 slots). Genesis is not otherwise special:
+/// once the flock grows it competes for survival by backing like any sheep (§4).
 pub const GENESIS_FLOCK_SIZE: usize = 4;
+
+// ---- §2/§4 (v4) lifecycle: vote-aged survival + birth lottery ---------------
+
+/// §3 (v4) **recency window** for vote-aged backing, measured in VOTES (the only
+/// clock). A sheep's standing = how many of its votes fall in the most recent
+/// `VOTE_WINDOW` votes cast swarm-wide; older votes age out as new ones arrive.
+/// So survival tracks *current* community support — a busy swarm ages votes fast
+/// (favorites need fresh support), a quiet swarm ages them slowly (freezes,
+/// preserved). Sized so a sheep needs a steady trickle of backing to stay live.
+pub const VOTE_WINDOW: usize = 128;
+
+/// §4.1 (v4) **carrying-capacity knobs.** The live flock is the top
+/// `n_target = N_base + GROWTH * ln(1 + M)` sheep by recency-weighted backing,
+/// where `M = Σ w(rep)` over contributors and `w(rep) = rep / (rep + MEMBERSHIP_K)`
+/// saturates at 1 (a Sybil's fresh keys count ~0; tenure can't inflate past one
+/// member). `ln` growth = diminishing returns: the first contributors move the
+/// flock a lot, then it takes ~10× the membership to add a constant chunk.
+pub const N_TARGET_GROWTH: f64 = 8.0;
+/// §4.1 (v4) reputation at which a contributor counts as ~½ a member (`w=0.5`).
+pub const MEMBERSHIP_K: f64 = 8.0;
+
+/// §2 (v4) **birth lottery rate** — per *confirmed* tile probability that the
+/// tile spawns a new sheep, as a `[0, 2^64)` threshold (a uniform draw below it
+/// births). Rare: the flock grows gradually with audited work. Births are a pure
+/// function of the confirmed tile (hash) + the converged vote/flock state, so
+/// every node derives the identical child — no gossiped birth, nothing to miss.
+pub const BIRTH_THRESHOLD: u64 = u64::MAX / 256;
+/// §2 (v4) fraction of births that are a fresh RANDOM genome rather than a
+/// vote-weighted crossover of existing sheep (diversity; matches original ES's
+/// random-sheep injection). 1-in-N: a birth is random when `draw % N == 0`.
+pub const RANDOM_BIRTH_ONE_IN: u64 = 8;
+
+/// §2 (v4) sentinel `creator` recorded on a lottery-born sheep (it has no
+/// signer — it is *derived* from a confirmed tile, not minted). Not a 64-hex key,
+/// so it never collides with a real key or the genesis minter (`is_genesis` stays
+/// false → lottery births compete for survival like any sheep).
+pub const LOTTERY_CREATOR: &str = "lottery";
 
 // ---- §6 trust / anti-fraud tunables ----------------------------------------
 
@@ -325,8 +364,15 @@ pub struct Engine {
     /// `earned − spent`; an `apply`'d spend that would overspend is rejected.
     spent_credits: HashMap<String, u64>,
     /// §2.2 per-sheep backing tally: lifetime votes received (log-derived). A
-    /// `Vote{sheep}` adds `1` here; vitality = backing − decay(age).
+    /// `Vote{sheep}` adds `1` here. Used for breeding parent-selection (monotonic,
+    /// converges); survival uses the recency-weighted view ([`recency_backings`]).
     backing: HashMap<String, u64>,
+    /// §3 (v4) the **ordered vote log** — every applied vote keyed by
+    /// `(ts, voter, seq)` → `sheep_id`, in the canonical order that defines vote
+    /// recency (the v4.0 ts-then-voter-then-seq ordering; pure function of the
+    /// converged vote set, so every node agrees). The last [`VOTE_WINDOW`] entries
+    /// are the "recent" votes that count toward survival ([`recency_backings`]).
+    vote_log: BTreeMap<(u64, String, u64), String>,
     /// §2.2 peak backing ever seen per sheep — recorded into the Hall on death.
     peak_backing: HashMap<String, u64>,
     /// §2.2 Hall of Fame: enshrined sheep, preserved after death.
@@ -670,6 +716,7 @@ impl Engine {
             spent_credits: HashMap::new(),
             backing: HashMap::new(),
             peak_backing: HashMap::new(),
+            vote_log: BTreeMap::new(),
             hall: Vec::new(),
             enshrined: HashSet::new(),
             decay: DecayParams::DEFAULT,
@@ -854,43 +901,95 @@ impl Engine {
         self.backing.get(sheep_hex).copied().unwrap_or(0)
     }
 
-    /// §2.2 a sheep's **vitality** at `now_ms`:
-    /// `total_backing − decay(age)`, where `age = now_ms − birth_ms` and decay
-    /// escalates with age. `> 0` = alive, `<= 0` = dormant/dead. Pure (reads the
-    /// injected clock, never wall-clock). Unknown sheep → `None`.
-    pub fn vitality(&self, sheep_hex: &str, now_ms: u64) -> Option<f64> {
-        let entry = self.flock.get(sheep_hex)?;
-        let age = now_ms.saturating_sub(entry.birth_ms);
-        let backing = self.backing(sheep_hex) as f64;
-        Some(backing - self.decay.decay(age))
+    /// §3 (v4) **recency-weighted backing** per sheep: how many of each sheep's
+    /// votes fall within the most recent [`VOTE_WINDOW`] votes cast swarm-wide.
+    /// Pure function of the converged vote log → every node agrees. This is the
+    /// survival currency (older votes age out as new ones arrive), measured in
+    /// vote-count not wall-clock, so an idle swarm freezes rather than decays.
+    pub fn recency_backings(&self) -> HashMap<String, u64> {
+        let mut m: HashMap<String, u64> = HashMap::new();
+        for sheep in self.vote_log.values().rev().take(VOTE_WINDOW) {
+            *m.entry(sheep.clone()).or_insert(0) += 1;
+        }
+        m
     }
 
-    /// §2.2/§2.3 is a sheep alive at `now_ms`? The deterministic genesis flock
-    /// (§1) is **immortal** — it never decays, so the gallery never empties and
-    /// no replacement minting is needed. Every other sheep is alive iff its
-    /// vitality (backing − decay(age)) is still positive.
-    pub fn is_alive(&self, sheep_hex: &str, now_ms: u64) -> bool {
-        if self.is_genesis(sheep_hex) {
-            return true;
+    /// §4.1 (v4) **proven membership** `M = Σ w(rep)` over contributors (banned
+    /// keys excluded), `w(rep) = rep / (rep + MEMBERSHIP_K)` saturating at 1. The
+    /// Sybil-resistant size of the working swarm: a fresh/disposable key counts
+    /// ~0, a long-standing one ~1 and never more. Drives [`n_target`].
+    pub fn membership_m(&self) -> f64 {
+        self.reputation
+            .iter()
+            .filter(|(k, _)| !self.banned.contains(*k))
+            .map(|(_, &r)| {
+                let r = r as f64;
+                r / (r + MEMBERSHIP_K)
+            })
+            .sum()
+    }
+
+    /// §4.1 (v4) **carrying capacity** — the number of live slots:
+    /// `N_base + GROWTH * ln(1 + M)`, floored at `N_base` ([`GENESIS_FLOCK_SIZE`])
+    /// so the gallery never drops below the founding count. Grows logarithmically
+    /// with proven membership.
+    pub fn n_target(&self) -> usize {
+        let m = self.membership_m();
+        let raw = GENESIS_FLOCK_SIZE as f64 + N_TARGET_GROWTH * (1.0 + m).ln();
+        (raw.floor() as usize).max(GENESIS_FLOCK_SIZE)
+    }
+
+    /// §4 (v4) the set of **live** sheep ids: the top [`n_target`] known sheep by
+    /// `(recency_backing desc, id asc)`. A pure stateless ranking over the
+    /// converged flock + vote logs — no clock, no decay, no births-and-deaths
+    /// fold. Death is implicit: fall below the cutoff and you're gone; sustained
+    /// fresh votes hold any sheep up indefinitely (no guaranteed lifespan).
+    pub fn live_ids(&self) -> HashSet<String> {
+        let rb = self.recency_backings();
+        let n = self.n_target();
+        let mut ranked: Vec<(&String, u64)> = self
+            .flock
+            .keys()
+            .map(|id| (id, rb.get(id).copied().unwrap_or(0)))
+            .collect();
+        // Highest backing first; ties broken by id (deterministic on every node).
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        ranked.into_iter().take(n).map(|(id, _)| id.clone()).collect()
+    }
+
+    /// §4 (v4) a sheep's "vitality" for display = its recency-weighted backing
+    /// (the survival score). `now_ms` is unused (survival is vote-clock driven, not
+    /// wall-clock); kept in the signature for API stability. Unknown sheep → `None`.
+    pub fn vitality(&self, sheep_hex: &str, _now_ms: u64) -> Option<f64> {
+        if !self.flock.contains_key(sheep_hex) {
+            return None;
         }
-        self.vitality(sheep_hex, now_ms).is_some_and(|v| v > 0.0)
+        Some(self.recency_backings().get(sheep_hex).copied().unwrap_or(0) as f64)
+    }
+
+    /// §4 (v4) is a sheep alive? It is iff it ranks in the top [`n_target`] by
+    /// recency-weighted backing ([`live_ids`]). `now_ms` unused (see [`vitality`]).
+    pub fn is_alive(&self, sheep_hex: &str, _now_ms: u64) -> bool {
+        self.live_ids().contains(sheep_hex)
     }
 
     /// §1 is `sheep_hex` a deterministic genesis founder (creator == the fixed
-    /// genesis minter key)? Genesis sheep are immortal — see [`is_alive`].
+    /// genesis minter key)? Genesis is the bootstrap top-`N_base`; not otherwise
+    /// special once the flock grows (it competes for survival like any sheep).
     pub fn is_genesis(&self, sheep_hex: &str) -> bool {
         self.flock
             .get(sheep_hex)
             .is_some_and(|e| e.creator == self.genesis_pub)
     }
 
-    /// §2.3 the **live flock** at `now_ms`: every sheep whose vitality is still
-    /// positive. Dormant/dead sheep are excluded here but remain in [`flock`]
-    /// (history) and, if enshrined, in [`hall`]. Pure — driven by injected clock.
-    pub fn live_flock(&self, now_ms: u64) -> HashMap<String, FlockEntry> {
+    /// §4 (v4) the **live flock**: the top-[`n_target`] sheep by recency-weighted
+    /// backing ([`live_ids`]). Dropped sheep remain in [`flock`] (history) and can
+    /// return if re-voted. `now_ms` unused (survival is vote-clock driven).
+    pub fn live_flock(&self, _now_ms: u64) -> HashMap<String, FlockEntry> {
+        let live = self.live_ids();
         self.flock
             .iter()
-            .filter(|(id, _)| self.is_alive(id, now_ms))
+            .filter(|(id, _)| live.contains(*id))
             .map(|(id, e)| (id.clone(), e.clone()))
             .collect()
     }
@@ -1314,6 +1413,13 @@ impl Engine {
         if *b > *peak {
             *peak = *b;
         }
+        // §3 (v4) record into the ordered vote log for recency-weighted survival.
+        // Keyed by (ts, voter, seq) so the order is a pure function of the vote
+        // set — every node agrees on which votes are "recent" (the last
+        // VOTE_WINDOW). commit_spend already rejected equivocating (key,seq), so
+        // the key is unique per accepted vote.
+        self.vote_log
+            .insert((env.ts, env.from.clone(), vote.seq), vote.sheep_id.clone());
         true
     }
 
@@ -1590,9 +1696,115 @@ impl Engine {
             if let Some(k) = credited {
                 *self.earned_tiles.entry(k).or_insert(0) += 1;
             }
+
+            // §2 (v4) birth lottery: a newly-confirmed tile may spawn a new sheep.
+            // Keyed on the (converged) confirmed tile + its consensus hash, so
+            // every node that confirms it derives the identical child — no gossip.
+            self.maybe_birth_from_confirmed(
+                &att.sheep_id,
+                att.frame,
+                att.idx,
+                att.pass,
+                &att.hash,
+            );
         }
 
         newly || was_new
+    }
+
+    /// Test/diagnostic hook: run the §2 birth lottery for a (would-be) confirmed
+    /// tile and return the new sheep id if one was born — so the deterministic
+    /// lottery can be exercised without rendering an actual winning tile.
+    pub fn try_birth_from_tile(
+        &mut self,
+        sheep: &str,
+        frame: u32,
+        idx: u32,
+        pass: u32,
+        tile_hash: &str,
+    ) -> Option<String> {
+        let before: HashSet<String> = self.flock.keys().cloned().collect();
+        self.maybe_birth_from_confirmed(sheep, frame, idx, pass, tile_hash);
+        self.flock
+            .keys()
+            .find(|id| !before.contains(*id))
+            .cloned()
+    }
+
+    /// §2 (v4) **birth lottery over a newly-confirmed tile.** A rare, deterministic
+    /// draw from the tile's content (`sheep ‖ frame ‖ idx ‖ pass ‖ consensus-hash`);
+    /// below [`BIRTH_THRESHOLD`] it spawns a new sheep. The child is a pure function
+    /// of CONVERGED facts only, so every node that confirms the tile produces the
+    /// byte-identical sheep (no gossiped birth, nothing to miss):
+    /// - **bred** (usual): crossover of the tile's OWN sheep (always in the flock —
+    ///   we just confirmed its tile) and a genesis founder picked by the hash (the
+    ///   fixed, always-present cohort). Vote-weighting is implicit: live/popular
+    ///   sheep get rendered more → more confirmed tiles → more offspring.
+    /// - **random** (1-in-[`RANDOM_BIRTH_ONE_IN`]): a fresh genome through the
+    ///   quality priors (diversity), derived deterministically from the draw.
+    /// The newborn enters the flock with zero backing; it is live only if it ranks
+    /// into the top-[`n_target`] (§4) — stillborn until/unless it earns votes.
+    fn maybe_birth_from_confirmed(
+        &mut self,
+        tile_sheep: &str,
+        frame: u32,
+        idx: u32,
+        pass: u32,
+        tile_hash: &str,
+    ) {
+        if tile_hash.is_empty() {
+            return;
+        }
+        let mut h = Sha256::new();
+        h.update(b"birth|");
+        h.update(tile_sheep.as_bytes());
+        h.update(frame.to_le_bytes());
+        h.update(idx.to_le_bytes());
+        h.update(pass.to_le_bytes());
+        h.update(b"|");
+        h.update(tile_hash.as_bytes());
+        let digest = h.finalize();
+        let draw = u64::from_be_bytes(digest[0..8].try_into().unwrap());
+        if draw >= BIRTH_THRESHOLD {
+            return;
+        }
+        // A second independent value seeds the genome derivation / parent pick.
+        let seed = u64::from_be_bytes(digest[8..16].try_into().unwrap());
+        let tier = ResolutionTier::R384;
+
+        let (genome, parents) = if draw % RANDOM_BIRTH_ONE_IN == 0 {
+            // Diversity: a fresh random genome (through the same quality priors as
+            // a minted sheep), deterministic from the draw.
+            (derive_minted(seed, b"v4-lottery-random"), None)
+        } else {
+            let Some(a) = self.flock.get(tile_sheep).map(|e| e.genome.clone()) else {
+                return; // (shouldn't happen: we just confirmed this sheep's tile)
+            };
+            let genesis_ids =
+                crate::derive_minted_genesis::genesis_sheep_hexes(self.genesis_flock_size);
+            if genesis_ids.is_empty() {
+                return;
+            }
+            let bsel = (seed as usize) % genesis_ids.len();
+            let bid = &genesis_ids[bsel];
+            let Some(b) = self.flock.get(bid).map(|e| e.genome.clone()) else {
+                return; // genesis not yet seeded locally — skip this draw
+            };
+            (
+                derive_bred(&a, &b, seed),
+                Some((tile_sheep.to_string(), bid.clone())),
+            )
+        };
+
+        let id_hex = hex_lower(&sheep_identity(&genome, tier));
+        self.flock.entry(id_hex).or_insert(FlockEntry {
+            genome,
+            resolution: tier,
+            // No wall-clock in v4 survival; birth_ms is metadata only.
+            birth_ms: 0,
+            creator: LOTTERY_CREATOR.to_string(),
+            parents,
+        });
     }
 
     /// §6 **assignment-anchored, optimistic confirmation predicate (the scaling
@@ -2073,13 +2285,23 @@ impl Engine {
     /// Pure + convergent: every node, fed the same births + votes + clock,
     /// enshrines the same set (nodes may differ by seconds on the death moment —
     /// soft and self-healing, not a fork, §2.2).
+    /// §2.2 run one enshrinement pass (the public face of [`reap`], also invoked
+    /// each [`tick`]): any sheep that has dropped out of the live ranking and ever
+    /// earned `>= min_peak_backing` is preserved in the Hall.
+    pub fn reap_dead(&mut self, now_ms: u64) {
+        self.reap(now_ms);
+    }
+
     fn reap(&mut self, now_ms: u64) {
+        // Compute the live set ONCE (live_ids ranks the whole flock; calling
+        // is_alive per sheep would be O(n²)).
+        let live = self.live_ids();
         // Collect dead-and-not-yet-enshrined ids first (avoid borrow conflict).
         let dead: Vec<String> = self
             .flock
             .keys()
             .filter(|id| !self.enshrined.contains(*id))
-            .filter(|id| !self.is_alive(id, now_ms))
+            .filter(|id| !live.contains(*id))
             .cloned()
             .collect();
 
@@ -2091,8 +2313,11 @@ impl Engine {
             };
             let lifespan_ms = now_ms.saturating_sub(entry.birth_ms);
             let peak = self.peak_backing.get(&id).copied().unwrap_or(0);
-            let worthy = lifespan_ms >= self.hall_threshold.min_lifespan_ms
-                || peak >= self.hall_threshold.min_peak_backing;
+            // §4 (v4): survival is vote-ranking, not wall-clock age, so the Hall
+            // keys on EARNED standing only (peak backing). This also stops the
+            // flood of zero-backing stillborn lottery births (birth_ms = 0 → huge
+            // apparent lifespan) from being enshrined.
+            let worthy = peak >= self.hall_threshold.min_peak_backing;
             if worthy {
                 self.hall.push(HallEntry {
                     sheep_id: id.clone(),

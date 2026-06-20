@@ -1,6 +1,36 @@
 # proof-of-sheep — v4 lifecycle (deterministic births, vote-aged survival)
 
-**Status: design proposal (not yet built).** This supersedes the v3 *lifecycle*
+**Status: IMPLEMENTED (step 1 + step 2). Built in `crates/sheep-node`.**
+
+Implementation notes / v1 simplifications vs the full design below (all noted
+inline as refinements, none change the trust model):
+- **Parent selection (§2.1)** is convergence-safe rather than backing-weighted at
+  confirm time: a lottery child crosses the tile's OWN sheep with a genesis
+  founder picked by the tile hash. Popularity still drives breeding *implicitly*
+  (live/voted sheep get rendered more → more confirmed tiles → more offspring),
+  and the child is a pure function of converged facts so every node derives it
+  identically. Backing-weighted parent selection would need a deterministic
+  snapshot to stay convergent — deferred.
+- **Vote aging (§3)** uses the simple **sliding window** of the last `VOTE_WINDOW`
+  votes (the ts-then-voter-then-seq canonical order), not the exponential
+  `DECAY^age` weighting or the causal vote-DAG.
+- **Membership `M` (§4.1)** sums `w(rep)` over all rep-bearing keys (no active
+  window yet), so it grows but doesn't shrink as contributors leave — `n_target`
+  growth is bounded by `ln` regardless.
+- **Newborn grace (§4.2)** is not implemented: a 0-backing newborn is stillborn
+  until it ranks in (it gets room as `n_target` grows / votes shift).
+- **No wire bump**: message formats are unchanged; only the engine's survival/
+  birth *interpretation* changed, so the two seeds deploy together (force-recreate
+  both) and no v3 node lingers.
+- **Pruning**: stillborn lottery births accumulate in the flock map (history);
+  bounded-history pruning is a follow-up.
+
+Constants live in `engine.rs`: `VOTE_WINDOW`, `N_TARGET_GROWTH`, `MEMBERSHIP_K`,
+`BIRTH_THRESHOLD`, `RANDOM_BIRTH_ONE_IN`, `GENESIS_FLOCK_SIZE` (= `N_base`).
+
+---
+
+**Original design proposal (the full contract):** This supersedes the v3 *lifecycle*
 only — births, deaths, population, the credit economy. The v3 substrate is
 unchanged and assumed: one global swarm of identical nodes, an append-only log
 of signed events gossiped + reconciled by anti-entropy, byte-deterministic

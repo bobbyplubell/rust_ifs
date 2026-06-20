@@ -18,7 +18,7 @@
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::SigningKey;
-use sheep_node::engine::{DecayParams, Engine, WorldConfig};
+use sheep_node::engine::{Engine, WorldConfig};
 use sheep_node::net::libp2p_key;
 
 /// A node identified by a fixed 32-byte secret (as `--key-file` persists) maps to
@@ -46,36 +46,22 @@ fn restart_keeps_peer_id() {
     assert_ne!(peer_id_1, other, "distinct keys → distinct PeerIds");
 }
 
-/// A backed founding sheep is alive for a bounded span under wall-clock decay and
-/// dies afterward without further votes. We drive the engine directly with an
-/// injected clock (no wall-clock, no networking), using a deliberately STEEP decay
-/// (small half-life) so the lifetime is short + the test is fast — proving the
-/// bootstrap-flock lifetime is a real, decay-driven property.
+/// (v4) Survival is the vote ranking, NOT wall-clock age: a lone backed sheep
+/// (no competitors) stays live forever regardless of the injected clock — there
+/// is no decay-driven death. It dies only by being out-competed (dropping below
+/// the `n_target` cutoff), and even then stays in the raw flock history.
 #[test]
-fn founding_sheep_lives_its_decay_lifetime() {
-    // A steep, short-lived world: decay reaches the backing level within seconds.
+fn lone_sheep_survives_without_decay_dies_only_when_outcompeted() {
     let world = WorldConfig {
-        decay: DecayParams {
-            time_unit_ms: 1_000, // 1 decay unit == 1s of age
-            base: 0.0,
-            linear: 1.0, // decay ≈ age_in_seconds (plus the exp tail)
-            quad: 0.0,
-            exp_scale: 0.0,
-            half_life: 8.0,
-        },
         bootstrap_flock: 1,
         ..WorldConfig::default()
     };
-
     let mut engine = Engine::new_with_config(SigningKey::from_bytes(&[0x42; 32]), &world);
 
-    // Seed one founding sheep at t=0 with 5 self-votes (backing = 5). With
-    // linear≈1/s decay, vitality = 5 − ~age_s, so it should be alive at a few
-    // seconds and dead by ~6s+ (the exp tail pulls it under a touch sooner).
-    let birth = 1_000_000u64; // arbitrary non-zero "now"
+    // Seed one founding sheep with 5 self-votes (backing 5).
+    let birth = 1_000_000u64;
     let envs = engine.bootstrap_seed_flock(1, 5, birth);
     assert!(!envs.is_empty(), "bootstrap minted a founding sheep + votes");
-
     let sheep = engine
         .live_flock(birth)
         .keys()
@@ -84,28 +70,59 @@ fn founding_sheep_lives_its_decay_lifetime() {
         .expect("one founding sheep is live at birth");
     assert_eq!(engine.backing(&sheep), 5, "5 self-votes → backing 5");
 
-    // Alive partway through its span (well before backing is consumed by decay).
+    // No competitors → live regardless of how far the injected clock advances
+    // (survival is vote-count driven, not wall-clock; an idle swarm freezes).
+    assert!(engine.is_alive(&sheep, birth), "alive at birth");
     assert!(
-        engine.is_alive(&sheep, birth + 2_000),
-        "founding sheep alive 2s in: vitality={:?}",
-        engine.vitality(&sheep, birth + 2_000)
+        engine.is_alive(&sheep, birth + 365 * 24 * 60 * 60 * 1_000),
+        "still alive a year later — no wall-clock decay"
     );
 
-    // Dead well after its span, with NO further votes cast (decay alone kills it).
-    let late = birth + 60_000; // 60s of age >> 5 backing under ~1/s decay
+    // Death only by being out-competed: mint 4 sheep, each more-backed, so our
+    // sheep falls below the N_base (=4) cutoff.
+    let minter = SigningKey::from_bytes(&[0x77; 32]);
+    let minter_pub: String = minter
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    engine.exempt_credit(minter_pub.clone());
+    for i in 0..4u64 {
+        // Mint a distinct sheep.
+        let mint = serde_json::json!({
+            "ts_micros": 5_000 + i,
+            "minter_pub": minter_pub,
+            "resolution": "R384",
+            "seq": i,
+        });
+        let mut menv = sheep_proto::Envelope::new(sheep_proto::proto::FLOCK, "", 5, mint);
+        menv.sign(&minter);
+        assert!(engine.apply(&menv, birth), "mint applies");
+        let id = {
+            let g = sheep_proto::derive::derive_minted(5_000 + i, &minter.verifying_key().to_bytes());
+            let idb = sheep_proto::identity::sheep_identity(&g, sheep_proto::identity::ResolutionTier::R384);
+            idb.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        };
+        // 6 votes each (> our sheep's 5) from distinct voters.
+        for v in 0..6u8 {
+            let voter = SigningKey::from_bytes(&[100 + i as u8 * 10 + v; 32]);
+            let vp: String = voter.verifying_key().to_bytes().iter().map(|b| format!("{b:02x}")).collect();
+            engine.exempt_credit(vp);
+            let vote = serde_json::json!({ "sheep_id": id, "seq": 0 });
+            let mut venv = sheep_proto::Envelope::new(sheep_proto::proto::VOTES, "", 5, vote);
+            venv.sign(&voter);
+            assert!(engine.apply(&venv, birth), "vote applies");
+        }
+    }
+
     assert!(
-        !engine.is_alive(&sheep, late),
-        "founding sheep dies under decay without renewed backing: vitality={:?}",
-        engine.vitality(&sheep, late)
+        !engine.is_alive(&sheep, birth),
+        "out-competed by 4 better-backed sheep → below the n_target cutoff"
     );
-    assert!(
-        engine.live_flock(late).is_empty(),
-        "the dead founding sheep leaves the LIVE flock"
-    );
-    // ...but remains in the raw flock history (never erased).
     assert!(
         engine.flock().contains_key(&sheep),
-        "dead sheep stays in the flock history"
+        "out-competed sheep stays in the flock history (can return if re-voted)"
     );
 }
 

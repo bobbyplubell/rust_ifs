@@ -10,7 +10,7 @@
 //! render/confirm loop, kept small.
 
 use ed25519_dalek::SigningKey;
-use sheep_node::engine::{DecayParams, Engine, HallThreshold, WorldConfig, GENESIS_FLOCK_SIZE};
+use sheep_node::engine::{DecayParams, Engine, HallThreshold, GENESIS_FLOCK_SIZE};
 use sheep_proto::identity::ResolutionTier;
 use sheep_proto::msg::{Mint, Vote};
 use sheep_proto::{proto, Envelope};
@@ -168,57 +168,114 @@ fn votes_raise_target_backing() {
     assert_eq!(eng.backing(&id), 3);
 }
 
-// ---- vitality: live young, dead-when-old-and-unloved (§2.2/§2.3) ------------
+// ---- (v4) survival = top N_target by recency-weighted backing --------------
 
 #[test]
-fn vitality_decay_kills_unloved_keeps_well_backed_live() {
+fn survival_is_top_n_by_recency_backing() {
     let mut eng = Engine::new(key(1));
-    // Use the default decay personality.
-    let dp = eng.decay_params();
     let minter = key(2);
     eng.exempt_credit(pub_hex(&minter));
 
-    // birth at t = 0 for clean ages.
-    let (m, id) = mint_env(&minter, 0, ResolutionTier::R384, 1);
-    assert!(eng.apply(&m, 0));
-
-    // A well-backed sheep: pile on votes.
-    for seed in 70u8..86 {
-        let voter = key(seed);
-        eng.exempt_credit(pub_hex(&voter));
-        let v = signed(proto::VOTES, &voter, 0, serde_json::to_value(&Vote { sheep_id: id.clone(), seq: 0 }).unwrap());
-        assert!(eng.apply(&v, 0));
+    // Mint 6 sheep — MORE than the N_base (=4) live slots; no proven membership
+    // yet, so n_target stays at the floor.
+    let mut ids = Vec::new();
+    for i in 0..6u64 {
+        let (m, id) = mint_env(&minter, 1_000 + i, ResolutionTier::R384, i);
+        assert!(eng.apply(&m, 0));
+        ids.push(id);
     }
-    let backing = eng.backing(&id);
-    assert_eq!(backing, 16);
+    assert_eq!(eng.n_target(), GENESIS_FLOCK_SIZE, "no proven membership → n_target = N_base");
 
-    // Young: vitality is high, sheep is live + in the live flock.
-    let young = dp.time_unit_ms; // 1 decay unit old
-    assert!(eng.vitality(&id, young).unwrap() > 0.0, "well-backed young sheep is alive");
-    assert!(eng.is_alive(&id, young));
-    assert!(eng.live_flock(young).contains_key(&id), "live flock includes the live sheep");
-
-    // Old enough that even 16 votes < decay(age): dead. Decay escalates
-    // exponentially, so find an age where it exceeds the backing.
-    let mut old = young;
-    while eng.vitality(&id, old).map_or(true, |v| v > 0.0) {
-        old += dp.time_unit_ms * 4;
-        assert!(old < dp.time_unit_ms * 10_000, "decay should eventually exceed backing");
+    // Vote (distinct voters → no equivocation) for the first 4 with strictly
+    // decreasing backing; leave the last 2 unvoted.
+    let mut voter_seed = 40u8;
+    for (rank, id) in ids.iter().take(4).enumerate() {
+        for _ in 0..(4 - rank) {
+            let voter = key(voter_seed);
+            voter_seed += 1;
+            eng.exempt_credit(pub_hex(&voter));
+            let v = signed(
+                proto::VOTES,
+                &voter,
+                0,
+                serde_json::to_value(&Vote { sheep_id: id.clone(), seq: 0 }).unwrap(),
+            );
+            assert!(eng.apply(&v, 0), "vote applies");
+        }
     }
-    assert!(!eng.is_alive(&id, old), "an old enough sheep dies even with 16 votes");
-    assert!(!eng.live_flock(old).contains_key(&id), "dead sheep leaves the live flock");
-    // ...but stays in the raw flock map (history).
-    assert!(eng.flock().contains_key(&id), "dead sheep remains in the raw flock for history");
 
-    // A no-backing sheep dies much earlier than the well-backed one.
-    let (m2, id2) = mint_env(&minter, 0, ResolutionTier::R512, 2);
-    assert!(eng.apply(&m2, 0));
-    assert_eq!(eng.backing(&id2), 0);
-    // At an age where the well-backed sheep is still alive, the unloved one is dead.
-    let mid = young * 4;
-    if eng.is_alive(&id, mid) {
-        assert!(!eng.is_alive(&id2, mid), "unloved sheep dies before the well-backed one");
+    // The live flock is exactly the 4 voted sheep (top N_target by backing).
+    let live = eng.live_flock(0);
+    assert_eq!(live.len(), GENESIS_FLOCK_SIZE, "live flock is exactly N_target");
+    for id in ids.iter().take(4) {
+        assert!(live.contains_key(id), "a voted sheep is live");
+        assert!(eng.is_alive(id, 0));
     }
+    for id in ids.iter().skip(4) {
+        assert!(!live.contains_key(id), "an unvoted sheep is below the cutoff");
+        assert!(!eng.is_alive(id, 0));
+        // ...but stays in the raw flock map (history; can return if re-voted).
+        assert!(eng.flock().contains_key(id), "dropped sheep kept for history");
+    }
+}
+
+// ---- (v4) birth lottery: deterministic + convergent across nodes -----------
+
+#[test]
+fn birth_lottery_is_deterministic_and_convergent() {
+    use sheep_node::derive_minted_genesis::genesis_sheep_hex;
+    // Two INDEPENDENT engines (different node keys) that each derive the same
+    // deterministic genesis flock — never exchange a message.
+    let mut a = Engine::new(key(1));
+    a.seed_genesis(0);
+    let mut b = Engine::new(key(99));
+    b.seed_genesis(0);
+    let parent = genesis_sheep_hex(); // a genesis sheep present in BOTH flocks
+
+    // Sweep candidate tile hashes until one WINS the lottery (~1/256), then assert
+    // both nodes derive the byte-IDENTICAL child from the same (tile, hash).
+    let mut won = false;
+    for n in 0u64..100_000 {
+        let h = format!("{n:064x}");
+        let child_a = a.try_birth_from_tile(&parent, 0, 0, 0, &h);
+        if let Some(child_a) = child_a {
+            let child_b = b.try_birth_from_tile(&parent, 0, 0, 0, &h);
+            assert_eq!(
+                Some(child_a.clone()),
+                child_b,
+                "two ungossiped nodes derive the IDENTICAL lottery child"
+            );
+            assert!(a.flock().contains_key(&child_a), "child entered A's flock");
+            assert!(b.flock().contains_key(&child_a), "child entered B's flock");
+            assert_ne!(child_a, parent, "the child is a new sheep");
+            won = true;
+            break;
+        }
+        // A non-winning hash must NOT birth on either node.
+        assert!(
+            b.try_birth_from_tile(&parent, 0, 0, 0, &h).is_none(),
+            "a non-winning tile births nothing"
+        );
+    }
+    assert!(won, "found a winning tile within the sweep (lottery fires)");
+}
+
+// ---- (v4) carrying capacity grows logarithmically with proven membership ----
+
+#[test]
+fn n_target_grows_with_membership() {
+    let mut eng = Engine::new(key(1));
+    let n0 = eng.n_target();
+    assert_eq!(n0, GENESIS_FLOCK_SIZE, "zero membership → floor at N_base");
+
+    // 20 contributors with high earned standing (rep → w(rep) ≈ 1 each).
+    for s in 0..20u32 {
+        eng.grant_rep(format!("{s:064x}"), 100);
+    }
+    let n_many = eng.n_target();
+    assert!(n_many > n0, "n_target grows with proven membership: {n0} -> {n_many}");
+    // Logarithmic, not linear: 20 full members add a bounded chunk, never explode.
+    assert!(n_many < n0 + 40, "n_target growth is logarithmic ({n_many})");
 }
 
 // ---- escalation: older needs MORE backing to survive (§2.2) -----------------
@@ -305,136 +362,64 @@ fn initiate_mint_and_breed_spend_and_record_lineage() {
     assert!(8 < 20, "MINT_COST < BREED_COST");
 }
 
-// ---- Hall of Fame: enshrine long-lived / well-loved, not quick & unloved -----
+// ---- (v4) Hall of Fame: enshrine a dropped well-backed sheep, not the unloved -
 
 #[test]
-fn hall_enshrines_loved_or_long_lived_not_quick_unloved() {
+fn hall_enshrines_dropped_well_backed_sheep_not_unloved() {
     let mut eng = Engine::new(key(1));
-    eng.set_hall_threshold(HallThreshold::DEFAULT); // long-lived OR >=16 peak backing
+    // v4: survival is the vote ranking (no wall-clock lifespan), so the Hall keys
+    // purely on EARNED standing — peak backing >= the bar.
+    eng.set_hall_threshold(HallThreshold {
+        min_lifespan_ms: u64::MAX,
+        min_peak_backing: 3,
+    });
     let minter = key(2);
     eng.exempt_credit(pub_hex(&minter));
 
-    // Sheep L: deeply loved (>= 16 votes) at birth t=0; will die of old age.
-    let (ml, idl) = mint_env(&minter, 0, ResolutionTier::R384, 1);
+    // Helper: cast `n` distinct votes (no equivocation) for `id`.
+    let mut next_voter = 30u8;
+    let cast = |eng: &mut Engine, id: &str, n: usize, nv: &mut u8| {
+        for _ in 0..n {
+            let voter = key(*nv);
+            *nv += 1;
+            eng.exempt_credit(pub_hex(&voter));
+            let v = signed(
+                proto::VOTES,
+                &voter,
+                0,
+                serde_json::to_value(&Vote { sheep_id: id.to_string(), seq: 0 }).unwrap(),
+            );
+            assert!(eng.apply(&v, 0));
+        }
+    };
+
+    // L: well-backed (peak 3) but OUT-COMPETED — four stronger sheep push it below
+    // the N_base=4 cutoff. Q: never voted.
+    let (ml, idl) = mint_env(&minter, 1, ResolutionTier::R384, 1);
     assert!(eng.apply(&ml, 0));
-    for seed in 90u8..110 {
-        let voter = key(seed);
-        eng.exempt_credit(pub_hex(&voter));
-        let v = signed(proto::VOTES, &voter, 0, serde_json::to_value(&Vote { sheep_id: idl.clone(), seq: 0 }).unwrap());
-        assert!(eng.apply(&v, 0));
+    cast(&mut eng, &idl, 3, &mut next_voter);
+    for i in 0..4u64 {
+        let (m, id) = mint_env(&minter, 100 + i, ResolutionTier::R384, 10 + i);
+        assert!(eng.apply(&m, 0));
+        cast(&mut eng, &id, 4 + i as usize, &mut next_voter); // 4,5,6,7 > L's 3
     }
-    assert!(eng.backing(&idl) >= 16, "L is deeply loved");
+    let (mq, idq) = mint_env(&minter, 9, ResolutionTier::R384, 9);
+    assert!(eng.apply(&mq, 0));
 
-    // Advance the clock far past BOTH sheep's death. L (born at 0, 16 votes)
-    // dies only once decay escalates past its backing, so `now` must be many
-    // decay units out — `now = 20 × time_unit` puts L at a deeply-decayed age
-    // where decay ≫ 20 regardless of the world's coefficients.
-    let dp = eng.decay_params();
-    let now = dp.time_unit_ms * 20;
+    assert_eq!(eng.n_target(), GENESIS_FLOCK_SIZE, "n_target = N_base = 4 slots");
+    assert!(!eng.is_alive(&idl, 0), "L is out-competed (below the cutoff)");
+    assert!(!eng.is_alive(&idq, 0), "Q is unvoted (below the cutoff)");
 
-    // Sheep Q: quick + unloved. Born LATE (just one decay unit before `now`) so
-    // its lifespan (`now − born_q`) is short — below `min_lifespan_ms` — while
-    // L's lifespan spans the whole window. Q has zero backing, so it's dead the
-    // instant decay(age) exceeds 0.
-    let born_q_ms = now - dp.time_unit_ms; // lifespan == 1 decay unit
-    let (mq, idq) = mint_env(&minter, born_q_ms * 1000, ResolutionTier::R384, 2);
-    assert!(eng.apply(&mq, born_q_ms));
-    assert_eq!(eng.backing(&idq), 0, "Q is unloved");
-    // Q's lifespan must stay under the hall's long-lived bar so it is excluded
-    // for being quick (not merely unloved) — guards the test's own premise.
-    assert!(
-        now - born_q_ms < HallThreshold::DEFAULT.min_lifespan_ms,
-        "Q's lifespan is below the long-lived enshrinement bar"
-    );
-
-    // Both should be dead by now: Q (0 backing) trivially, L because decay has
-    // escalated far past its 16 votes at this age.
-    assert!(!eng.is_alive(&idq, now), "Q is dead");
-    assert!(!eng.is_alive(&idl, now), "L is dead (very old)");
-
-    // Reap via tick → enshrinement.
-    eng.tick(now);
+    eng.reap_dead(0); // enshrine the dropped sheep
 
     let hall: Vec<String> = eng.hall().iter().map(|h| h.sheep_id.clone()).collect();
-    assert!(hall.contains(&idl), "deeply-loved (or very long-lived) L is enshrined");
-    assert!(
-        !hall.contains(&idq),
-        "quick + unloved Q (lifespan {}ms < {}ms bar, 0 backing) is NOT enshrined",
-        now - born_q_ms,
-        HallThreshold::DEFAULT.min_lifespan_ms,
-    );
-
-    // The Hall entry preserves legacy data after death.
+    assert!(hall.contains(&idl), "dropped well-backed L is enshrined (peak >= bar)");
+    assert!(!hall.contains(&idq), "never-voted Q is NOT enshrined (peak 0)");
     let l = eng.hall().iter().find(|h| h.sheep_id == idl).unwrap();
-    assert!(l.peak_backing >= 16, "peak backing preserved");
-    assert!(l.lifespan_ms > 0 && l.death_ms == now, "lifespan + death recorded");
+    assert_eq!(l.peak_backing, 3, "peak backing preserved in the Hall");
 }
 
 // ---- deploy finalization: env→config + world bootstrap ----------------------
-
-/// The per-world decay personality (injected via [`WorldConfig`] at
-/// construction, the SAME path `net.rs`/`main.rs` use from env) actually takes
-/// effect: a STEEP-decay world (Sandbox) kills a lightly-backed sheep sooner
-/// than a GENTLE one (Gallery). This proves the env knob is not a no-op.
-#[test]
-fn world_config_steep_decay_kills_sooner_than_gentle() {
-    // A steep (Sandbox-ish) and a gentle (Gallery-ish) world, configured ONLY
-    // by the WorldConfig path (Engine::new_with_config) — no manual setters.
-    let steep = WorldConfig {
-        decay: DecayParams {
-            time_unit_ms: 1_000,
-            base: 0.5,
-            linear: 1.0,
-            quad: 1.0,
-            exp_scale: 2.0,
-            half_life: 4.0,
-        },
-        ..WorldConfig::default()
-    };
-    let gentle = WorldConfig {
-        decay: DecayParams {
-            time_unit_ms: 1_000, // same time unit so ages compare directly
-            base: 0.5,
-            linear: 0.1,
-            quad: 0.0,
-            exp_scale: 0.0,
-            half_life: 8.0,
-        },
-        ..WorldConfig::default()
-    };
-
-    // Build two engines via the config path, give each the SAME sheep with the
-    // SAME light backing (3 votes), and find the age at which each dies.
-    let death_age = |cfg: WorldConfig| -> u64 {
-        let minter = key(7);
-        let mut eng = Engine::new_with_config(key(1), &cfg);
-        eng.exempt_credit(pub_hex(&minter));
-        let (m, id) = mint_env(&minter, 1_000_000, ResolutionTier::R384, 1);
-        assert!(eng.apply(&m, 0));
-        // 3 light votes (credit-exempt voters → no funding needed).
-        for v in 0..3u8 {
-            let voter = key(100 + v);
-            eng.exempt_credit(pub_hex(&voter));
-            let body = serde_json::to_value(&Vote { sheep_id: id.clone(), seq: v as u64 })
-                .unwrap();
-            assert!(eng.apply(&signed(proto::VOTES, &voter, 0, body), 0));
-        }
-        assert!(eng.is_alive(&id, 1_000), "alive while young in both worlds");
-        // Advance the injected clock until vitality crosses 0.
-        let mut age = 1_000u64;
-        while eng.is_alive(&id, age) && age < 10_000_000 {
-            age += 1_000;
-        }
-        age
-    };
-
-    let steep_death = death_age(steep);
-    let gentle_death = death_age(gentle);
-    assert!(
-        steep_death < gentle_death,
-        "steep world kills sooner: steep died at {steep_death}ms, gentle at {gentle_death}ms"
-    );
-}
 
 /// World bootstrap: a seed's `bootstrap_seed_flock(N, ..)` (the pure engine half
 /// of the deploy boot step, driven with an INJECTED now_ms — no async swarm)
