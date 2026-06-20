@@ -53,12 +53,28 @@ pub const COVERAGE_FLOOR: u64 = 4 * BUNDLE_SIZE as u64;
 // ---- §6 trust / anti-fraud tunables ----------------------------------------
 
 /// §6 reputation-graduated sampling constant: `sample_rate(rep) =
-/// max(SAMPLE_FLOOR, TRUST_REP / (TRUST_REP + rep))`. At `rep == TRUST_REP` the
-/// sample rate is 50%; new/zero-rep submitters are audited at 100%, and trust
-/// only ever *reduces* the rate, never to zero (the floor). Kept modest so a
-/// peer must accrue a meaningful body of confirmed work before its audit rate
-/// drops appreciably — trust can't be cheaply cashed out into a free pass.
+/// max(SAMPLE_FLOOR, NEW_PEER_RATE * TRUST_REP / (TRUST_REP + rep))`. At
+/// `rep == TRUST_REP` the sample rate is half the new-peer rate; trust only ever
+/// *reduces* the rate, never to zero (the floor). Kept modest so a peer must
+/// accrue a meaningful body of confirmed work before its audit rate drops
+/// appreciably — trust can't be cheaply cashed out into a free pass.
 pub const TRUST_REP: u64 = 64;
+
+/// §6 **new-peer audit rate** — the audit rate applied to a zero-reputation
+/// submitter (the ceiling of [`sample_rate`]). Auditing is a deterministic
+/// re-render, so every audited tile is rendered *twice* by the swarm; auditing
+/// 100% of fresh work halves throughput for the dominant new-browser population.
+///
+/// We don't need 100% to deter fraud, because detection is **statistical and
+/// retroactive**, not exhaustive: a bad tile is audited with probability
+/// `NEW_PEER_RATE`, so submitting `k` bad tiles is caught with probability
+/// `1 - (1 - NEW_PEER_RATE)^k` (≈97% by the 5th at 0.5), and a single catch
+/// slashes + bans the key — nuking ALL its credit. Honeypots (always re-rendered
+/// by the assigned auditor) independently catch lazy/lying auditors. So fraud
+/// stays strongly −EV while redundant rendering is roughly halved. This is the
+/// single dial for the speed/fraud-latency tradeoff; raise toward 1.0 to audit
+/// fresh work harder, lower toward [`SAMPLE_FLOOR`] to render less redundantly.
+pub const NEW_PEER_RATE: f64 = 0.5;
 
 /// §6 sampling floor: the audit rate never drops below this no matter how
 /// trusted a submitter is (so reputation is never a full free pass).
@@ -89,10 +105,13 @@ pub const CONFIRM_QUORUM: usize = 2;
 pub const CONFIRM_QUORUM_REP_SUM: u64 = 24;
 
 /// §6 reputation-graduated sample rate for a submitter of standing `rep`.
-/// `max(SAMPLE_FLOOR, TRUST_REP / (TRUST_REP + rep))`. Pure; anyone recomputes
-/// it from a peer's log-derived rep, so two nodes agree on how heavily to audit.
+/// `max(SAMPLE_FLOOR, NEW_PEER_RATE * TRUST_REP / (TRUST_REP + rep))`. Pure;
+/// anyone recomputes it from a peer's log-derived rep, so two nodes agree on how
+/// heavily to audit. A zero-rep submitter is sampled at [`NEW_PEER_RATE`] (not
+/// 100% — see that constant for why partial auditing still deters fraud), and
+/// the rate decays toward [`SAMPLE_FLOOR`] as confirmed work accrues.
 pub fn sample_rate(rep: u64) -> f64 {
-    let raw = TRUST_REP as f64 / (TRUST_REP as f64 + rep as f64);
+    let raw = NEW_PEER_RATE * (TRUST_REP as f64 / (TRUST_REP as f64 + rep as f64));
     if raw < SAMPLE_FLOOR {
         SAMPLE_FLOOR
     } else {

@@ -17,7 +17,7 @@ use ed25519_dalek::SigningKey;
 use flame_core::chunked::{hist_hash_hex, render_batch};
 use sheep_node::engine::{
     assigned_to_audit, sample_rate, Engine, CONFIRM_QUORUM_REP_SUM, DEFAULT_ROUND_SALT,
-    SAMPLE_FLOOR, TRUSTED_ATTESTOR_REP, TRUST_REP,
+    NEW_PEER_RATE, SAMPLE_FLOOR, TRUSTED_ATTESTOR_REP, TRUST_REP,
 };
 use sheep_node::spec::{IDXS_PER_FRAME, N_FRAMES, SPP};
 use sheep_proto::derive::derive_minted;
@@ -201,10 +201,12 @@ fn assignment_rate_is_reputation_graduated() {
     let low = count_assigned(0);
     let high = count_assigned(100_000);
 
-    // Zero-rep → audited ~everything (sample_rate(0) == 1.0).
+    // Zero-rep → audited at the new-peer rate (sample_rate(0) == NEW_PEER_RATE),
+    // not 100%: partial auditing still deters fraud (statistical + retroactive).
+    let low_frac = low as f64 / total as f64;
     assert!(
-        low as f64 > 0.95 * total as f64,
-        "zero-rep submitter audited near-fully: {low}/{total}"
+        (low_frac - NEW_PEER_RATE).abs() < 0.05,
+        "zero-rep submitter audited at ~NEW_PEER_RATE: {low}/{total} = {low_frac}"
     );
     // Very-high-rep → audited far less, but never below the 5% floor.
     assert!(high < low, "trusted submitter audited far less: high={high} low={low}");
@@ -217,10 +219,13 @@ fn assignment_rate_is_reputation_graduated() {
 
 #[test]
 fn sample_rate_curve_and_floor() {
-    assert!((sample_rate(0) - 1.0).abs() < 1e-9, "zero rep → audit everything");
     assert!(
-        (sample_rate(TRUST_REP) - 0.5).abs() < 1e-9,
-        "rep == TRUST_REP → 50%"
+        (sample_rate(0) - NEW_PEER_RATE).abs() < 1e-9,
+        "zero rep → new-peer rate"
+    );
+    assert!(
+        (sample_rate(TRUST_REP) - NEW_PEER_RATE / 2.0).abs() < 1e-9,
+        "rep == TRUST_REP → half the new-peer rate"
     );
     // Monotonically decreasing.
     assert!(sample_rate(10) > sample_rate(1000));

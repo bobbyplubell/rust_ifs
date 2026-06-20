@@ -230,7 +230,8 @@ fn assign_cache_path_yields_audits_without_live_engine() {
     assert!(eng.apply(&m, 1000));
 
     // Populate the unaudited set: a submitter gossips many Coverage tiles (a fresh
-    // rep-0 submitter → sampled at ~100%, so the worker is assigned a healthy set).
+    // rep-0 submitter → sampled at NEW_PEER_RATE, so the worker is assigned a
+    // healthy subset of the 64 tiles).
     let submitter = key(7);
     for i in 0..64u32 {
         let cov = Coverage { sheep_id: id.clone(), frame: i, idx: 0, pass: 0, hash: "ab".repeat(32) };
