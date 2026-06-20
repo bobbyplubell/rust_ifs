@@ -285,7 +285,7 @@ async fn peer_connects_during_seed_bootmint() {
 // gateway via ingest-audit, not by cross-seed gossip). Tracked for a focused
 // gossipsub-delivery investigation; the single-node + sync paths stay covered by
 // the other swarm tests.
-#[ignore = "gossipsub doesn't deliver low-traffic progress topic between 2 in-process nodes; see note + follow-up"]
+#[ignore = "in-process TCP gossip quirk: low-traffic progress topic doesn't deliver between two same-process nodes (mesh tuning didn't fix it); prod (separate machines) confirms locally per-gateway. Tracked for a focused gossipsub investigation."]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_nodes_collaborate_and_confirm() {
     let mut dirs = Vec::new();

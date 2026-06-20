@@ -59,6 +59,15 @@ pub const COVERAGE_FLOOR: u64 = 4 * BUNDLE_SIZE as u64;
 /// browser keeps the seed in audit-only mode without flapping.
 pub const CONTRIBUTOR_IDLE_MS: u64 = 30_000;
 
+/// §4 **display floor** — a seed renders new tiles for a live sheep only until it
+/// has this many CONFIRMED tiles (enough to show a watchable video); past it, the
+/// seed renders nothing and only audits. This caps competitive seed rendering so
+/// the native-fast seeds bootstrap the gallery's display but never out-race
+/// contributors for submitter credit — the robust fix (independent of whether a
+/// seed has observed contributor activity) for "browsers stay at ~0 accepted
+/// while the seeds win every tile". Contributors carry rendering past the floor.
+pub const DISPLAY_COVER: usize = 32;
+
 /// §1 `N_base` — the deterministic genesis flock size, and the floor on
 /// [`Engine::n_target`]. The founders are identical on every node (fixed genesis
 /// key, derived not gossiped) so the seeds can never disagree about the founding
@@ -937,6 +946,15 @@ impl Engine {
         let m = self.membership_m();
         let raw = GENESIS_FLOCK_SIZE as f64 + N_TARGET_GROWTH * (1.0 + m).ln();
         (raw.floor() as usize).max(GENESIS_FLOCK_SIZE)
+    }
+
+    /// §4 does any LIVE sheep still need rendering up to the display floor
+    /// ([`DISPLAY_COVER`] confirmed tiles)? Gates competitive seed rendering so a
+    /// seed bootstraps each sheep's display then becomes a pure auditor.
+    fn flock_needs_render(&self) -> bool {
+        self.live_ids().iter().any(|id| {
+            self.confirmed.get(id).map(|s| s.len()).unwrap_or(0) < DISPLAY_COVER
+        })
     }
 
     /// §4 (v4) the set of **live** sheep ids: the top [`n_target`] known sheep by
@@ -2185,7 +2203,15 @@ impl Engine {
         // contributors gone) lets it render to grow/display the flock.
         let contributors_active =
             self.last_contributor_ms != 0 && now_ms.saturating_sub(self.last_contributor_ms) < CONTRIBUTOR_IDLE_MS;
-        if !busy_auditing && !contributors_active {
+        // §4 also stand down once every live sheep is displayed (>= DISPLAY_COVER
+        // confirmed tiles). This is the gossip-independent guard: the MIRROR seed
+        // never receives browser submissions directly (they POST to the primary)
+        // and may not see them via gossip, so without this it competitively
+        // re-renders the founding flock forever and wins the submitter race,
+        // starving browser credit. With it, both seeds bootstrap the display then
+        // become pure auditors, leaving all rendering past the floor to contributors.
+        let needs_display = self.flock_needs_render();
+        if !busy_auditing && !contributors_active && needs_display {
             if self.active.is_some() {
                 self.render_active(now_ms, &mut out);
             } else if let Some(block) = self.pick_block(now_ms) {

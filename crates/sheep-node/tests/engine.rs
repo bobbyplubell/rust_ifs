@@ -390,33 +390,38 @@ fn seed_defers_to_active_contributor() {
 fn credits_accrue_at_tiles_per_credit() {
     let mut eng = Engine::new(key(1));
     let minter = key(2);
-    let (m, id_hex) = mint(&minter, 1_000_000, ResolutionTier::R384);
-    assert!(eng.apply(&m, 1000));
+    // Mint 6 sheep: the §4 per-sheep display floor (DISPLAY_COVER) caps a node's
+    // own competitive rendering per sheep, so to render+confirm past
+    // TILES_PER_CREDIT (128) own tiles we need >= ceil(128/DISPLAY_COVER) sheep
+    // (an unknown minter key spends optimistically, so the mints just apply).
+    for i in 0..6u64 {
+        let (m, _id) = mint(&minter, 1_000_000 + i, ResolutionTier::R384);
+        assert!(eng.apply(&m, 1000));
+    }
 
-    // Render enough blocks (16 units each) that our own submissions exceed
-    // TILES_PER_CREDIT (128). 128/16 = 8 full blocks. We render, then have an
-    // auditor confirm each rendered (frame, idx) so the tile is credited. The
-    // auditor is granted trusted standing (§6) so its lone attestation confirms —
-    // this test exercises the credit ledger (confirmed → earned), not the §6
-    // quorum, so we keep one trusted attestation = one confirmed tile.
+    // We render, then have an auditor confirm each rendered tile so it is
+    // credited. The auditor is granted trusted standing (§6) so its lone
+    // attestation confirms — this exercises the credit ledger (confirmed →
+    // earned), not the §6 quorum.
     let auditor = key(8);
     eng.grant_rep(pub_hex(&auditor), TRUSTED_ATTESTOR_REP);
     let mut now = 2000u64;
-    let mut confirmed_units: std::collections::HashSet<(u32, u32, u32)> = Default::default();
-    for _ in 0..10 {
+    let mut confirmed_units: std::collections::HashSet<(String, u32, u32, u32)> = Default::default();
+    for _ in 0..40 {
         eng.tick(now); now += 100; // claim (or render)
         let out = eng.tick(now); now += 100; // render
         for e in &out {
             if e.t == proto::PROGRESS {
                 let cov: Coverage = serde_json::from_value(e.body.clone()).unwrap();
-                // Confirm distinct (frame, idx) once.
-                if confirmed_units.insert((cov.frame, cov.idx, cov.pass)) {
-                    let att = Attestation { sheep_id: id_hex.clone(), frame: cov.frame, idx: cov.idx, pass: cov.pass, hash: cov.hash };
+                // Confirm distinct (sheep, frame, idx, pass) once.
+                if confirmed_units.insert((cov.sheep_id.clone(), cov.frame, cov.idx, cov.pass)) {
+                    let att = Attestation { sheep_id: cov.sheep_id.clone(), frame: cov.frame, idx: cov.idx, pass: cov.pass, hash: cov.hash };
                     let aenv = signed(proto::ATTEST, &auditor, now, serde_json::to_value(&att).unwrap());
                     eng.apply(&aenv, now);
                 }
             }
         }
+        if eng.own_confirmed_tiles() >= 128 { break; }
     }
     assert!(eng.own_confirmed_tiles() >= 128, "should have confirmed >=128 own tiles, got {}", eng.own_confirmed_tiles());
     assert!(eng.credits() >= 1, "credits = confirmed/{} should be >=1, got {}", 128, eng.credits());

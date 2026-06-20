@@ -130,6 +130,21 @@ fn build_behaviour(key: &libp2p::identity::Keypair) -> Result<SheepBehaviour, Ne
     let gs_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_millis(200))
         .validation_mode(gossipsub::ValidationMode::Permissive)
+        // Mesh sizing for a SMALL swarm. The deploy is two seeds — one peer each —
+        // so gossipsub's large-swarm defaults (mesh_n_low=5, mesh_outbound_min=2)
+        // can NEVER be satisfied with a single peer: the per-topic meshes stay
+        // perpetually "understaffed", and while a HIGH-traffic topic (claims) still
+        // floods through, a LOW-traffic one (progress/coverage) fails to deliver to
+        // the other seed. That's the production credit bug: the mirror seed never
+        // sees browser coverage, so it never defers (§4) and competitively renders
+        // the same tiles, winning the submitter race (native-fast) and leaving
+        // browsers uncredited. Size the mesh so ONE peer is a healthy mesh, and
+        // flood-publish so a publish reaches every subscribed peer regardless.
+        .mesh_n_low(1)
+        .mesh_n(2)
+        .mesh_n_high(6)
+        .mesh_outbound_min(0)
+        .flood_publish(true)
         // A PIECE envelope carries a full-frame histogram (§5): ~4.7 MB for an
         // R384 tile, far over gossipsub's default 64 KiB cap, so without this
         // pieces fail to publish (`MessageTooLarge`) and never propagate. 10 MiB
