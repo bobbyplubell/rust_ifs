@@ -59,6 +59,13 @@ pub const COVERAGE_FLOOR: u64 = 4 * BUNDLE_SIZE as u64;
 /// browser keeps the seed in audit-only mode without flapping.
 pub const CONTRIBUTOR_IDLE_MS: u64 = 30_000;
 
+/// §1 `N_base` — the deterministic genesis flock size. These founders are
+/// immortal ([`Engine::is_alive`]) and identical on every node, so the gallery
+/// is never empty and the seeds can never disagree about the founding flock
+/// (no per-node minting, no gossip). The v4 replacement for `bootstrap_flock` +
+/// `maintain_floor`.
+pub const GENESIS_FLOCK_SIZE: usize = 4;
+
 // ---- §6 trust / anti-fraud tunables ----------------------------------------
 
 /// §6 reputation-graduated sampling constant: `sample_rate(rep) =
@@ -256,6 +263,13 @@ pub struct Engine {
     /// This node's own public key, lowercase hex (matches `Envelope.from`).
     self_pub: String,
 
+    /// §1 the fixed genesis minter's public key, lowercase hex (cached from
+    /// [`derive_minted_genesis::genesis_minter_pub`]). Sheep whose `creator` is
+    /// this key are the deterministic genesis flock and are **immortal** — they
+    /// never decay, so the gallery is never empty without any replacement
+    /// minting (the v4 replacement for `maintain_floor`).
+    genesis_pub: String,
+
     /// Learned flock: sheep identity hex -> entry (§2.3).
     flock: HashMap<String, FlockEntry>,
 
@@ -321,6 +335,9 @@ pub struct Engine {
     enshrined: HashSet<String>,
     /// §2.2 the per-world decay personality (age-escalation rate knob).
     decay: DecayParams,
+    /// §1 size of the deterministic genesis flock this node seeds (from
+    /// [`WorldConfig::genesis_flock_size`]; default [`GENESIS_FLOCK_SIZE`]).
+    genesis_flock_size: usize,
     /// §2.2 the Hall enshrinement thresholds.
     hall_threshold: HallThreshold,
     /// §3 per-world credit sinks (the base costs at the R384 tier; scaled by
@@ -554,7 +571,17 @@ pub struct WorldConfig {
     pub breed_cost: u64,
     /// How many LIVE genesis sheep a *seed* mints into the world at boot (0 =
     /// none). Only the serving/accumulator node acts on this.
+    ///
+    /// LEGACY (v3): the old per-node wall-clock boot mint. Unused by v4 — genesis
+    /// is the deterministic [`genesis_flock_size`] cohort seeded by EVERY node.
     pub bootstrap_flock: usize,
+    /// §1 (v4) size of the deterministic immortal genesis flock that EVERY node
+    /// seeds at boot. A protocol constant in production (every node must use the
+    /// same value to derive the identical founders — that's the no-divergence
+    /// guarantee), defaulting to [`GENESIS_FLOCK_SIZE`]. Exposed as a knob only so
+    /// tests can use a tiny flock (faster debug renders); never vary it across
+    /// live nodes.
+    pub genesis_flock_size: usize,
     /// RAM budget (MB = 1e6 bytes) for the accumulator's resident merged-frame
     /// working set (§5). The merged CRDT sums spill to `data_dir/accum/` beyond
     /// this; the small per-frame metadata stays resident regardless. Memory is
@@ -589,6 +616,7 @@ impl WorldConfig {
             mint_cost: MINT_COST,
             breed_cost: BREED_COST,
             bootstrap_flock: 4,
+            genesis_flock_size: GENESIS_FLOCK_SIZE,
             // 128 MB resident merged-frame working set by default — comfortably
             // holds a handful of full-frame R384 frames while bounding total RAM.
             accum_ram_mb: 128,
@@ -610,6 +638,7 @@ impl Engine {
         Engine {
             signing_key,
             self_pub,
+            genesis_pub: crate::derive_minted_genesis::genesis_minter_pub(),
             flock: HashMap::new(),
             confirmed: HashMap::new(),
             unaudited: HashMap::new(),
@@ -644,6 +673,7 @@ impl Engine {
             hall: Vec::new(),
             enshrined: HashSet::new(),
             decay: DecayParams::DEFAULT,
+            genesis_flock_size: GENESIS_FLOCK_SIZE,
             hall_threshold: HallThreshold::DEFAULT,
             vote_cost: VOTE_COST,
             mint_cost: MINT_COST,
@@ -672,6 +702,7 @@ impl Engine {
     /// including the §6 explicit `trusted_keys` mutual-trust set.
     pub fn apply_world_config(&mut self, cfg: &WorldConfig) {
         self.decay = cfg.decay;
+        self.genesis_flock_size = cfg.genesis_flock_size;
         self.hall_threshold = cfg.hall;
         self.vote_cost = cfg.vote_cost;
         self.mint_cost = cfg.mint_cost;
@@ -834,9 +865,23 @@ impl Engine {
         Some(backing - self.decay.decay(age))
     }
 
-    /// §2.2/§2.3 is a sheep alive (vitality > 0) at `now_ms`?
+    /// §2.2/§2.3 is a sheep alive at `now_ms`? The deterministic genesis flock
+    /// (§1) is **immortal** — it never decays, so the gallery never empties and
+    /// no replacement minting is needed. Every other sheep is alive iff its
+    /// vitality (backing − decay(age)) is still positive.
     pub fn is_alive(&self, sheep_hex: &str, now_ms: u64) -> bool {
+        if self.is_genesis(sheep_hex) {
+            return true;
+        }
         self.vitality(sheep_hex, now_ms).is_some_and(|v| v > 0.0)
+    }
+
+    /// §1 is `sheep_hex` a deterministic genesis founder (creator == the fixed
+    /// genesis minter key)? Genesis sheep are immortal — see [`is_alive`].
+    pub fn is_genesis(&self, sheep_hex: &str) -> bool {
+        self.flock
+            .get(sheep_hex)
+            .is_some_and(|e| e.creator == self.genesis_pub)
     }
 
     /// §2.3 the **live flock** at `now_ms`: every sheep whose vitality is still
@@ -968,6 +1013,16 @@ impl Engine {
     pub fn audit_inputs(&self) -> Vec<(String, u32, u32, u32, u64)> {
         let mut all: Vec<(String, u32, u32, u32, u64)> = Vec::new();
         for (sheep, set) in &self.unaudited {
+            // Never hand out an audit for a sheep this node hasn't learned: an
+            // auditor would re-render it and `apply_attestation` would reject the
+            // result (sheep not in flock) → the contributor gets HTTP 422 on every
+            // such tile. `unaudited` can carry a phantom sheep when a `Coverage`
+            // referencing it was observed but its `Mint` never arrived/was kept
+            // (e.g. a peer-minted founder lost to a sync gap), so gate on flock
+            // membership here — the one chokepoint the §10 assign hand-out reads.
+            if !self.flock.contains_key(sheep) {
+                continue;
+            }
             for &(frame, idx, pass) in set {
                 let submitter_rep = self
                     .submitter
@@ -1846,46 +1901,27 @@ impl Engine {
         out
     }
 
-    /// §2.x **population floor — anti-extinction replenishment.** Guarantee the
-    /// LIVE flock never empties: if fewer than `floor` sheep are alive at
-    /// `now_ms`, mint exactly enough FRESH founding sheep to bring the live count
-    /// back up to `floor`, returning their signed Mint/Vote envelopes (ready to
-    /// publish — they are applied locally here too).
+    /// §1 **seed the deterministic genesis flock** (the v4 replacement for the
+    /// wall-clock boot mint + `maintain_floor`). Applies the fixed
+    /// [`derive_minted_genesis::genesis_flock`] of `GENESIS_FLOCK_SIZE` founders
+    /// signed by the constant genesis key, and returns the applied envelopes
+    /// (for `birth_log` republish to late joiners).
     ///
-    /// This does NOT override "loved or dead" (§2.2): individual sheep still
-    /// decay and die on their own merits, and an over-floor flock is left
-    /// untouched. The floor only protects the POPULATION — without it a fully
-    /// decayed world spirals dead (no sheep → nothing to render → no
-    /// contribution → no new mints), leaving an empty gallery. With it, a seed
-    /// silently re-mints a fresh founding cohort the moment the live count dips
-    /// below `floor`, so there is always something live to watch and build on.
-    ///
-    /// Pure-ish (clock injected): the caller passes the real `now_ms`. Reuses
-    /// [`bootstrap_seed_flock`] for the actual minting, so the replenishment
-    /// sheep are produced by exactly the same signed-Mint path as the boot flock
-    /// — distinct genomes (the per-sheep `now_micros + i` seed) and, because the
-    /// mint seed is wall-clock-derived, top-ups at different `now_ms` yield
-    /// distinct identities (no duplicate genomes across replenishments).
-    ///
-    /// Caller contract (transport): only a FOUNDING seed
-    /// (`world.bootstrap_flock > 0`) should call this, on a timer; a node that
-    /// never seeds (`bootstrap_flock == 0`, e.g. a mirror seed or a plain worker)
-    /// must NOT — otherwise two seeds double-mint. Returns `vec![]` (a no-op)
-    /// when the live flock already meets or exceeds `floor`.
-    pub fn maintain_floor(
-        &mut self,
-        floor: usize,
-        initial_backing: u64,
-        now_ms: u64,
-    ) -> Vec<Envelope> {
-        let live = self.live_flock(now_ms).len();
-        let need = floor.saturating_sub(live);
-        if need == 0 {
-            return Vec::new();
+    /// EVERY node calls this at boot — not just seeds — and because the
+    /// envelopes are byte-identical constants, all nodes derive the identical
+    /// founders WITHOUT gossiping a mint. That kills the v3 divergence (each seed
+    /// minted its OWN wall-clock founders → different IDs → split flocks → HTTP
+    /// 422) at the root. Idempotent: re-applying a genesis mint for a sheep
+    /// already in the flock is a no-op. Genesis sheep are immortal ([`is_alive`]),
+    /// so the gallery never empties and no replacement minting exists.
+    pub fn seed_genesis(&mut self, now_ms: u64) -> Vec<Envelope> {
+        let mut out = Vec::new();
+        for env in crate::derive_minted_genesis::genesis_flock(self.genesis_flock_size) {
+            if self.apply(&env, now_ms) {
+                out.push(env);
+            }
         }
-        // Reuse the boot-mint path: signed Mints with deterministically-derived,
-        // per-sheep-distinct genomes, applied locally and returned for gossip.
-        self.bootstrap_seed_flock(need, initial_backing, now_ms)
+        out
     }
 
     // ---- contribute loop (§4 tick) ----------------------------------------

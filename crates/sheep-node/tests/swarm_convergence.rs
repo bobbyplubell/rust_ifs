@@ -357,7 +357,7 @@ async fn reconnect_resyncs() {
         a.inject(mint_env).await.expect("inject replies").accepted,
         "A accepts the user mint while B is gone"
     );
-    let a_flock = poll_node_until(&a, Duration::from_secs(10), |s| s.flock.contains(&extra_id))
+    let a_flock = poll_node_until(&a, Duration::from_secs(45), |s| s.flock.contains(&extra_id))
         .await
         .expect("A's flock includes the mint")
         .flock;

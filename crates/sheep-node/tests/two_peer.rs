@@ -28,8 +28,26 @@ use ed25519_dalek::SigningKey;
 use libp2p::core::transport::MemoryTransport;
 use libp2p::core::upgrade::Version;
 use libp2p::{noise, yamux, Multiaddr, Transport};
-use sheep_node::net::{run_on_transport, Control, Snapshot};
+use sheep_node::engine::WorldConfig;
+use sheep_node::net::{run_on_transport_with, Control, Snapshot};
 use sheep_node::{genesis_sheep_hex, net::libp2p_key};
+
+/// Lowercase-hex public key for a node seed (matches `Envelope.from`).
+fn pub_hex(seed: [u8; 32]) -> String {
+    let pk = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+    pk.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A world for a collaborating seed: trusts the peer (as the two production seeds
+/// mutually do via `SHEEP_TRUSTED_KEYS`, so neither stands down for the other
+/// under the §4 contributor-deference gate) and seeds a single immortal genesis
+/// sheep (one is enough to close the loop, and keeps debug renders fast).
+fn collab_world(trusted: &str) -> WorldConfig {
+    let mut w = WorldConfig::default();
+    w.trusted_keys.insert(trusted.to_string());
+    w.genesis_flock_size = 1;
+    w
+}
 use tokio::sync::{mpsc, oneshot};
 
 /// Build a boxed in-memory transport (noise + yamux) for one node's key.
@@ -68,16 +86,18 @@ async fn two_peers_close_the_loop() {
     // Peer A: listens, no bootstrap.
     let ta = mem_transport(&key_a);
     let addr_a2 = addr_a.clone();
+    let world_a = collab_world(&pub_hex([0xB2; 32]));
     let ha = tokio::spawn(async move {
-        let _ = run_on_transport(key_a, ta, addr_a2, vec![], rx_a).await;
+        let _ = run_on_transport_with(key_a, ta, addr_a2, vec![], rx_a, None, world_a).await;
     });
 
     // Peer B: listens on its own addr, dials A (the only "bootstrap").
     let tb = mem_transport(&key_b);
     let addr_b2 = addr_b.clone();
     let addr_a_dial = addr_a.clone();
+    let world_b = collab_world(&pub_hex([0xA1; 32]));
     let hb = tokio::spawn(async move {
-        let _ = run_on_transport(key_b, tb, addr_b2, vec![addr_a_dial], rx_b).await;
+        let _ = run_on_transport_with(key_b, tb, addr_b2, vec![addr_a_dial], rx_b, None, world_b).await;
     });
 
     let sheep = genesis_sheep_hex();

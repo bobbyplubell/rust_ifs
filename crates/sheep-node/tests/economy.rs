@@ -10,7 +10,7 @@
 //! render/confirm loop, kept small.
 
 use ed25519_dalek::SigningKey;
-use sheep_node::engine::{DecayParams, Engine, HallThreshold, WorldConfig};
+use sheep_node::engine::{DecayParams, Engine, HallThreshold, WorldConfig, GENESIS_FLOCK_SIZE};
 use sheep_proto::identity::ResolutionTier;
 use sheep_proto::msg::{Mint, Vote};
 use sheep_proto::{proto, Envelope};
@@ -469,114 +469,61 @@ fn world_bootstrap_seeds_a_live_flock() {
     assert_eq!(eng.live_flock(now + 1_000).len(), n, "still live shortly after boot");
 }
 
-/// §2.x population floor — anti-extinction replenishment. A seed mints a small
-/// founding flock, time advances until that whole flock has decayed dead (live
-/// count → 0, below the floor), then `maintain_floor(floor, ..)` re-mints
-/// exactly enough FRESH sheep to bring the live count back to `floor` — and a
-/// second immediate call is a no-op (no over-mint).
+/// §1 (v4): `seed_genesis` brings up exactly `GENESIS_FLOCK_SIZE` deterministic
+/// founders, and they are **immortal** — alive arbitrarily far in the future with
+/// no votes and no replenishment. This is what replaces `maintain_floor`: the
+/// gallery is never empty because genesis never decays.
 #[test]
-fn maintain_floor_tops_up_to_floor() {
-    let floor = 4usize;
-    let backing = 8u64;
+fn genesis_flock_is_immortal_and_correct_size() {
     let boot = 1_000_000u64;
-    let mut eng = Engine::new(key(7)); // fresh seed, zero earned credits
-
-    // Seed below-strength so we start short of the floor (only 2 of 4), then let
-    // them die: at DEFAULT decay a backing-8 sheep ages out by ~44 min, so two
-    // hours later the whole founding pair is dead → live count 0 < floor.
-    eng.bootstrap_seed_flock(2, backing, boot);
-    assert_eq!(eng.live_flock(boot).len(), 2, "two starter sheep at boot");
-
-    let now = boot + 2 * 60 * 60 * 1_000; // +2h — the founding pair has decayed dead
-    assert_eq!(eng.live_flock(now).len(), 0, "founding pair has fully decayed");
-
-    // Refill: maintain_floor re-mints floor-live = 4 fresh founding sheep.
-    let births = eng.maintain_floor(floor, backing, now);
-    assert!(!births.is_empty(), "replenishment births were minted");
+    let mut eng = Engine::new(key(7)); // fresh node, zero earned credits
+    let envs = eng.seed_genesis(boot);
+    assert_eq!(envs.len(), GENESIS_FLOCK_SIZE, "one mint per genesis founder");
     assert_eq!(
-        eng.live_flock(now).len(),
-        floor,
-        "floor maintenance brings the live flock back up to the floor"
+        eng.live_flock(boot).len(),
+        GENESIS_FLOCK_SIZE,
+        "genesis flock is live at boot"
     );
-
-    // No over-mint: a second immediate call sees live == floor → returns nothing.
-    let again = eng.maintain_floor(floor, backing, now);
-    assert!(again.is_empty(), "no over-mint when already at the floor");
-    assert_eq!(eng.live_flock(now).len(), floor, "still exactly at the floor");
+    for id in eng.live_flock(boot).keys() {
+        assert!(eng.is_genesis(id), "every founder is a genesis sheep");
+        assert_eq!(eng.backing(id), 0, "genesis needs no backing to live");
+    }
+    // Immortal: still the full live flock a year later, despite zero votes.
+    let far = boot + 365u64 * 24 * 60 * 60 * 1_000;
+    assert_eq!(
+        eng.live_flock(far).len(),
+        GENESIS_FLOCK_SIZE,
+        "genesis never decays — the gallery is never empty"
+    );
 }
 
-/// §2.x: when the live flock already meets or exceeds the floor, maintenance is
-/// a pure no-op (loved-or-dead governs the individuals; the floor only protects
-/// the population from hitting zero).
+/// §1 (v4): seeding genesis is idempotent — a second call mints nothing new and
+/// the flock is unchanged (so a re-applied/replayed genesis can never duplicate
+/// or churn founders).
 #[test]
-fn maintain_floor_noop_when_at_or_above_floor() {
+fn genesis_seed_is_idempotent() {
     let now = 2_000_000u64;
     let mut eng = Engine::new(key(8));
-    // Seed a live flock at the floor.
-    eng.bootstrap_seed_flock(4, 8, now);
-    assert_eq!(eng.live_flock(now).len(), 4, "four live at boot");
-
-    // At the floor → no-op.
-    assert!(eng.maintain_floor(4, 8, now).is_empty(), "at floor → no mint");
-    // Above the floor (floor smaller than live) → still no-op, nothing pruned.
-    assert!(eng.maintain_floor(3, 8, now).is_empty(), "above floor → no mint");
-    assert_eq!(eng.live_flock(now).len(), 4, "live flock untouched");
+    eng.seed_genesis(now);
+    let again = eng.seed_genesis(now);
+    assert!(again.is_empty(), "re-seeding genesis mints nothing new");
+    assert_eq!(eng.live_flock(now).len(), GENESIS_FLOCK_SIZE, "flock unchanged");
 }
 
-/// §2.x: two top-ups at DIFFERENT `now_ms` yield DISTINCT sheep identities (the
-/// mint seed is `now_micros + i`, so no replenishment ever duplicates an earlier
-/// sheep's genome).
+/// §1 (v4) THE divergence cure: two independent nodes that have NEVER exchanged a
+/// message derive the byte-identical genesis flock just by calling `seed_genesis`
+/// — no gossip, no per-node minting. This is exactly what the v3 wall-clock
+/// `bootstrap_seed_flock` failed to do (each seed minted its own IDs → split
+/// flocks → HTTP 422); here it holds by construction.
 #[test]
-fn maintain_floor_sheep_are_distinct() {
-    let floor = 3usize;
-    let backing = 8u64;
-    let t0 = 1_000_000u64;
-    let mut eng = Engine::new(key(9));
-
-    // First top-up from empty.
-    let first = eng.maintain_floor(floor, backing, t0);
-    assert!(!first.is_empty());
-    let ids_t0: std::collections::HashSet<String> =
-        eng.live_flock(t0).keys().cloned().collect();
-    assert_eq!(ids_t0.len(), floor, "first top-up reaches the floor");
-
-    // Advance two hours so the first cohort decays dead, then top up again.
-    let t1 = t0 + 2 * 60 * 60 * 1_000;
-    assert_eq!(eng.live_flock(t1).len(), 0, "first cohort decayed by t1");
-    let second = eng.maintain_floor(floor, backing, t1);
-    assert!(!second.is_empty());
-    let ids_t1: std::collections::HashSet<String> =
-        eng.live_flock(t1).keys().cloned().collect();
-    assert_eq!(ids_t1.len(), floor, "second top-up reaches the floor");
-
-    // No identity is shared across the two cohorts — fresh genomes each time.
-    assert!(
-        ids_t0.is_disjoint(&ids_t1),
-        "replenishment cohorts have distinct sheep identities (no duplicate genomes)"
-    );
-}
-
-/// §2.x: the births `maintain_floor` returns are valid signed Mint/Vote
-/// envelopes — a FRESH engine that never seeded (a peer / the mirror seed)
-/// `apply`s them and converges to the same live flock. This is the gossip
-/// convergence the transport relies on (signed Mint → every node derives the
-/// same sheep), checked without any transport scaffolding.
-#[test]
-fn maintain_floor_births_apply_on_a_peer() {
-    let floor = 3usize;
+fn two_nodes_derive_identical_genesis_without_gossip() {
     let now = 4_000_000u64;
-    let mut seed = Engine::new(key(10)); // the founding seed
-    let births = seed.maintain_floor(floor, 8, now);
-    assert_eq!(seed.live_flock(now).len(), floor, "seed reaches the floor");
-
-    // A peer that never seeded replays the signed births and converges.
-    let mut peer = Engine::new(key(200));
-    for env in &births {
-        assert!(peer.apply(env, now), "peer accepts a valid signed birth/vote");
-    }
-    let seed_ids: std::collections::HashSet<String> =
-        seed.live_flock(now).keys().cloned().collect();
-    let peer_ids: std::collections::HashSet<String> =
-        peer.live_flock(now).keys().cloned().collect();
-    assert_eq!(seed_ids, peer_ids, "peer converges to the seed's replenished flock");
+    let mut a = Engine::new(key(10));
+    let mut b = Engine::new(key(200)); // different node key entirely
+    a.seed_genesis(now);
+    b.seed_genesis(now);
+    let a_ids: std::collections::HashSet<String> = a.live_flock(now).keys().cloned().collect();
+    let b_ids: std::collections::HashSet<String> = b.live_flock(now).keys().cloned().collect();
+    assert_eq!(a_ids, b_ids, "two ungossiped nodes hold the identical genesis flock");
+    assert_eq!(a_ids.len(), GENESIS_FLOCK_SIZE);
 }

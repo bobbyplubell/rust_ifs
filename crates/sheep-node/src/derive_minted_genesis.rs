@@ -42,26 +42,41 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-/// A signed genesis [`Mint`] envelope (`t = proto::FLOCK`), ready to
-/// `engine.apply(..)` and publish. Deterministic: same bytes on every node.
-pub fn genesis_mint() -> Envelope {
+/// The `index`-th genesis [`Mint`] envelope (`t = proto::FLOCK`), ready to
+/// `engine.apply(..)`. Deterministic: same bytes on every node. The whole
+/// genesis flock is derived from the fixed `(genesis key, ts, seq)` constants
+/// varied only by `index`, so two nodes produce byte-identical founders WITHOUT
+/// gossiping anything — the v4 cure for the v3 per-node boot-mint divergence.
+pub fn genesis_mint_at(index: usize) -> Envelope {
     let key = genesis_minter_key();
     let minter_pub = hex_lower(&key.verifying_key().to_bytes());
+    let ts_micros = GENESIS_TS_MICROS + index as u64; // distinct genome per founder
     let mint = Mint {
-        ts_micros: GENESIS_TS_MICROS,
+        ts_micros,
         minter_pub,
         resolution: GENESIS_TIER,
-        // The genesis mint is the bootstrap birth: seq 0 from the (constant)
-        // genesis minter key, which the engine grandfathers past the credit
-        // check (`genesis_minter_pub`). Not a real user spend.
-        seq: 0,
+        // seq from the (constant) genesis minter key, which the engine
+        // grandfathers past the §3 credit check (`genesis_minter_pub`). Not a
+        // real user spend; `index` keeps the seqs distinct (no equivocation).
+        seq: index as u64,
     };
     let body = serde_json::to_value(&mint).expect("Mint -> Value cannot fail");
-    // birth_ms is ts_micros/1000 in the engine; we sign with that ts so the
+    // birth_ms is ts_micros/1000 in the engine; sign with that ts so the
     // envelope's ts matches the recorded mint time.
-    let mut env = Envelope::new(proto::FLOCK, "", GENESIS_TS_MICROS / 1000, body);
+    let mut env = Envelope::new(proto::FLOCK, "", ts_micros / 1000, body);
     env.sign(&key);
     env
+}
+
+/// The genesis flock of `count` deterministic founders (the §1 `N_base` cohort).
+/// Every node applies these at boot; identical bytes everywhere → no divergence.
+pub fn genesis_flock(count: usize) -> Vec<Envelope> {
+    (0..count).map(genesis_mint_at).collect()
+}
+
+/// The first genesis [`Mint`] (back-compat shim for `index = 0`).
+pub fn genesis_mint() -> Envelope {
+    genesis_mint_at(0)
 }
 
 /// The genesis minter's public key, lowercase hex. A fixed protocol constant
@@ -72,15 +87,25 @@ pub fn genesis_minter_pub() -> String {
     hex_lower(&genesis_minter_key().verifying_key().to_bytes())
 }
 
-/// The genesis sheep's identity hex (the key both peers cover). Re-derived the
-/// same way the engine does, for tests / display.
-pub fn genesis_sheep_hex() -> String {
+/// The `index`-th genesis sheep's identity hex. Re-derived the same way the
+/// engine does (`apply_mint`), for registration / display / immortality checks.
+pub fn genesis_sheep_hex_at(index: usize) -> String {
     use sheep_proto::derive::derive_minted;
     use sheep_proto::identity::sheep_identity;
     let key = genesis_minter_key();
     let minter = key.verifying_key().to_bytes();
-    let genome = derive_minted(GENESIS_TS_MICROS, &minter);
+    let genome = derive_minted(GENESIS_TS_MICROS + index as u64, &minter);
     hex_lower(&sheep_identity(&genome, GENESIS_TIER))
+}
+
+/// The identity hexes of the first `count` genesis founders.
+pub fn genesis_sheep_hexes(count: usize) -> Vec<String> {
+    (0..count).map(genesis_sheep_hex_at).collect()
+}
+
+/// The first genesis sheep's identity hex (back-compat shim for `index = 0`).
+pub fn genesis_sheep_hex() -> String {
+    genesis_sheep_hex_at(0)
 }
 
 #[cfg(test)]

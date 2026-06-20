@@ -72,6 +72,9 @@ fn world_config_from_env() -> WorldConfig {
         // New deploy knob (added to the *.env files): how many LIVE starter
         // sheep a seed mints at boot. Default 4 (a watchable starter flock).
         bootstrap_flock: env_or("SHEEP_BOOTSTRAP_FLOCK", base.bootstrap_flock),
+        // §1 deterministic genesis flock size — a protocol constant; every node
+        // must use the same value (default 4). Overridable only for testing.
+        genesis_flock_size: env_or("SHEEP_GENESIS_FLOCK_SIZE", base.genesis_flock_size),
         // §5 accumulator RAM budget (MB) for the resident merged-frame working
         // set; the rest spills to `data_dir/accum/`. Default 128 (bounds RAM
         // independent of flock size). Only the serving/accumulator node uses it.

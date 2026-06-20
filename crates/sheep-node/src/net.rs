@@ -559,7 +559,6 @@ async fn event_loop(
     // register genomes, and publish the founding envelopes onto an ALREADY-FORMED
     // mesh (plus the persistent republish path below keeps re-offering them).
     let genesis = genesis_mint();
-    let bootstrap_flock = if accumulate { world.bootstrap_flock } else { 0 };
     // Apply the genesis birth INLINE (cheap: one Mint → one genome derivation).
     // Keeping it synchronous makes the genesis sheep known to the engine the
     // instant the loop starts — so the §6.1 ingest-audit write path (which re-
@@ -587,23 +586,15 @@ async fn event_loop(
         let boot_now = now_ms();
         Some(tokio::task::spawn_blocking(move || {
             let mut engine = engine;
-            // A SEED (a serving/accumulator node) mints `bootstrap_flock` LIVE
-            // starter sheep at boot so the deployed world is watchable from the
-            // first request (the fixed-2023 genesis is already dead under real
-            // wall-clock decay). Workers (no serve config) never seed. The
-            // births+votes are applied locally and stashed so they (re)publish
-            // on every (re)formed mesh, exactly like the genesis birth
-            // (FLOCK/VOTES are never re-emitted by the engine). Restart re-seeds
-            // with fresh ids — see `bootstrap_seed_flock`.
-            let envs = if bootstrap_flock > 0 {
-                // 8 self-votes/sheep: with the recalibrated decay this gives the
-                // founding flock a comfortable lifetime (DEFAULT ~44 min, Sandbox
-                // ~2 min, Gallery hours) so a fresh world shows a LIVE, persisting
-                // flock from the first request instead of sheep that die in seconds.
-                engine.bootstrap_seed_flock(bootstrap_flock, 8, boot_now)
-            } else {
-                Vec::new()
-            };
+            // §1 EVERY node seeds the same deterministic genesis flock (not just
+            // serving seeds): the envelopes are byte-identical constants signed by
+            // the fixed genesis key, so all nodes derive the identical immortal
+            // founders WITHOUT gossiping a mint. This replaces the v3 per-node
+            // wall-clock `bootstrap_seed_flock` whose distinct IDs split the seeds
+            // into divergent flocks (→ HTTP 422). Idempotent (sheep 0 was already
+            // applied inline above, so this returns sheep 1..N). Genome derivation
+            // is CPU-heavy, hence the blocking task. See `Engine::seed_genesis`.
+            let envs = engine.seed_genesis(boot_now);
             (engine, envs)
         }))
     };
@@ -683,9 +674,6 @@ async fn event_loop(
     // or a prior floor run in flight) simply doesn't start one, so two
     // maintenance runs never overlap. Extinction is slow under the recalibrated
     // decay, so a coarse 30s cadence is ample.
-    let mut floor_task: Option<tokio::task::JoinHandle<(Engine, Vec<Envelope>)>> = None;
-    const FLOOR_INTERVAL: Duration = Duration::from_secs(30);
-    let mut floor_tick = tokio::time::interval(FLOOR_INTERVAL);
     let mut pending_inbound: Vec<(Envelope, u64)> = Vec::new();
     // §5 heavy artifacts (PieceUploads) awaiting ingest into the accumulator —
     // both observed-from-gossip and this node's own renders. Buffered and drained
@@ -765,13 +753,12 @@ async fn event_loop(
                 boot_task = None;
                 match res {
                     Ok((eng, mut bootstrap_envs)) => {
-                        if bootstrap_flock > 0 {
-                            eprintln!(
-                                "[node] world bootstrap: minted {} live starter sheep ({} envelopes)",
-                                bootstrap_flock,
-                                bootstrap_envs.len()
-                            );
-                        }
+                        eprintln!(
+                            "[node] genesis: seeded deterministic founding flock \
+                             (live={}, {} new envelopes)",
+                            eng.live_flock(now_ms()).len(),
+                            bootstrap_envs.len()
+                        );
                         // Register every founding sheep's genome with the accumulator
                         // so tonemap works as their tiles land, and seed the watch
                         // face's snapshot once up front.
@@ -849,58 +836,6 @@ async fn event_loop(
                     }
                     Err(e) => {
                         eprintln!("tick task panicked: {e}");
-                        // Engine is lost on panic; nothing safe to do but stop.
-                        return;
-                    }
-                }
-            }
-            // ---- a §2.x floor-maintenance mint finished: merge the engine back,
-            // register the replenishment genomes, fold them into the persistent
-            // founding-republish set, and publish them — exactly as the boot-mint
-            // does its founding envelopes (they're signed Mint/Vote births that
-            // converge across the swarm, so the mirror seed + browsers learn the
-            // refilled flock via gossip/flock-sync with no special handling).
-            res = async { floor_task.as_mut().unwrap().await }, if floor_task.is_some() => {
-                floor_task = None;
-                match res {
-                    Ok((eng, refill_envs)) => {
-                        if !refill_envs.is_empty() {
-                            eprintln!(
-                                "[node] population floor: re-minted to refill the flock ({} envelopes)",
-                                refill_envs.len()
-                            );
-                        }
-                        // Register every new sheep's genome with the accumulator so
-                        // tonemap works as their tiles land (mirrors the boot-mint).
-                        if accumulate && !refill_envs.is_empty() {
-                            if let Some(accum) = accum.as_ref() {
-                                let mut acc = accum.lock().unwrap();
-                                for (id, entry) in eng.flock().iter() {
-                                    if registered.insert(id.clone()) {
-                                        acc.register_sheep(id, entry.genome.clone());
-                                    }
-                                }
-                            }
-                            refresh_read_state(&eng, read_state.as_ref(), now_ms());
-                        }
-                        // Add to the persistent founding set so the replenishment
-                        // births re-publish on every (re)formed mesh (FLOCK/VOTES
-                        // are never re-emitted by the engine), and publish now.
-                        if !refill_envs.is_empty() {
-                            founding_envs.extend(refill_envs.iter().cloned());
-                            if connected {
-                                for env in &refill_envs {
-                                    publish_env(&mut swarm, env);
-                                }
-                            }
-                            last_snapshot = snapshot(&eng);
-                            refresh_birth_cache(&eng, &mut birth_cache);
-                            refresh_assign_cache(&eng, &mut assign_cache);
-                        }
-                        engine_slot = Some(eng);
-                    }
-                    Err(e) => {
-                        eprintln!("floor-maintenance task panicked: {e}");
                         // Engine is lost on panic; nothing safe to do but stop.
                         return;
                     }
@@ -1065,32 +1000,10 @@ async fn event_loop(
                     (eng, out)
                 }));
             }
-            // §2.x population floor: a FOUNDING seed re-mints fresh sheep whenever
-            // the live flock dips below `bootstrap_flock`. Gated on `bootstrap_flock
-            // > 0` — the SAME condition the boot-mint uses (`accumulate &&
-            // world.bootstrap_flock > 0`, folded into `bootstrap_flock` above) — so
-            // a non-seeding node (mirror seed / worker) NEVER auto-mints and the two
-            // seeds can't double-mint. Requires the engine in hand (so we don't race
-            // a render: taking it here means no tick is running), no floor run
-            // already in flight (the in-flight guard — `floor_task.is_none()`), and
-            // the boot-mint complete (`boot_task.is_none()`, so we don't replenish
-            // while the initial founding mint is still building). The maintain_floor
-            // mint runs on a BLOCKING thread with the engine checked out — never on
-            // the reactor — exactly like the boot-mint and render tick.
-            _ = floor_tick.tick(), if bootstrap_flock > 0
-                && engine_slot.is_some()
-                && floor_task.is_none()
-                && tick_task.is_none()
-                && boot_task.is_none() =>
-            {
-                let mut eng = engine_slot.take().expect("engine present");
-                let now = now_ms();
-                let floor = bootstrap_flock;
-                floor_task = Some(tokio::task::spawn_blocking(move || {
-                    let envs = eng.maintain_floor(floor, 8, now);
-                    (eng, envs)
-                }));
-            }
+            // §1 (v4): no population-floor minting. The deterministic genesis
+            // flock is immortal and identical on every node, so there is nothing
+            // to replenish and no node ever auto-mints — the v3 churn/divergence
+            // source is simply gone (see `Engine::seed_genesis`).
             _ = redial.tick(), if !connected => {
                 for addr in &bootstrap {
                     let _ = swarm.dial(addr.clone());
@@ -1200,6 +1113,14 @@ fn dispatch_control(
                     sync_retractions(eng, accum, retracted_seen);
                     refresh_read_state(eng, read_state, now);
                 }
+            }
+            // If the engine was in hand the inject applied immediately (a user
+            // mint/vote births a sheep / changes backing); refresh the cached
+            // snapshot so a `Control::Snapshot` reader sees it without waiting for
+            // the next render-tick. (When a render owns the engine the inject is
+            // buffered and the tick-return drain refreshes the snapshot instead.)
+            if let Some(eng) = engine_slot.as_ref() {
+                *last_snapshot = snapshot(eng);
             }
             let _ = reply.send(result);
         }

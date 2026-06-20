@@ -28,6 +28,7 @@ use libp2p::core::upgrade::Version;
 use libp2p::{noise, yamux, Multiaddr, Transport};
 use serde_json::Value;
 use sheep_node::net::{libp2p_key, run_on_transport_with};
+use sheep_node::spec::N_FRAMES;
 use sheep_node::{genesis_sheep_hex, Control, ServeConfig, WorldConfig};
 use sheep_proto::msg::Coverage;
 use sheep_proto::{proto, Envelope};
@@ -171,16 +172,29 @@ async fn write_face_msg_assign_and_ingest_audit() {
         assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST, "bad sig rejected with 400");
     }
 
-    // ---- ingest-audit ON: WRONG hash caught + rejected ------------------
+    // ---- ingest-audit ON: a SAMPLED wrong-hash tile is caught + rejected ----
+    // Ingest-audit is reputation-graduated (`NEW_PEER_RATE`): a fresh browser is
+    // audited on only a FRACTION of its tiles, so some wrong-hash submissions are
+    // caught here (422) and the rest forwarded optimistically (200) to be caught
+    // later by assigned swarm auditors. Sweep distinct tiles until the gate fires
+    // — over a full frame range it is statistically certain to sample at least
+    // one. (Frames 1/2 are reserved for the good-hash + parity checks below.)
     {
-        let cov = Coverage { sheep_id: sheep.clone(), frame: 0, idx: 0, pass: 0, hash: "deadbeef".repeat(8) };
-        let env = sign_coverage(&browser, &cov);
-        let r = client.post(format!("{base}/api/msg")).body(serde_json::to_vec(&env).unwrap()).send().await.unwrap();
-        // All-rejected → 422; body says not accepted with an ingest-audit reason.
-        assert_eq!(r.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY, "wrong-hash submission rejected");
-        let b: Value = r.json().await.unwrap();
-        assert_eq!(b["accepted"], false);
-        assert!(b["reason"].as_str().unwrap_or("").contains("ingest-audit"), "rejected by ingest-audit: {b}");
+        let mut caught = false;
+        for frame in 5..N_FRAMES {
+            let cov = Coverage { sheep_id: sheep.clone(), frame, idx: 0, pass: 0, hash: "deadbeef".repeat(8) };
+            let env = sign_coverage(&browser, &cov);
+            let r = client.post(format!("{base}/api/msg")).body(serde_json::to_vec(&env).unwrap()).send().await.unwrap();
+            if r.status() == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+                let b: Value = r.json().await.unwrap();
+                assert_eq!(b["accepted"], false);
+                assert!(b["reason"].as_str().unwrap_or("").contains("ingest-audit"), "rejected by ingest-audit: {b}");
+                caught = true;
+                break;
+            }
+            assert!(r.status().is_success(), "un-sampled wrong-hash tile forwarded optimistically: {}", r.status());
+        }
+        assert!(caught, "ingest-audit catches at least one sampled wrong-hash tile across the sweep");
     }
 
     // ---- ingest-audit ON: CORRECT hash accepted + applied + read back ---
@@ -205,7 +219,14 @@ async fn write_face_msg_assign_and_ingest_audit() {
         assert!(r.status().is_success());
         let b: Value = r.json().await.unwrap();
         let blocks = b["blocks"].as_array().expect("blocks array");
-        assert!(!blocks.is_empty(), "assign hands out work for the genesis sheep");
+        assert!(!blocks.is_empty(), "assign hands out work for the genesis flock");
+        // The deterministic genesis flock (§1) — work may be for any of them.
+        let genesis_ids: std::collections::HashSet<String> =
+            sheep_node::derive_minted_genesis::genesis_sheep_hexes(
+                sheep_node::engine::GENESIS_FLOCK_SIZE,
+            )
+            .into_iter()
+            .collect();
         // Non-colliding: every unit's (sheep,frame,idx,pass) is distinct.
         let mut seen = std::collections::HashSet::new();
         for u in blocks {
@@ -216,7 +237,10 @@ async fn write_face_msg_assign_and_ingest_audit() {
                 u["pass"].as_u64().unwrap(),
             );
             assert!(seen.insert(k), "assign work units are non-colliding");
-            assert_eq!(u["sheep_id"], sheep, "work is for a known sheep");
+            assert!(
+                genesis_ids.contains(u["sheep_id"].as_str().unwrap()),
+                "work is for a genesis founder"
+            );
         }
         // bad pubkey → 400
         let r = client.get(format!("{base}/api/assign?pub=nothex")).send().await.unwrap();
