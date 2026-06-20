@@ -12,7 +12,7 @@
 use ed25519_dalek::SigningKey;
 use sheep_node::engine::{DecayParams, Engine, HallThreshold, GENESIS_FLOCK_SIZE};
 use sheep_proto::identity::ResolutionTier;
-use sheep_proto::msg::{Mint, Vote};
+use sheep_proto::msg::{Coverage, Mint, Vote};
 use sheep_proto::{proto, Envelope};
 
 // ---- helpers ----------------------------------------------------------------
@@ -217,6 +217,38 @@ fn survival_is_top_n_by_recency_backing() {
         // ...but stays in the raw flock map (history; can return if re-voted).
         assert!(eng.flock().contains_key(id), "dropped sheep kept for history");
     }
+}
+
+// ---- (v6) auditor-of-last-resort sweep confirms stuck tiles -----------------
+
+#[test]
+fn auditor_of_last_resort_confirms_unaudited_tiles() {
+    let mut eng = Engine::new(key(1));
+    let minter = key(2);
+    eng.exempt_credit(pub_hex(&minter));
+    let (m, id) = mint_env(&minter, 1, ResolutionTier::R384, 1);
+    assert!(eng.apply(&m, 0));
+
+    // A contributor submits Coverage for 5 tiles (empty hash → no dispute path;
+    // the node's own honest re-render is the truth that confirms them).
+    let contributor = key(50);
+    let now = 1000u64;
+    for f in 0..5u32 {
+        let cov = Coverage { sheep_id: id.clone(), frame: f, idx: 0, pass: 0, hash: String::new() };
+        let env = signed(proto::PROGRESS, &contributor, now, serde_json::to_value(&cov).unwrap());
+        assert!(eng.apply(&env, now));
+    }
+    assert_eq!(eng.coverage(&id), 0, "nothing confirmed before any audit");
+
+    // One tick: the contributor is active so the node doesn't render — it sweeps
+    // the un-attested tiles (auditor-of-last-resort) and confirms ALL of them,
+    // even though the §6 lottery may have assigned the node to none of them.
+    eng.tick(now);
+    assert_eq!(
+        eng.coverage(&id),
+        5,
+        "the sweep confirmed every un-attested contributor tile (no stuck tiles)"
+    );
 }
 
 // ---- (v4) birth lottery: deterministic + convergent across nodes -----------

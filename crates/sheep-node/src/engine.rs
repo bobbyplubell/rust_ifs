@@ -68,6 +68,12 @@ pub const CONTRIBUTOR_IDLE_MS: u64 = 30_000;
 /// while the seeds win every tile". Contributors carry rendering past the floor.
 pub const DISPLAY_COVER: usize = 32;
 
+/// §6 how many un-attested "gap" tiles the auditor-of-last-resort sweep confirms
+/// per tick when the node has audit capacity (see `tick`). Bounds the per-tick
+/// re-render work (the sweep runs in the blocking render thread); the backlog
+/// drains across ticks. Sized so stuck tiles clear faster than contributors flood.
+pub const AUDIT_SWEEP_PER_TICK: usize = 16;
+
 /// §1 `N_base` — the deterministic genesis flock size, and the floor on
 /// [`Engine::n_target`]. The founders are identical on every node (fixed genesis
 /// key, derived not gossiped) so the seeds can never disagree about the founding
@@ -2218,11 +2224,49 @@ impl Engine {
         // starving browser credit. With it, both seeds bootstrap the display then
         // become pure auditors, leaving all rendering past the floor to contributors.
         let needs_display = self.flock_needs_render();
-        if !busy_auditing && !contributors_active && needs_display {
+        let render_now = !busy_auditing && !contributors_active && needs_display;
+        if render_now {
             if self.active.is_some() {
                 self.render_active(now_ms, &mut out);
             } else if let Some(block) = self.pick_block(now_ms) {
                 out.push(self.emit_claim(block, now_ms));
+            }
+        }
+
+        // 2.5) §6 **auditor-of-last-resort sweep.** The §6 assignment lottery is
+        // STATIC and gives no reassignment: a tile whose assigned auditor never
+        // acts — or that the lottery assigned to NOBODY (a real fraction at the
+        // sample rate with few peers) — is stuck unaudited forever, and the audit
+        // backlog wedges on these gaps so confirmation flatlines (the "accepted
+        // plateaus / one machine stuck at 0" symptom). When this node has audit
+        // capacity (it isn't rendering this tick), sweep a bounded batch of
+        // un-attested tiles others submitted and confirm them: the local node is a
+        // trusted attestor, so its lone honest re-render confirms (a forged tile
+        // mismatches and is rejected, not confirmed). This guarantees every
+        // contributor tile is eventually audited — no permanently-stuck tiles.
+        if !render_now {
+            let gaps: Vec<(String, u32, u32, u32)> = self
+                .unaudited
+                .iter()
+                .flat_map(|(sheep, set)| {
+                    set.iter().map(move |&(f, i, p)| (sheep.clone(), f, i, p))
+                })
+                .filter(|(s, f, i, p)| {
+                    let key = (s.clone(), *f, *i, *p);
+                    self.flock.contains_key(s)
+                        // no valid attestation yet (the lottery missed it)
+                        && self.attestors.get(&key).map_or(true, |a| a.is_empty())
+                        // never audit our OWN submission (can't confirm own work)
+                        && self.submitter.get(&key).map_or(true, |sub| sub != &self.self_pub)
+                })
+                .take(AUDIT_SWEEP_PER_TICK)
+                .collect();
+            for (sheep_id, frame, idx, pass) in gaps {
+                let tile = Coverage { sheep_id, frame, idx, pass, hash: String::new() };
+                if let Some(env) = self.make_attestation(&tile, now_ms) {
+                    self.apply_attestation(&env);
+                    out.push(env);
+                }
             }
         }
 
