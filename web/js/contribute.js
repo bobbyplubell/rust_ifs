@@ -27,11 +27,16 @@ export const SPP = 200_000;     // spec::SPP
 export const N_FRAMES = 128;    // spec::N_FRAMES
 export const SS = 1;            // ResolutionTier supersample
 
-// Max tiles rendered per assign cycle (the node may hand out a big bundle). Keep
-// each cycle short so counters update live and the loop re-assigns often (fresh
-// frontier + latest standing). Audits ~match blocks for roughly 1:1 audit↔render.
-export const MAX_BLOCKS_PER_CYCLE = 12;
-export const MAX_AUDITS_PER_CYCLE = 12;
+// Tiles rendered per assign cycle. CRITICAL: a block is BUNDLE_SIZE (16) units,
+// and the frontier only advances once a block is FULLY submitted. The old cap of
+// 12 (< 16) meant the browser rendered the first 12 units of a block forever,
+// never completing it → the frontier never advanced → it re-rendered the same
+// tiles as no-credit duplicates and "accepted" froze. So render WHOLE blocks: the
+// server already caps the bundle (default 4 blocks = 64 units), and per-tile
+// progress keeps the counters live, so this isn't a UI freeze. Audits are capped
+// separately so a browser still spends most of its budget rendering fresh work.
+export const MAX_BLOCKS_PER_CYCLE = 256;
+export const MAX_AUDITS_PER_CYCLE = 48;
 
 // base64(deflate(LE-u64 histogram cells)). The node decodes with
 // hist::decode_accum, which magic-sniffs zstd vs zlib/deflate; CompressionStream
