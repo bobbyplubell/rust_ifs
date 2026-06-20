@@ -50,6 +50,15 @@ pub const COVERAGE_TOLERANCE: u64 = BUNDLE_SIZE as u64;
 /// tolerance band covers them, so nobody is rejected on first contributions.
 pub const COVERAGE_FLOOR: u64 = 4 * BUNDLE_SIZE as u64;
 
+/// §4 contributor-deference window: a founding seed treats contributors as
+/// "active" for this long after the last non-seed `Coverage`. While active, the
+/// seed renders NO new tiles (it only audits, confirming + crediting contributor
+/// work) so its native speed never steals submitter credit from a browser. When
+/// the window lapses (swarm idle), the seed resumes rendering to grow/display the
+/// flock. Sized a few browser contribute-cycles wide so a steadily-contributing
+/// browser keeps the seed in audit-only mode without flapping.
+pub const CONTRIBUTOR_IDLE_MS: u64 = 30_000;
+
 // ---- §6 trust / anti-fraud tunables ----------------------------------------
 
 /// §6 reputation-graduated sampling constant: `sample_rate(rep) =
@@ -344,6 +353,14 @@ pub struct Engine {
     /// Audit queue: tiles this node has been asked to re-render + attest (§6).
     audit_queue: Vec<Coverage>,
 
+    /// §4 last wall-clock (ms) a real CONTRIBUTOR (a key that is neither this node
+    /// nor a trusted seed) submitted a `Coverage`. A founding seed renders new
+    /// tiles only when this is stale (no contributor active within
+    /// [`CONTRIBUTOR_IDLE_MS`]); while contributors are submitting it audits
+    /// instead, so the native-fast seed never out-races a browser for submitter
+    /// credit. `0` = no contributor seen yet (cold bootstrap → seed renders).
+    last_contributor_ms: u64,
+
     /// §6 reputation per peer key (lowercase hex) — log-derived "proof of useful
     /// work" standing. A submitter's confirmed audited tiles raise its rep; an
     /// auditor's correct attestations raise its. Read by [`sample_rate`] so
@@ -608,6 +625,7 @@ impl Engine {
             active: None,
             completed_blocks: HashSet::new(),
             audit_queue: Vec::new(),
+            last_contributor_ms: 0,
             tile_hashes: HashMap::new(),
             submitter: HashMap::new(),
             retracted_hashes: HashSet::new(),
@@ -1112,7 +1130,7 @@ impl Engine {
         let accepted = match env.t.as_str() {
             t if t == proto::FLOCK => self.apply_birth(env),
             t if t == proto::CLAIMS => self.apply_claim_or_heartbeat(env, now_ms),
-            t if t == proto::PROGRESS => self.apply_coverage(env),
+            t if t == proto::PROGRESS => self.apply_coverage(env, now_ms),
             t if t == proto::ATTEST => self.apply_attestation(env),
             t if t == proto::REP || t == proto::REP_V1 => self.apply_rep_delta(env),
             t if t == proto::VOTES || t == proto::VOTES_V1 => self.apply_vote(env),
@@ -1368,7 +1386,7 @@ impl Engine {
 
     /// A `Coverage`/`Have` (§4): a tile was submitted (ingest-trust, §6). It is
     /// tracked as unaudited until an attestation confirms it.
-    fn apply_coverage(&mut self, env: &Envelope) -> bool {
+    fn apply_coverage(&mut self, env: &Envelope, now_ms: u64) -> bool {
         let Ok(cov) = serde_json::from_value::<Coverage>(env.body.clone()) else {
             return false;
         };
@@ -1378,6 +1396,12 @@ impl Engine {
         // Only count progress on sheep we know (genome verified).
         if !self.flock.contains_key(&cov.sheep_id) {
             return false;
+        }
+        // §4 note real contributor activity (a non-seed submitter) so a founding
+        // seed steps back from rendering and lets the contributor own the tile —
+        // see [`CONTRIBUTOR_IDLE_MS`] / the render gate in `tick`.
+        if env.from != self.self_pub && !self.trusted_keys.contains(&env.from) {
+            self.last_contributor_ms = self.last_contributor_ms.max(now_ms);
         }
         let tile = (cov.sheep_id.clone(), cov.frame, cov.idx, cov.pass);
         // §6 dispute tracking: record the submitter (first to gossip a Coverage
@@ -1900,14 +1924,20 @@ impl Engine {
             }
         }
 
-        // 2) Work: render new tiles ONLY when NOT busy auditing. A seed's
-        // highest-value job is CONFIRMING others' work (it is trusted), so while
-        // contributors are submitting (audit queue non-empty) it audits instead of
-        // competing for the same fresh tiles — otherwise the seed, being native-fast,
-        // wins the render race and is recorded as the tile's submitter, so the
-        // contributor's identical render earns NO credit. With no audit backlog
-        // (e.g. an empty swarm at bootstrap) the seed renders to grow the flock.
-        if !busy_auditing {
+        // 2) Work: render new tiles ONLY when NOT busy auditing AND no contributor
+        // is currently active. A seed's highest-value job is CONFIRMING others'
+        // work (it is trusted). The audit queue empties faster than browsers can
+        // refill it, so gating on `busy_auditing` alone let the native-fast seed
+        // slip back into rendering between audit batches and win the race for the
+        // same fresh tiles — recorded as submitter, so the contributor's identical
+        // render earned NO credit (the "rendered climbs but nothing accepted"
+        // symptom). So the seed also stands down for [`CONTRIBUTOR_IDLE_MS`] after
+        // any contributor `Coverage`: while browsers submit, it purely audits
+        // (crediting them); only a genuinely idle swarm (cold bootstrap or
+        // contributors gone) lets it render to grow/display the flock.
+        let contributors_active =
+            self.last_contributor_ms != 0 && now_ms.saturating_sub(self.last_contributor_ms) < CONTRIBUTOR_IDLE_MS;
+        if !busy_auditing && !contributors_active {
             if self.active.is_some() {
                 self.render_active(now_ms, &mut out);
             } else if let Some(block) = self.pick_block(now_ms) {

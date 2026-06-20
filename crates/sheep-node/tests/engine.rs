@@ -10,7 +10,9 @@
 use ed25519_dalek::SigningKey;
 use flame_core::chunked::{hist_hash_hex, render_batch};
 use sheep_node::block::{block_units, BlockId, Unit};
-use sheep_node::engine::{Engine, COVERAGE_FLOOR, COVERAGE_TOLERANCE, TRUSTED_ATTESTOR_REP};
+use sheep_node::engine::{
+    Engine, CONTRIBUTOR_IDLE_MS, COVERAGE_FLOOR, COVERAGE_TOLERANCE, TRUSTED_ATTESTOR_REP,
+};
 use sheep_node::spec::{N_FRAMES, SPP};
 use sheep_proto::derive::derive_minted;
 use sheep_proto::identity::{sheep_identity, ResolutionTier};
@@ -342,6 +344,44 @@ fn honest_render_matches_independent_and_audit_detects_tamper() {
     // re-render is detectable (the auditor's attestation hash != the claim).
     let tampered_hash = "deadbeef".to_string();
     assert_ne!(att.hash, tampered_hash, "a tampered tile mismatches the honest attestation");
+}
+
+// ---- §4 a seed defers rendering to an active contributor --------------------
+
+#[test]
+fn seed_defers_to_active_contributor() {
+    let mut eng = Engine::new(key(1));
+    let (m, id_hex) = mint(&key(2), 1_000_000, ResolutionTier::R384);
+    assert!(eng.apply(&m, 1000));
+
+    // A real contributor (a non-seed key) submits a Coverage at t = 10s.
+    let contributor = key(7);
+    let cov = Coverage {
+        sheep_id: id_hex.clone(),
+        frame: 5,
+        idx: 0,
+        pass: 0,
+        hash: "ab".repeat(32),
+    };
+    let env = signed(proto::PROGRESS, &contributor, 10_000, serde_json::to_value(&cov).unwrap());
+    assert!(eng.apply(&env, 10_000));
+
+    // While that contributor is active (within CONTRIBUTOR_IDLE_MS), the seed
+    // stands down — it emits NO new claim/render, so it can't out-race the
+    // contributor for submitter credit. It would only audit.
+    let during = eng.tick(12_000);
+    assert!(
+        !during.iter().any(|e| e.t == proto::CLAIMS || e.t == proto::PROGRESS),
+        "seed defers to an active contributor (no new render work)"
+    );
+
+    // Once the swarm goes idle (no contributor for the whole window), the seed
+    // resumes rendering to grow/display the flock.
+    let after = eng.tick(10_000 + CONTRIBUTOR_IDLE_MS + 1_000);
+    assert!(
+        after.iter().any(|e| e.t == proto::CLAIMS || e.t == proto::PROGRESS),
+        "seed resumes rendering when no contributor is active"
+    );
 }
 
 // ---- credits accrue at TILES_PER_CREDIT (§3) --------------------------------
