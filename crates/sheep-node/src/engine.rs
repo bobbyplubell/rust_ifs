@@ -41,9 +41,14 @@ use crate::spec::{
 pub const CLAIM_TTL_MS: u64 = 30_000;
 
 /// §4.1 coverage cap tolerance: a sheep may run up to
-/// `min_flock_coverage + COVERAGE_TOLERANCE` confirmed tiles before claims for
-/// it are rejected.
-pub const COVERAGE_TOLERANCE: u64 = BUNDLE_SIZE as u64;
+/// `min_flock_coverage + COVERAGE_TOLERANCE` submitted tiles before it's skipped
+/// for claims. Sized GENEROUSLY (many blocks) so the work frontier stays DEEP:
+/// a tight tolerance kept all renderers piled on the same 1-block-wide frontier
+/// per sheep, so they collided and the frontier periodically exhausted (the
+/// confirmation stalls). A wide tolerance lets contributors render deep coverage
+/// in parallel across passes (richer video too); the §4 display floor still
+/// guarantees the per-sheep MINIMUM, so deep-but-uneven coverage is fine.
+pub const COVERAGE_TOLERANCE: u64 = 16 * BUNDLE_SIZE as u64;
 
 /// §4.1 floor: don't enforce the per-sheep cap until total confirmed coverage
 /// across the flock exceeds this — early on every sheep is near zero and the
@@ -2244,7 +2249,11 @@ impl Engine {
         // trusted attestor, so its lone honest re-render confirms (a forged tile
         // mismatches and is rejected, not confirmed). This guarantees every
         // contributor tile is eventually audited — no permanently-stuck tiles.
-        if !render_now {
+        // ALWAYS sweep (not gated on `!render_now`): confirmation throughput is the
+        // priority. Gating on `!render_now` stalled confirmation whenever a lottery
+        // BIRTH made the display floor want the new sheep rendered — the seed then
+        // rendered instead of sweeping, so "accepted" froze for ~30s each birth.
+        {
             let gaps: Vec<(String, u32, u32, u32)> = self
                 .unaudited
                 .iter()
