@@ -74,10 +74,14 @@ pub const CONTRIBUTOR_IDLE_MS: u64 = 30_000;
 pub const DISPLAY_COVER: usize = 32;
 
 /// §6 how many un-attested "gap" tiles the auditor-of-last-resort sweep confirms
-/// per tick when the node has audit capacity (see `tick`). Bounds the per-tick
-/// re-render work (the sweep runs in the blocking render thread); the backlog
-/// drains across ticks. Sized so stuck tiles clear faster than contributors flood.
-pub const AUDIT_SWEEP_PER_TICK: usize = 16;
+/// per tick. Each is a full re-render, so this is the node's STANDING CPU cost —
+/// it runs EVERY tick (see `tick`). Kept SMALL: the sweep is only a FALLBACK for
+/// tiles the §6 lottery + contributor cross-audit missed; the bulk of confirmation
+/// is contributors auditing each other. A large value (was 16) pegged the seed CPU
+/// at ~100% once the flock grew (~14 sheep), starving the engine task so
+/// `/api/assign` timed out AND the libp2p reactor couldn't dial peers — it took the
+/// node DOWN. Drain the backlog gently across many ticks instead.
+pub const AUDIT_SWEEP_PER_TICK: usize = 4;
 
 /// §1 `N_base` — the deterministic genesis flock size, and the floor on
 /// [`Engine::n_target`]. The founders are identical on every node (fixed genesis
