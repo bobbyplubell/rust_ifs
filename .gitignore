@@ -2,14 +2,9 @@
 **/*.png
 /frames
 /baked
-/web/pkg
 *.gif
 *.mp4
 .claude/
-scratch.md
-PLAN.md
-ARCHITECTURE-v3.md
-Caddyfile.lan
 .tools/
 
 # secrets / certs / keys — never commit (defensive)
@@ -19,6 +14,5 @@ Caddyfile.lan
 *.crt
 *.ca-bundle
 *.pfx
-# local logs / swarm dumps
-*.jsonl
+# local logs
 *.log
